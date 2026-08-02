@@ -30,3 +30,22 @@ fn panic(info: &PanicInfo) -> ! {
 fn serial_console_carries_output() {
     serial_println!("(this line proves the serial sink is live)");
 }
+
+#[test_case]
+fn init_brought_every_subsystem_up() {
+    // Reaching a test case at all proves `entry_point!` accepted our config and
+    // the bootloader handed over with a working stack. These assertions cover
+    // the rest of `init`, which reports nothing on success.
+    assert!(
+        panda_kernel::memory::frame::is_initialised(),
+        "frame allocator was not initialised"
+    );
+    assert!(
+        panda_kernel::memory::paging::is_initialised(),
+        "page tables were not adopted"
+    );
+    assert!(
+        panda_kernel::allocator::stats().size > 0,
+        "the heap was never given any memory"
+    );
+}

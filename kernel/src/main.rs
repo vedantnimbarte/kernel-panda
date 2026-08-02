@@ -3,6 +3,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use bootloader_api::{entry_point, BootInfo};
@@ -30,6 +33,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     memory::log_memory_map(&boot_info.memory_regions);
     println!();
     memory::log_usage();
+    println!();
+
+    // Proof that `alloc` is live: this allocates, grows, and reallocates.
+    let squares: Vec<u64> = (1..=8u64).map(|n| n * n).collect();
+    println!("alloc smoke test: {squares:?}");
     println!();
 
     halt_loop()

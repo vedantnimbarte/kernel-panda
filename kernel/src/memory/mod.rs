@@ -6,8 +6,10 @@
 //! 2. Build the physical frame allocator over it.
 //! 3. Adopt the page tables, which need the frame allocator for intermediate
 //!    tables.
+//! 4. Map and initialise the kernel heap, which needs both.
 
 pub mod frame;
+pub mod heap;
 pub mod paging;
 
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
@@ -20,13 +22,13 @@ use crate::println;
 /// a Phase 3 concern.
 pub const PAGE_SIZE: u64 = 4096;
 
-/// Bring up the memory subsystem.
+/// Bring up the whole memory subsystem.
 ///
 /// # Panics
 ///
 /// If the bootloader did not provide the physical memory mapping that
-/// `BOOTLOADER_CONFIG` asks for. That is not recoverable -- there is no kernel
-/// without it.
+/// `BOOTLOADER_CONFIG` asks for, or if the heap cannot be mapped. Neither is
+/// recoverable -- there is no kernel without them.
 pub fn init(boot_info: &mut BootInfo) {
     let physical_memory_offset = boot_info
         .physical_memory_offset
@@ -44,6 +46,8 @@ pub fn init(boot_info: &mut BootInfo) {
         frame::init(&boot_info.memory_regions, physical_memory_offset);
         paging::init(VirtAddr::new(physical_memory_offset));
     }
+
+    heap::init().expect("failed to map the kernel heap");
 }
 
 /// Print the bootloader's memory map and the totals derived from it.
@@ -67,7 +71,7 @@ pub fn log_memory_map(regions: &MemoryRegions) {
     println!("  usable: {value} {unit} across {} regions", regions.len());
 }
 
-/// Report frame allocator occupancy.
+/// Report frame allocator and heap occupancy.
 pub fn log_usage() {
     frame::with(|allocator| {
         let (total, unit) = human_size(allocator.total_frames() as u64 * PAGE_SIZE);
@@ -79,6 +83,12 @@ pub fn log_usage() {
             allocator.used_frames(),
         );
     });
+
+    let stats = crate::allocator::stats();
+    println!(
+        "heap:   {} bytes total, {} allocated, {} peak, {} live allocations",
+        stats.size, stats.allocated, stats.peak, stats.allocations
+    );
 }
 
 /// Split a byte count into a value and a unit, using integer arithmetic only.

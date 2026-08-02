@@ -19,6 +19,12 @@ bench = false
 # Doc-tests would be compiled and run on the host, where none of this links.
 doctest = false
 
+[features]
+default = []
+# Swap the linked-list heap for the bump allocator. Diagnostic aid: if `Box::new`
+# faults under this, the fault is in the page mapping, not the allocator.
+bump-allocator = []
+
 # Every dependency here ships inside the kernel image and must earn its place
 # against the auditability requirement. Three, and only three:
 #   bootloader_api - mandated by the chosen boot path

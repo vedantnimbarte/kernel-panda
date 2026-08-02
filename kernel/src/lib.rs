@@ -8,9 +8,14 @@
 // compiler to emit an iret-based epilogue and preserve the full register set.
 #![feature(abi_x86_interrupt)]
 
+// The kernel heap is set up during `init`, after which `Box`, `Vec` and friends
+// are available. Nothing before that point may allocate.
+extern crate alloc;
+
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::BootInfo;
 
+pub mod allocator;
 pub mod arch;
 pub mod console;
 pub mod memory;
@@ -56,7 +61,7 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
 
     // Memory last: it needs the console up to report the map it finds, and the
     // IDT installed so a bad mapping surfaces as a page fault with an address
-    // rather than as a reset.
+    // rather than as a reset. It ends by turning `alloc` on.
     memory::init(boot_info);
 
     if !serial_ok {
