@@ -10,6 +10,7 @@
 
 pub mod frame;
 pub mod heap;
+pub mod kstack;
 pub mod paging;
 
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};

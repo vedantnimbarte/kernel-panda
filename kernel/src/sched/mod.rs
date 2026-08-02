@@ -71,9 +71,31 @@ struct Scheduler {
     idle: [Option<ThreadId>; MAX_CPUS],
     /// Ticks left in the current slice, per processor.
     slice: [u32; MAX_CPUS],
-    /// A thread switched away from on this CPU whose registers are now saved and
-    /// which may therefore safely be offered to another processor.
+    /// The thread this CPU most recently switched away from, cleared by the
+    /// incoming context once the switch has actually completed.
+    ///
+    /// It serves two purposes at once. A still-runnable thread may not be
+    /// offered to another processor until its registers are saved, and a
+    /// *finished* one may not be freed until this CPU has left its stack --
+    /// between releasing the scheduler lock and the `mov rsp` inside
+    /// `context_switch`, the outgoing thread is no longer `current` anywhere but
+    /// is still the stack this CPU is standing on.
     pending: [Option<ThreadId>; MAX_CPUS],
+
+    /// Finished threads waiting to be dropped.
+    ///
+    /// Dropping one unmaps its stack, which takes the page-table and frame
+    /// locks and broadcasts a TLB shootdown. None of that can happen here --
+    /// `reap` runs inside the timer interrupt with this lock held, so it would
+    /// be taking the paging locks underneath the scheduler lock in one path and
+    /// above it in another. They are handed out and dropped after the lock is
+    /// released instead.
+    ///
+    /// The `Box` is not redundant: `prepare_switch` hands out a raw pointer into
+    /// the live thread's `stack_pointer`, so a thread's address has to stay put.
+    /// Unboxing into the vector would move it.
+    #[allow(clippy::vec_box)]
+    graveyard: Vec<Box<Thread>>,
 }
 
 impl Scheduler {
@@ -95,39 +117,69 @@ impl Scheduler {
 
     /// Free threads that have run to completion.
     ///
-    /// Never one that is current on *any* processor: it is still executing on
-    /// the very stack that dropping it would free. Checking only this CPU was
-    /// correct while there was only one.
+    /// Never one that any processor is still standing on. `on_cpu` covers both
+    /// "running right now" and "being switched away from", and it is the second
+    /// that matters: a thread stops being `current` under the lock, but the CPU
+    /// does not leave its stack until `context_switch` runs, well after the lock
+    /// is released. Freeing it in that window unmaps the stack out from under a
+    /// live processor. Checking only this CPU's `current` was correct while
+    /// there was only one CPU.
     fn reap(&mut self) {
-        let running = self.current;
         for slot in self.threads.iter_mut() {
             let finished = matches!(
                 slot.as_deref(),
-                Some(t) if t.state == State::Finished && !running.contains(&Some(t.id))
+                Some(t) if t.state == State::Finished && !t.on_cpu
             );
             if finished {
-                *slot = None;
+                if let Some(thread) = slot.take() {
+                    self.graveyard.push(thread);
+                }
             }
         }
     }
 
+    /// Hand over the finished threads so the caller can drop them once the
+    /// scheduler lock is released.
+    #[allow(clippy::vec_box)]
+    fn take_graveyard(&mut self) -> Vec<Box<Thread>> {
+        core::mem::take(&mut self.graveyard)
+    }
+
     /// Take the next genuinely runnable thread off the queue, discarding
     /// entries for threads that have since finished or been reaped.
+    ///
+    /// A queued thread that is still `on_cpu` is dropped rather than returned.
+    /// The invariant is that this cannot happen -- nothing enqueues a thread a
+    /// processor is standing on -- but if it ever did, running it would put two
+    /// CPUs on one stack. Dropping the entry is safe because `flush_pending`
+    /// enqueues the thread again when the switch away from it completes.
     fn pop_runnable(&mut self) -> Option<ThreadId> {
         while let Some(id) = self.ready.pop_front() {
-            if matches!(self.thread_opt(id), Some(t) if t.state == State::Ready) {
+            if matches!(self.thread_opt(id), Some(t) if t.state == State::Ready && !t.on_cpu) {
                 return Some(id);
             }
         }
         None
     }
 
-    /// Return a thread another CPU finished switching away from to the queue.
+    /// Release the thread this CPU switched away from: the switch is complete,
+    /// so it is safe both to run elsewhere and to free.
+    ///
+    /// Only a runnable, non-idle thread rejoins the queue. Idle threads belong
+    /// to their processor and are never queued; finished ones are left for
+    /// `reap`, which can now see them.
     fn flush_pending(&mut self, cpu: usize) {
-        if let Some(id) = self.pending[cpu].take() {
-            if matches!(self.thread_opt(id), Some(t) if t.state == State::Ready) {
-                self.ready.push_back(id);
-            }
+        let Some(id) = self.pending[cpu].take() else {
+            return;
+        };
+        let Some(thread) = self.threads.get_mut(id.0).and_then(|s| s.as_deref_mut()) else {
+            return;
+        };
+        thread.on_cpu = false;
+        let state = thread.state;
+
+        if state == State::Ready && !self.idle.contains(&Some(id)) {
+            self.ready.push_back(id);
         }
     }
 
@@ -160,20 +212,19 @@ impl Scheduler {
             outgoing.state = State::Ready;
         }
 
-        // Deliberately not pushed to the ready queue yet. Its registers are
-        // still live in this CPU; another processor picking it up now would
-        // resume a thread whose context has not been saved. The incoming
-        // context enqueues it once the switch has completed.
-        self.pending[cpu] = if current != idle && self.thread(current).state == State::Ready {
-            Some(current)
-        } else {
-            None
-        };
+        // Held back, whatever its state. A runnable thread must not be picked up
+        // elsewhere while its registers are still live in this CPU, and a
+        // finished one must not be freed while this CPU is still on its stack.
+        // The incoming context releases it once the switch has completed.
+        self.pending[cpu] = Some(current);
 
         let save_to: *mut u64 = &mut self.thread_mut(current).stack_pointer;
 
         let incoming = self.thread_mut(next);
         incoming.state = State::Running;
+        // This CPU is committed to it from here, even though it does not
+        // actually arrive until `context_switch`.
+        incoming.on_cpu = true;
         let load_from = incoming.stack_pointer;
         let kernel_stack_top = incoming.kernel_stack_top;
         let space = incoming.address_space;
@@ -223,6 +274,7 @@ pub fn init() {
             idle: [None; MAX_CPUS],
             slice: [TIME_SLICE_TICKS; MAX_CPUS],
             pending: [None; MAX_CPUS],
+            graveyard: Vec::new(),
         };
         scheduler.current[0] = Some(BOOT_THREAD);
         scheduler.idle[0] = Some(ThreadId(1));
@@ -268,15 +320,19 @@ pub fn schedule() {
     without_interrupts(|| {
         let cpu = cpu_index();
 
-        let switch = {
+        let (switch, dead) = {
             let mut guard = SCHEDULER.lock();
             let Some(scheduler) = guard.as_mut() else {
                 return;
             };
             scheduler.flush_pending(cpu);
             scheduler.reap();
-            scheduler.prepare_switch(cpu)
+            (scheduler.prepare_switch(cpu), scheduler.take_graveyard())
         };
+
+        // Outside the scheduler lock: this unmaps stacks, returns frames and
+        // may broadcast a shootdown, none of which may happen underneath it.
+        drop(dead);
 
         let Some(switch) = switch else {
             return;
@@ -337,18 +393,26 @@ pub fn block_current() {
 /// blocked, so a duplicate wake is harmless.
 pub fn unblock(id: ThreadId) {
     with(|scheduler| {
-        let woken = match scheduler
+        let Some(thread) = scheduler
             .threads
             .get_mut(id.0)
             .and_then(|slot| slot.as_deref_mut())
-        {
-            Some(thread) if thread.state == State::Blocked => {
-                thread.state = State::Ready;
-                true
-            }
-            _ => false,
+        else {
+            return;
         };
-        if woken {
+        if thread.state != State::Blocked {
+            return;
+        }
+        thread.state = State::Ready;
+
+        // A wake can land while the thread is still leaving its processor: it
+        // set itself Blocked, and the CPU running it has released the scheduler
+        // lock but not yet reached `context_switch`. Queueing it here would let
+        // another core resume it from a saved stack pointer that has not been
+        // written yet -- which is a second CPU running on a live stack, and
+        // reads as a wild jump or a fault on a null rsp. `flush_pending` puts it
+        // in the queue once the switch is genuinely done.
+        if !thread.on_cpu {
             scheduler.ready.push_back(id);
         }
     });
@@ -434,6 +498,18 @@ pub fn current_kernel_stack_top() -> u64 {
             .unwrap_or(0)
     })
     .unwrap_or(0)
+}
+
+/// The unmapped page below a thread's stack, and its lowest mapped address.
+///
+/// Diagnostic, and used by the test that checks the guard is really there.
+pub fn stack_bounds_of(id: ThreadId) -> Option<(u64, u64)> {
+    with(|scheduler| {
+        scheduler.thread_opt(id).and_then(|thread| {
+            Some((thread.guard_page()?, thread.stack_bottom()?))
+        })
+    })
+    .flatten()
 }
 
 /// Whether a thread still exists. False once it has finished and been reaped.

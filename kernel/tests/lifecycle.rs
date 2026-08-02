@@ -14,7 +14,8 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::ipc::{self, EndpointId, Rights};
-use panda_kernel::memory::frame;
+use panda_kernel::memory::{frame, paging};
+use x86_64::VirtAddr;
 use panda_kernel::sched::ThreadId;
 use panda_kernel::{arch::x86_64::halt_loop, gbm, sched, testing, userspace, BOOTLOADER_CONFIG};
 
@@ -106,6 +107,46 @@ fn a_user_program_returns_its_frames() {
         "a user program leaked physical frames: {} free against a baseline of \
          {baseline}",
         frame::with(|allocator| allocator.free_frames())
+    );
+}
+
+static PARKED: AtomicU64 = AtomicU64::new(0);
+
+fn park_forever() {
+    PARKED.store(1, Ordering::Release);
+    loop {
+        sched::yield_now();
+    }
+}
+
+#[test_case]
+fn kernel_stacks_have_a_guard_page() {
+    // A stack on the heap has nothing beneath it but more heap, so an overflow
+    // writes silently into another allocation and surfaces later as corruption
+    // with no path back to its cause. An unmapped page turns that into a fault
+    // on the first byte past the end.
+    PARKED.store(0, Ordering::Release);
+    let thread = sched::spawn("guarded", park_forever).expect("spawn failed");
+    assert!(
+        spin_until(|| PARKED.load(Ordering::Acquire) == 1),
+        "the probe thread never ran"
+    );
+
+    let (guard, bottom) = sched::stack_bounds_of(thread).expect("the thread owns no stack");
+
+    assert_eq!(
+        guard + 4096,
+        bottom,
+        "the guard page does not sit immediately below the stack"
+    );
+    assert!(
+        paging::flags(VirtAddr::new(bottom)).is_some(),
+        "the stack itself is not mapped"
+    );
+    assert!(
+        paging::flags(VirtAddr::new(guard)).is_none(),
+        "the page below the stack is mapped, so an overflow would land in real \
+         memory instead of faulting"
     );
 }
 

@@ -254,12 +254,31 @@ names the stack *that* processor traps onto; sharing one would have two cores
 landing on the same stack and destroying each other's frames — corruption rather
 than a fault.
 
-**The scheduler does not enqueue an outgoing thread until its registers are
-saved.** Releasing the lock before a context switch was safe with one core
-because nothing could observe the gap. With more, another CPU could pick the
-outgoing thread off the ready queue and resume a context that is still live in
-our registers. The incoming context performs the enqueue instead, once the
-switch has completed.
+**No thread is runnable, or freeable, while a processor is still standing on its
+stack.** Releasing the scheduler lock before a context switch was safe with one
+core because nothing could observe the gap. With more, the window between "stops
+being this CPU's `current`" and "the `mov rsp` inside `context_switch`" is a
+window in which the thread looks idle and is not. Another core resuming it there
+loads a saved stack pointer that has not been written yet; another core *freeing*
+it there unmaps a live stack.
+
+Each thread therefore carries an `on_cpu` flag, set when a CPU commits to
+switching to it and cleared by the incoming context once the switch has actually
+happened. The ready queue, `unblock` and `reap` all respect it. `unblock` is the
+one that is easy to miss — a wake arrives from another core at a moment of the
+waker's choosing, including while the thread it is waking is halfway off its
+processor. It sets the state and leaves the enqueue to the handshake.
+
+Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
+run in ten, from a blocking IPC receive.
+
+**Kernel stacks are mapped, not allocated, with an unmapped guard page beneath
+each.** A stack on the heap has nothing below it but more heap, so overflowing it
+writes into another allocation and surfaces later as corruption somewhere
+unrelated. An unmapped page turns that into a fault on the first byte past the
+end — and on a kernel thread that fault escalates to a double fault, which lands
+on the IST stack and prints. Slots are spaced twice the stack size apart, so an
+overflow cannot skip the guard and land in the neighbour.
 
 **Each process has its own page tables.** A new address space is a clone of the
 kernel's level 4 table with one slot — the 512 GiB entry covering the whole user
@@ -344,9 +363,6 @@ which only means the hang would be intermittent.
   every access goes through the uncached mapping, but it should be tidied up.
 * Calibration trusts a single 10 ms PIT sample. Averaging several would be more
   robust on a loaded host.
-* Kernel stacks come from the heap, so they have no guard page. A thread that
-  overflows its 32 KiB corrupts whatever the allocator put beneath it, silently.
-  They should move to guard-paged mappings of their own.
 * The scheduler is strict round-robin with no priorities. Threads can now block
   on IPC, but there is still no sleep and no wait-for-thread, so polling with
   `yield_now` is the only way to await anything else.

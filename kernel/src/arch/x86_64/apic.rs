@@ -267,10 +267,17 @@ pub unsafe fn start_processor(apic_id: u8, trampoline: u64) {
         write_reg(REG_ICR_LOW, ICR_INIT);
         wait_for_delivery();
 
-        // The manual asks for 10 ms after INIT. The timer is running by now, so
-        // wait on real ticks rather than guessing at a spin count.
+        // The manual asks for 10 ms after INIT. Wait on real ticks where the
+        // timer is running, but never unconditionally: this runs before the
+        // other processors exist, and a stalled timer here would hang the boot
+        // with no way to tell why.
         let deadline = crate::time::ticks() + 2;
+        let mut spins = 0u64;
         while crate::time::ticks() < deadline {
+            spins += 1;
+            if spins > 50_000_000 {
+                break;
+            }
             core::hint::spin_loop();
         }
 
@@ -299,24 +306,34 @@ pub unsafe fn start_processor(apic_id: u8, trampoline: u64) {
 /// A process's own tables need no shootdown: only one CPU runs it at a time, and
 /// the CR3 reload on the way in flushes everything non-global.
 pub fn broadcast_tlb_shootdown() {
-    if APIC_VIRT.load(Ordering::Acquire) == 0 || crate::smp::online_count() <= 1 {
+    if APIC_VIRT.load(Ordering::Acquire) == 0 {
         return;
     }
+    crate::smp::for_each_other_online_processor(|apic_id| {
+        // SAFETY: the id came from the online set, so that processor has its
+        // descriptor tables loaded and can take the vector.
+        unsafe { send_ipi(apic_id, TLB_SHOOTDOWN_VECTOR) };
+    });
+}
 
-    // Destination shorthand 0b11: every processor except this one. Using the
-    // shorthand rather than looping over ids means no list to keep in step with
-    // reality, and no chance of missing a CPU that came up late.
-    const ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
+/// Send a fixed-delivery interrupt to one processor.
+///
+/// Addressed individually rather than with the "all except self" shorthand.
+/// The shorthand reaches *every* processor, including one still climbing
+/// through the startup trampoline with no IDT loaded -- which turns a routine
+/// shootdown into a triple fault on the CPU that was almost ready.
+///
+/// # Safety
+///
+/// `apic_id` must name a processor that has installed an IDT handling `vector`.
+pub unsafe fn send_ipi(apic_id: u8, vector: u8) {
     const LEVEL_ASSERT: u32 = 1 << 14;
 
     // SAFETY: the APIC is mapped, and this is the architecturally defined way to
-    // interrupt other processors.
+    // interrupt another processor. The caller vouches for the target.
     unsafe {
-        write_reg(REG_ICR_HIGH, 0);
-        write_reg(
-            REG_ICR_LOW,
-            ALL_EXCLUDING_SELF | LEVEL_ASSERT | TLB_SHOOTDOWN_VECTOR as u32,
-        );
+        write_reg(REG_ICR_HIGH, (apic_id as u32) << 24);
+        write_reg(REG_ICR_LOW, LEVEL_ASSERT | vector as u32);
         wait_for_delivery();
     }
 }

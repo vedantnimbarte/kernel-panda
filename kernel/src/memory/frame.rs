@@ -214,9 +214,20 @@ pub unsafe fn init(regions: &MemoryRegions, physical_memory_offset: u64) {
         allocator.mark_used(frame);
     }
 
-    // Keep physical address zero out of circulation so a null physical address
-    // stays a reliable error signal.
-    allocator.mark_used(0);
+    // Hold back the whole first megabyte.
+    //
+    // The bootloader reports most of it as usable, and arithmetically it is --
+    // but real-mode structures live down there, and a processor coming out of
+    // reset can only start from an address below 1 MiB. Handing any of it to a
+    // general allocation means the SMP trampoline eventually lands on top of
+    // whatever was given out, which presents as an application processor that
+    // silently fails to start rather than as a memory error.
+    //
+    // 256 frames, on a machine with tens of thousands.
+    const LOW_MEMORY_FRAMES: usize = (1024 * 1024) / PAGE_SIZE as usize;
+    for frame in 0..LOW_MEMORY_FRAMES.min(allocator.total_frames) {
+        allocator.mark_used(frame);
+    }
 
     ALLOCATOR.call_once(|| Mutex::new(allocator));
 }

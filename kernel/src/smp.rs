@@ -1,4 +1,4 @@
-//! Symmetric multiprocessing: starting the other CPUs and keeping per-CPU state.
+﻿//! Symmetric multiprocessing: starting the other CPUs and keeping per-CPU state.
 //!
 //! An application processor comes out of reset in 16-bit real mode, so there is
 //! no way to start one without a trampoline that walks it back up through
@@ -149,6 +149,30 @@ pub fn online_count() -> usize {
     ONLINE.load(Ordering::Acquire)
 }
 
+/// Bit per CPU index, set once that processor can take an interrupt.
+///
+/// A processor is only in here after it has its own IDT. Sending it a vector
+/// before that point faults on a CPU with nowhere to record the fault, which
+/// takes it out entirely -- so the set exists to be the thing IPIs are addressed
+/// from, rather than the "all except self" shorthand.
+static ONLINE_MASK: AtomicU64 = AtomicU64::new(1);
+
+/// Call `f` with the APIC id of every online processor except this one.
+pub fn for_each_other_online_processor(mut f: impl FnMut(u8)) {
+    let mask = ONLINE_MASK.load(Ordering::Acquire);
+    if mask.count_ones() <= 1 {
+        return;
+    }
+    let self_index = cpu_index();
+    let identifiers = without_interrupts(|| APIC_IDS.lock().clone());
+
+    for (index, apic_id) in identifiers.iter().enumerate() {
+        if index != self_index && mask & (1 << index) != 0 {
+            f(*apic_id);
+        }
+    }
+}
+
 /// This CPU's dense index.
 ///
 /// Derived from the Local APIC id rather than stored somewhere per-CPU, because
@@ -176,7 +200,6 @@ pub unsafe fn start_application_processors() -> usize {
     if identifiers.len() <= 1 {
         return 0;
     }
-
     // SAFETY: called once during boot, before anything else can touch the
     // trampoline page.
     unsafe { install_trampoline() };
@@ -201,7 +224,6 @@ pub unsafe fn start_application_processors() -> usize {
             write_parameter(PARAM_STACK, stack_top);
             write_parameter(PARAM_INDEX, index as u64);
         }
-
         HANDSHAKE.store(0, Ordering::Release);
 
         // SAFETY: `apic_id` came from the firmware's own processor list.
@@ -243,9 +265,10 @@ unsafe fn install_trampoline() {
     // happens to live at a low address.
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
-    // SAFETY: this frame is below 1 MiB in firmware-reserved low memory, which
-    // the frame allocator never hands out -- its bitmap only covers regions the
-    // bootloader marked usable, and it holds frame 0 back besides.
+    // SAFETY: the frame allocator holds the whole first megabyte back precisely
+    // so this page is never handed to anything else. It is reported as usable
+    // memory and would otherwise be allocated like any other frame -- which is
+    // exactly what happened before that reservation existed.
     let _ = unsafe { paging::map_to_frame_in(&paging::kernel_space(), page, frame, flags) };
 
     let start = &raw const AP_TRAMPOLINE_START;
@@ -335,6 +358,10 @@ extern "C" fn application_processor_entry(index: u64) -> ! {
     // SAFETY: runs once per CPU, with interrupts disabled.
     let _ = unsafe { crate::arch::x86_64::apic::init_for_secondary() };
 
+    // Published only now, with descriptor tables and the APIC in place. Before
+    // this point an IPI addressed here would land on a processor that cannot
+    // handle it.
+    ONLINE_MASK.fetch_or(1 << index, Ordering::AcqRel);
     ONLINE.fetch_add(1, Ordering::AcqRel);
     HANDSHAKE.store(index + 1, Ordering::Release);
 

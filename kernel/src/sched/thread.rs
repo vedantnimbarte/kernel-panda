@@ -1,14 +1,10 @@
 ﻿//! Thread control blocks.
 
-use alloc::boxed::Box;
-use alloc::vec;
-
 use super::context;
+use crate::memory::kstack::{self, KernelStack};
 
-/// 32 KiB. Generous for a kernel thread that does not recurse, and small enough
-/// that the 1 MiB heap can hold a useful number of them. Kernel stacks will move
-/// off the heap and onto guard-paged mappings of their own once there is a
-/// reason to care about stack overflow per thread.
+/// Kept for callers that still name it; the real size is fixed by the stack
+/// region's slot layout.
 pub const DEFAULT_STACK_SIZE: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,34 +53,56 @@ pub struct Thread {
     /// thread's stack corrupts that thread silently.
     pub kernel_stack_top: u64,
 
+    /// Some processor is executing on this thread's stack.
+    ///
+    /// True from the moment a CPU commits to switching *to* the thread until the
+    /// switch *away* from it has actually completed -- which is later than the
+    /// point where it stops being that CPU's `current`, because the scheduler
+    /// lock is released before `context_switch` runs.
+    ///
+    /// While it is set the thread must not be given to another processor and
+    /// must not be freed: its saved `stack_pointer` is stale and its stack is
+    /// live. Two things would otherwise get this wrong -- `unblock`, which can
+    /// arrive from another core at any moment, and `reap`.
+    pub on_cpu: bool,
+
     /// The owned kernel stack. `None` for the boot thread, which runs on the
     /// stack the bootloader set up and does not own it.
     ///
     /// Never read directly -- the CPU reaches it through `stack_pointer`. It is
-    /// held here so that dropping the thread frees the stack.
-    #[allow(dead_code)]
-    stack: Option<Box<[u8]>>,
+    /// held here so that dropping the thread unmaps the stack and returns both
+    /// its frames and its guard page's address space.
+    stack: Option<KernelStack>,
 }
 
 impl Thread {
+    /// The unmapped page below this thread's stack, if it owns one.
+    pub fn guard_page(&self) -> Option<u64> {
+        self.stack.as_ref().map(|stack| stack.guard_page())
+    }
+
+    /// Lowest mapped address of this thread's stack, if it owns one.
+    pub fn stack_bottom(&self) -> Option<u64> {
+        self.stack.as_ref().map(|stack| stack.bottom())
+    }
+
     /// Create a thread that has never run, with a stack fabricated so that the
     /// first switch into it lands on `trampoline`.
     pub fn new(
         id: ThreadId,
         name: &'static str,
         entry: fn(),
-        stack_size: usize,
+        _stack_size: usize,
         trampoline: unsafe extern "C" fn() -> !,
     ) -> Self {
-        let mut stack = vec![0u8; stack_size].into_boxed_slice();
+        let stack = kstack::allocate().expect("out of kernel stack address space");
 
-        // Round down rather than up: rounding up would put the top past the end
-        // of the allocation.
-        let top = (stack.as_mut_ptr() as u64 + stack_size as u64) & !0xF;
+        // Page aligned already, so also 16-byte aligned.
+        let top = stack.top();
 
-        // SAFETY: `top` is 16-byte aligned and sits at (or just below) the end of
-        // an allocation of `stack_size` bytes, which is far larger than the
-        // fabricated frame. The stack is not yet reachable from anywhere else.
+        // SAFETY: `top` is 16-byte aligned and sits at the top of a freshly
+        // mapped stack far larger than the fabricated frame. Nothing else
+        // references it yet.
         let stack_pointer = unsafe { context::init_stack(top, trampoline) };
 
         Self {
@@ -95,6 +113,7 @@ impl Thread {
             entry: Some(entry),
             address_space: None,
             kernel_stack_top: top,
+            on_cpu: false,
             stack: Some(stack),
         }
     }
@@ -115,6 +134,8 @@ impl Thread {
             // The boot thread never drops to Ring 3, so no Ring 0 stack has to
             // be published for it.
             kernel_stack_top: 0,
+            // It is running: that is the whole point of adopting it.
+            on_cpu: true,
             stack: None,
         }
     }

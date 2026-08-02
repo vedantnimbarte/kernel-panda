@@ -236,15 +236,29 @@ fn a_thread_cannot_grant_rights_it_does_not_hold() {
     );
 }
 
+static NARROW_RELEASE: AtomicBool = AtomicBool::new(false);
+
+/// Stays alive until released. A thread that simply returned would be reaped
+/// before the assertions run -- on another core, quite possibly before `grant`
+/// even returns -- and its capabilities would go with it, so the test would be
+/// reading an empty table rather than a narrow one.
+fn narrow_holder() {
+    while !NARROW_RELEASE.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
+}
+
 #[test_case]
 fn granting_cannot_widen_authority() {
     let endpoint = ipc::create(me(), 4).expect("create failed");
+    NARROW_RELEASE.store(false, Ordering::Release);
 
     // The owner holds everything, so grant a deliberately narrow subset.
-    let target = sched::spawn("narrow", || {}).expect("spawn failed");
+    let target = sched::spawn("narrow", narrow_holder).expect("spawn failed");
     ipc::grant(me(), target, endpoint, Rights::SEND).expect("grant failed");
 
     let rights = ipc::rights_of(target, endpoint);
+    NARROW_RELEASE.store(true, Ordering::Release);
     assert!(rights.contains(Rights::SEND));
     assert!(
         !rights.contains(Rights::RECEIVE),

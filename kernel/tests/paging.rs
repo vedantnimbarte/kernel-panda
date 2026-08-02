@@ -1,4 +1,4 @@
-//! Page table management: map, write through the mapping, translate, unmap.
+﻿//! Page table management: map, write through the mapping, translate, unmap.
 
 #![no_std]
 #![no_main]
@@ -35,7 +35,7 @@ const RW: PageTableFlags = PageTableFlags::from_bits_truncate(
 /// Addresses well clear of the kernel, the heap at 0x4444_4444_0000, and
 /// anything the bootloader mapped.
 fn scratch_page(index: u64) -> Page<Size4KiB> {
-    Page::containing_address(VirtAddr::new(0x_5555_0000_0000 + index * 0x1000))
+    Page::containing_address(VirtAddr::new(0x_6660_0000_0000 + index * 0x1000))
 }
 
 #[test_case]
