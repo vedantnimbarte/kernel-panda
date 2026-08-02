@@ -40,9 +40,9 @@ pub const BOOTLOADER_CONFIG: BootloaderConfig = {
 /// Bring up the subsystems every entry point needs before it can do anything
 /// observable. Call exactly once, first thing.
 ///
-/// Takes and returns `boot_info` so that later stages -- which borrow the
-/// framebuffer and the memory map out of it -- can be added here without
-/// changing every caller.
+/// Hands `boot_info` back so the caller can go on to use the rest of it: the
+/// framebuffer is borrowed out of it here, and returning it is what keeps that
+/// borrow from swallowing the whole structure.
 pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // Serial first: everything after this point can report its own failures.
     let serial_ok = console::init();
@@ -51,9 +51,32 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // readable diagnostic instead of a silent reset.
     arch::x86_64::init();
 
+    adopt_framebuffer(boot_info);
+
     if !serial_ok {
         crate::println!("warning: UART loopback self-test failed; serial output may be lost");
     }
 
     boot_info
+}
+
+/// Hand the bootloader's framebuffer to the console.
+fn adopt_framebuffer(boot_info: &mut BootInfo) {
+    let Some(framebuffer) = boot_info.framebuffer.as_mut() else {
+        return;
+    };
+
+    let info = framebuffer.info();
+    let slice = framebuffer.buffer_mut();
+    let ptr = slice.as_mut_ptr();
+    let len = slice.len();
+
+    // SAFETY: widening this borrow to 'static is sound because the bootloader
+    // maps the framebuffer for the entire life of the kernel and never reclaims
+    // it. `framebuffer::init` is the sole consumer and stores it behind a `Once`,
+    // so the buffer is installed exactly once and never aliased -- the borrow we
+    // took from `boot_info` ends here, leaving `boot_info` usable by callers.
+    let buffer: &'static mut [u8] = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+
+    console::init_framebuffer(info, buffer);
 }
