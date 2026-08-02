@@ -9,8 +9,9 @@ A bare-metal microkernel written from scratch in `no_std` Rust, targeting
 [the project specification](docs/prd.md): a kernel that boots, catches its own
 faults, and manages physical and virtual memory.
 
-**Status:** Phases 1 and 2 complete, Phase 3 started (hardware interrupts).
-33 test cases across 8 boot-and-assert test kernels, all passing under QEMU.
+**Status:** Phases 1 and 2 complete, Phase 3 underway (interrupts and a
+preemptive scheduler). 40 test cases across 9 boot-and-assert test kernels, all
+passing under QEMU.
 
 ```
 Kernel Panda v0.1.0
@@ -36,7 +37,19 @@ timer at 100 Hz, waiting for ticks:
   uptime   670 ms  (67 ticks)
   uptime   870 ms  (87 ticks)
   uptime  1070 ms  (107 ticks)
+
+scheduler: spawning two workers that never yield
+  [worker-b] step 1 of 3
+  [worker-a] step 1 of 3
+  [worker-b] step 2 of 3
+  [worker-a] step 2 of 3
+  [worker-b] step 3 of 3
+  [worker-a] step 3 of 3
+  both workers finished; 3 threads live, running as 'boot'
 ```
+
+Neither worker yields. The interleaving above is entirely the timer taking the
+CPU away from them.
 
 ## Building and running
 
@@ -69,7 +82,8 @@ kernel-panda/
     │   ├── console/   16550 UART, framebuffer text console, 8x8 font
     │   ├── arch/x86_64/   GDT + TSS, IDT, Local APIC + timer, 8259 masking
     │   ├── memory/    memory map, bitmap frame allocator, page tables, heap region
-    │   └── allocator/ bump and linked-list `GlobalAlloc` implementations
+    │   ├── allocator/ bump and linked-list `GlobalAlloc` implementations
+    │   └── sched/  threads, context switch, round-robin scheduler
     └── tests/       one standalone boot-and-assert kernel per file
 ```
 
@@ -143,6 +157,22 @@ from a port, so calibration needs no interrupt, which matters when interrupts ar
 still masked. The poll is bounded so a machine whose PIT never asserts fails
 cleanly instead of hanging the boot.
 
+**The context switch exchanges only callee-saved registers.** `context_switch` is
+called like an ordinary C function, so the compiler has already spilled anything
+caller-saved at the call site; saving it again would be wasted work. Between the
+two halves the whole register file is covered.
+
+**The boot thread cannot double as the idle thread.** Idle is by definition the
+last choice, so any CPU-bound worker would starve it permanently — and with it,
+whatever the kernel booted into. There is a separate idle thread that only runs
+when the ready queue is empty.
+
+**The scheduler lock is released before the switch.** Holding a spinlock across a
+context switch leaves it locked by a thread that is no longer running. This is
+safe only because the whole scheduler runs with interrupts disabled on a single
+core, so nothing can observe the gap. It is the first thing that will need
+rethinking for SMP.
+
 **The console disables interrupts while it holds its lock.** Without this the
 kernel deadlocks the first time a handler prints: it spins on a lock held by the
 code it interrupted, which cannot run again to release it. The window is small,
@@ -171,12 +201,20 @@ which only means the hang would be intermittent.
   every access goes through the uncached mapping, but it should be tidied up.
 * Calibration trusts a single 10 ms PIT sample. Averaging several would be more
   robust on a loaded host.
+* Kernel stacks come from the heap, so they have no guard page. A thread that
+  overflows its 32 KiB corrupts whatever the allocator put beneath it, silently.
+  They should move to guard-paged mappings of their own.
+* The scheduler is strict round-robin with no priorities and no blocking. There
+  is no way to sleep or wait on anything yet, so `yield_now` in a loop is the
+  only way to wait — which burns a slice each time round.
 
 ## Phase 3 progress
 
 - [x] **M1 — Hardware interrupts.** Local APIC, calibrated periodic timer at
       100 Hz, tick counter and uptime, interrupt-safe console.
-- [ ] M2 — Preemptive thread scheduler.
+- [x] **M2 — Preemptive thread scheduler.** Kernel threads with their own
+      stacks, round-robin over a 10 ms quantum, timer-driven preemption,
+      `yield_now`, and reaping of finished threads.
 - [ ] M3 — Ring 0 → Ring 3 context switch.
 - [ ] M4 — The IPC ring buffer.
 - [ ] M5 — First user-space daemon: a shell over the serial port.

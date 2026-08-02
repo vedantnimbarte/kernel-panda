@@ -25,6 +25,7 @@ pub mod allocator;
 pub mod arch;
 pub mod console;
 pub mod memory;
+pub mod sched;
 pub mod sync;
 pub mod testing;
 pub mod time;
@@ -70,6 +71,10 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // IDT installed so a bad mapping surfaces as a page fault with an address
     // rather than as a reset. It ends by turning `alloc` on.
     memory::init(boot_info);
+
+    // The scheduler needs the heap for thread stacks, and it must exist before
+    // the first timer tick -- that handler preempts through it.
+    sched::init();
 
     // Interrupts last of all. The APIC needs its MMIO page mapped, so it cannot
     // come up before memory does -- and nothing may be unmasked until the

@@ -9,8 +9,12 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use bootloader_api::{entry_point, BootInfo};
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use panda_kernel::arch::x86_64::apic;
-use panda_kernel::{arch::x86_64::halt_loop, console, memory, println, time, BOOTLOADER_CONFIG};
+use panda_kernel::{
+    arch::x86_64::halt_loop, console, memory, println, sched, time, BOOTLOADER_CONFIG,
+};
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -61,7 +65,54 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     println!();
 
+    // Both workers busy-wait rather than sleeping, and neither ever yields.
+    // Their output interleaving is therefore entirely the timer's doing.
+    println!("scheduler: spawning two workers that never yield");
+    sched::spawn("worker-a", worker_a).expect("scheduler not running");
+    sched::spawn("worker-b", worker_b).expect("scheduler not running");
+
+    while !(WORKER_A_DONE.load(Ordering::Acquire) && WORKER_B_DONE.load(Ordering::Acquire)) {
+        sched::yield_now();
+    }
+
+    println!(
+        "  both workers finished; {} threads live, running as '{}'",
+        sched::live_thread_count(),
+        sched::current_name().unwrap_or("?")
+    );
+    println!();
+
     halt_loop()
+}
+
+static WORKER_A_DONE: AtomicBool = AtomicBool::new(false);
+static WORKER_B_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Spin for `n` timer ticks without yielding.
+///
+/// Deliberately a busy wait rather than a sleep: the point of the demo is that
+/// a thread which never gives up the CPU is taken off it anyway.
+fn busy_wait_ticks(n: u64) {
+    let target = time::ticks() + n;
+    while time::ticks() < target {
+        core::hint::spin_loop();
+    }
+}
+
+fn worker_a() {
+    for step in 1..=3 {
+        println!("  [worker-a] step {step} of 3");
+        busy_wait_ticks(15);
+    }
+    WORKER_A_DONE.store(true, Ordering::Release);
+}
+
+fn worker_b() {
+    for step in 1..=3 {
+        println!("  [worker-b] step {step} of 3");
+        busy_wait_ticks(10);
+    }
+    WORKER_B_DONE.store(true, Ordering::Release);
 }
 
 #[panic_handler]

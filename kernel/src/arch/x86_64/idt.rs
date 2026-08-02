@@ -88,11 +88,21 @@ extern "x86-interrupt" fn page_fault_handler(
     );
 }
 
-/// The APIC timer. Runs on every tick, so it does nothing but bump the counter
-/// and acknowledge -- no printing, no locks, no allocation.
+/// The APIC timer, and the kernel's preemption point.
+///
+/// The end-of-interrupt goes out *before* the scheduler is called. Otherwise the
+/// switch would carry us off to another thread with the interrupt still marked
+/// in service, and the APIC would deliver nothing further until this thread
+/// happened to be scheduled again -- if it ever were.
 extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     crate::time::tick();
     apic::end_of_interrupt();
+
+    // May not return until this thread is scheduled again. The switch happens on
+    // this thread's stack, below the interrupt frame the CPU just pushed, so
+    // resuming later unwinds back out through this handler and `iret`s
+    // correctly.
+    crate::sched::on_timer_tick();
 }
 
 /// Fires when an interrupt is withdrawn between being raised and being
