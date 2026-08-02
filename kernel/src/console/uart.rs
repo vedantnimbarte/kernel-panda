@@ -115,6 +115,17 @@ impl SerialPort {
         true
     }
 
+    /// Take a received byte if one is waiting.
+    pub fn try_read_byte(&mut self) -> Option<u8> {
+        // SAFETY: polling LSR and reading RBR on the port configured by `init`.
+        unsafe {
+            if self.line_status.read() & LSR_DATA_READY == 0 {
+                return None;
+            }
+            Some(self.data.read())
+        }
+    }
+
     pub fn write_byte(&mut self, byte: u8) {
         // SAFETY: polling LSR and writing THR on the port configured by `init`.
         // If no UART is present LSR reads 0xFF, so the drain loop sees THR_EMPTY
@@ -147,6 +158,25 @@ pub static COM1: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1_BASE));
 /// Returns `false` if the loopback self-test did not pass.
 pub fn init() -> bool {
     COM1.lock().init()
+}
+
+/// Drain any bytes the UART has received.
+///
+/// Returns how many were handed to `sink`.
+pub fn drain_input(mut sink: impl FnMut(u8)) -> usize {
+    let mut port = COM1.lock();
+    let mut count = 0;
+    // Bounded by the FIFO depth, so a stuck data-ready bit cannot spin forever.
+    while count < 32 {
+        match port.try_read_byte() {
+            Some(byte) => {
+                sink(byte);
+                count += 1;
+            }
+            None => break,
+        }
+    }
+    count
 }
 
 #[doc(hidden)]

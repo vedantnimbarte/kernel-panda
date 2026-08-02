@@ -24,6 +24,7 @@ use bootloader_api::BootInfo;
 pub mod allocator;
 pub mod arch;
 pub mod console;
+pub mod gbm;
 pub mod ipc;
 pub mod memory;
 pub mod pci;

@@ -25,12 +25,14 @@ use crate::memory::paging::{self, MapError};
 /// 0x4444_4444_0000, and the APIC window at 0x7777_0000_0000.
 pub const USER_BASE: u64 = 0x0000_2000_0000_0000;
 
-/// Address space handed to each user thread. Generous, and it keeps the
-/// arithmetic obvious in a fault dump.
-pub const SLOT_SIZE: u64 = 0x10_0000;
+/// Address space handed to each user thread.
+///
+/// 64 MiB, sized by the graphics case rather than the code case: a single
+/// 1280x720 32-bit buffer is 3.6 MiB, and a compositor maps several at once.
+pub const SLOT_SIZE: u64 = 0x400_0000;
 
 /// How many slots exist, and therefore the end of the user region.
-pub const MAX_SLOTS: u64 = 64;
+pub const MAX_SLOTS: u64 = 16;
 
 /// One past the last address Ring 3 may ever name.
 pub const USER_REGION_END: u64 = USER_BASE + MAX_SLOTS * SLOT_SIZE;
@@ -42,6 +44,14 @@ const CODE_OFFSET: u64 = 0;
 const DATA_OFFSET: u64 = 0x1000;
 const STACK_BOTTOM_OFFSET: u64 = 0x1_0000;
 const STACK_PAGES: u64 = 4;
+
+/// Where shared graphics buffers start being mapped, well clear of the stack.
+pub const BUFFER_AREA_OFFSET: u64 = 0x10_0000;
+
+/// Base address of a thread's slot.
+pub fn slot_base_of(slot: u64) -> u64 {
+    slot_base(slot)
+}
 
 /// Where a loaded program's pieces ended up.
 #[derive(Debug, Clone, Copy)]

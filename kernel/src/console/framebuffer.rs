@@ -209,6 +209,11 @@ pub fn buffer_len() -> usize {
     CONSOLE.get().map_or(0, |console| console.lock().buffer.len())
 }
 
+/// Geometry and pixel format of the adopted framebuffer.
+pub fn info() -> Option<FrameBufferInfo> {
+    CONSOLE.get().map(|console| console.lock().info)
+}
+
 /// Blank the screen and return the cursor to the top-left.
 pub fn clear() {
     if let Some(console) = CONSOLE.get() {

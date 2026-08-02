@@ -1,0 +1,426 @@
+//! Generic buffer management.
+//!
+//! Graphics memory that outlives a single process and can be handed between
+//! them. A client allocates a buffer, renders into it, and passes the handle to
+//! the compositor over IPC; the compositor maps the same physical frames and
+//! reads them. Nothing is copied through the kernel.
+//!
+//! Handles are checked the same way IPC endpoints are: holding a buffer id is
+//! not permission to map it. The owner may share a buffer with a specific
+//! thread, and only the owner and its share list can map.
+//!
+//! The scanout buffer is the exception that makes the whole thing useful -- it
+//! wraps the display controller's own memory rather than frames from the
+//! allocator, which is how a Ring 3 compositor gets to put pixels on a screen.
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::{PhysAddr, VirtAddr};
+
+use crate::memory::paging;
+use crate::sched::ThreadId;
+use crate::sync::{without_interrupts, Mutex};
+use crate::syscall::Error;
+use crate::{console, userspace};
+
+const PAGE_SIZE: u64 = 4096;
+
+/// Everything here is 32 bits per pixel. The hardware formats we care about are
+/// all four bytes wide, and a format negotiation is not worth its complexity
+/// until something needs a second one.
+pub const BYTES_PER_PIXEL: u32 = 4;
+
+/// Ceiling on a single allocation, so one process cannot exhaust physical
+/// memory by asking for an enormous buffer.
+const MAX_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BufferId(pub u64);
+
+/// Shared with user space, so the layout is part of the ABI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BufferInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row. Not always `width * 4` -- the scanout buffer inherits the
+    /// hardware's stride, which is commonly padded.
+    pub stride: u32,
+    pub bytes_per_pixel: u32,
+    pub size: u64,
+}
+
+struct Buffer {
+    info: BufferInfo,
+    frames: Vec<PhysFrame<Size4KiB>>,
+    /// False for the scanout buffer: those frames are the display controller's
+    /// memory, not the frame allocator's, and returning them would be a
+    /// catastrophic double free.
+    owns_frames: bool,
+    owner: ThreadId,
+    shared_with: Vec<ThreadId>,
+    /// Where each thread has it mapped.
+    mappings: Vec<(ThreadId, u64)>,
+}
+
+impl Buffer {
+    fn may_access(&self, thread: ThreadId) -> bool {
+        self.owner == thread || self.shared_with.contains(&thread)
+    }
+}
+
+struct Registry {
+    buffers: BTreeMap<u64, Buffer>,
+    next_id: u64,
+    /// Next free offset in each thread's buffer area, so two buffers mapped by
+    /// the same thread never overlap.
+    next_offset: BTreeMap<usize, u64>,
+    /// The scanout buffer, created on first request and shared thereafter.
+    scanout: Option<BufferId>,
+}
+
+impl Registry {
+    fn new() -> Self {
+        Self {
+            buffers: BTreeMap::new(),
+            next_id: 1,
+            next_offset: BTreeMap::new(),
+            scanout: None,
+        }
+    }
+}
+
+static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
+
+fn with<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
+    without_interrupts(|| {
+        let mut guard = REGISTRY.lock();
+        f(guard.get_or_insert_with(Registry::new))
+    })
+}
+
+/// Allocate a buffer backed by fresh physical frames.
+pub fn create(owner: ThreadId, width: u32, height: u32) -> Result<BufferId, Error> {
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidArgument);
+    }
+
+    let stride = width
+        .checked_mul(BYTES_PER_PIXEL)
+        .ok_or(Error::InvalidArgument)?;
+    let size = (stride as u64)
+        .checked_mul(height as u64)
+        .ok_or(Error::InvalidArgument)?;
+
+    if size > MAX_BUFFER_BYTES {
+        return Err(Error::InvalidArgument);
+    }
+
+    let pages = size.div_ceil(PAGE_SIZE);
+    let mut frames = Vec::new();
+
+    // Take the frames up front. A partial allocation that then fails has to give
+    // everything back, or a process can leak physical memory by asking for
+    // buffers it knows will not fit.
+    for _ in 0..pages {
+        match crate::memory::frame::with(|allocator| allocator.allocate()) {
+            Some(frame) => frames.push(frame),
+            None => {
+                crate::memory::frame::with(|allocator| {
+                    for frame in frames.drain(..) {
+                        allocator.deallocate(frame);
+                    }
+                });
+                return Err(Error::OutOfMemory);
+            }
+        }
+    }
+
+    Ok(with(|registry| {
+        let id = registry.next_id;
+        registry.next_id += 1;
+        registry.buffers.insert(
+            id,
+            Buffer {
+                info: BufferInfo {
+                    width,
+                    height,
+                    stride,
+                    bytes_per_pixel: BYTES_PER_PIXEL,
+                    size,
+                },
+                frames,
+                owns_frames: true,
+                owner,
+                shared_with: Vec::new(),
+                mappings: Vec::new(),
+            },
+        );
+        BufferId(id)
+    }))
+}
+
+/// The display's own memory, as a buffer.
+///
+/// Created once and shared on every later call: there is one screen, and two
+/// independent handles to it would let two compositors fight over the same
+/// pixels without either knowing.
+pub fn scanout(owner: ThreadId) -> Result<BufferId, Error> {
+    let info = console::framebuffer::info().ok_or(Error::NoSuchEndpoint)?;
+    let virtual_base = console::framebuffer::buffer_address().ok_or(Error::NoSuchEndpoint)?;
+    let physical_base = paging::translate(VirtAddr::new(virtual_base))
+        .ok_or(Error::BadPointer)?
+        .as_u64();
+
+    let size = info.byte_len as u64;
+    let pages = size.div_ceil(PAGE_SIZE);
+
+    // The display's memory is physically contiguous, so the frame list is just
+    // an arithmetic sequence from the BAR.
+    let frames = (0..pages)
+        .map(|index| PhysFrame::containing_address(PhysAddr::new(physical_base + index * PAGE_SIZE)))
+        .collect();
+
+    Ok(with(|registry| {
+        if let Some(existing) = registry.scanout {
+            // Whoever asks second gets access rather than a second handle.
+            if let Some(buffer) = registry.buffers.get_mut(&existing.0) {
+                if !buffer.may_access(owner) {
+                    buffer.shared_with.push(owner);
+                }
+            }
+            return existing;
+        }
+
+        let id = registry.next_id;
+        registry.next_id += 1;
+        registry.buffers.insert(
+            id,
+            Buffer {
+                info: BufferInfo {
+                    width: info.width as u32,
+                    height: info.height as u32,
+                    stride: (info.stride * info.bytes_per_pixel) as u32,
+                    bytes_per_pixel: info.bytes_per_pixel as u32,
+                    size,
+                },
+                frames,
+                owns_frames: false,
+                owner,
+                shared_with: Vec::new(),
+                mappings: Vec::new(),
+            },
+        );
+
+        registry.scanout = Some(BufferId(id));
+        BufferId(id)
+    }))
+}
+
+/// Let `target` map this buffer. Owner only.
+pub fn share(owner: ThreadId, target: ThreadId, buffer: BufferId) -> Result<(), Error> {
+    with(|registry| {
+        let entry = registry
+            .buffers
+            .get_mut(&buffer.0)
+            .ok_or(Error::NoSuchEndpoint)?;
+
+        if entry.owner != owner {
+            return Err(Error::NoCapability);
+        }
+        if !entry.shared_with.contains(&target) {
+            entry.shared_with.push(target);
+        }
+        Ok(())
+    })
+}
+
+/// Map a buffer into a thread's slot and return the address it landed at.
+///
+/// Mapping twice returns the existing address rather than consuming more of the
+/// slot.
+pub fn map(thread: ThreadId, buffer: BufferId) -> Result<u64, Error> {
+    // Collect what is needed under the lock, then map outside it: establishing a
+    // mapping takes the page-table and frame-allocator locks, and nesting those
+    // under this one in some paths but not others is how deadlocks appear.
+    let (frames, size, address) = with(|registry| {
+        let entry = registry
+            .buffers
+            .get_mut(&buffer.0)
+            .ok_or(Error::NoSuchEndpoint)?;
+
+        if !entry.may_access(thread) {
+            return Err(Error::NoCapability);
+        }
+
+        if let Some((_, existing)) = entry.mappings.iter().find(|(id, _)| *id == thread) {
+            return Ok((Vec::new(), 0u64, *existing));
+        }
+
+        let slot_base = userspace::slot_base_of(thread.0 as u64);
+        let offset = registry
+            .next_offset
+            .entry(thread.0)
+            .or_insert(userspace::BUFFER_AREA_OFFSET);
+
+        let address = slot_base + *offset;
+        let span = entry.info.size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+
+        if *offset + span > userspace::SLOT_SIZE {
+            return Err(Error::OutOfMemory);
+        }
+        *offset += span;
+
+        entry.mappings.push((thread, address));
+        Ok((entry.frames.clone(), entry.info.size, address))
+    })?;
+
+    // Already mapped.
+    if size == 0 {
+        return Ok(address);
+    }
+
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    for (index, frame) in frames.iter().enumerate() {
+        let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(VirtAddr::new(
+            address + index as u64 * PAGE_SIZE,
+        ));
+
+        // SAFETY: for an allocated buffer these frames came from the frame
+        // allocator and are owned by this buffer alone. For the scanout buffer
+        // they are the display controller's MMIO window, which the allocator
+        // never hands out because it sits far above the highest usable RAM
+        // address. Either way nothing else will map them behind our back.
+        unsafe { paging::map_to_frame(page, *frame, flags) }.map_err(|_| Error::OutOfMemory)?;
+    }
+
+    Ok(address)
+}
+
+/// Release a buffer and return its frames to the allocator. Owner only.
+///
+/// Every mapping is torn down first. Freeing frames that are still reachable
+/// from a user address space is a use-after-free the kernel handed out itself --
+/// the process would go on writing into memory the allocator had given to
+/// someone else.
+pub fn destroy(owner: ThreadId, buffer: BufferId) -> Result<(), Error> {
+    let (frames, mappings, span) = with(|registry| {
+        let entry = registry
+            .buffers
+            .get(&buffer.0)
+            .ok_or(Error::NoSuchEndpoint)?;
+
+        if entry.owner != owner {
+            return Err(Error::NoCapability);
+        }
+        if registry.scanout == Some(buffer) {
+            // There is one screen and it is not the caller's to destroy.
+            return Err(Error::InvalidArgument);
+        }
+
+        let entry = registry
+            .buffers
+            .remove(&buffer.0)
+            .expect("present a moment ago");
+        let span = entry.info.size.div_ceil(PAGE_SIZE);
+        let frames = if entry.owns_frames {
+            entry.frames
+        } else {
+            Vec::new()
+        };
+        Ok((frames, entry.mappings, span))
+    })?;
+
+    for (_, address) in mappings {
+        for index in 0..span {
+            let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(
+                VirtAddr::new(address + index * PAGE_SIZE),
+            );
+            // The frames are freed below rather than here, so `unmap` is used
+            // instead of `unmap_and_free`: a scanout buffer's frames belong to
+            // the display controller and must never reach the allocator.
+            let _ = paging::unmap(page);
+        }
+    }
+
+    crate::memory::frame::with(|allocator| {
+        for frame in frames {
+            allocator.deallocate(frame);
+        }
+    });
+
+    Ok(())
+}
+
+pub fn info(thread: ThreadId, buffer: BufferId) -> Result<BufferInfo, Error> {
+    with(|registry| {
+        let entry = registry
+            .buffers
+            .get(&buffer.0)
+            .ok_or(Error::NoSuchEndpoint)?;
+        if !entry.may_access(thread) {
+            return Err(Error::NoCapability);
+        }
+        Ok(entry.info)
+    })
+}
+
+/// Whether a thread may map a buffer. Diagnostic, and used by tests.
+pub fn may_access(thread: ThreadId, buffer: BufferId) -> bool {
+    with(|registry| {
+        registry
+            .buffers
+            .get(&buffer.0)
+            .is_some_and(|entry| entry.may_access(thread))
+    })
+}
+
+/// Number of live buffers.
+pub fn count() -> usize {
+    with(|registry| registry.buffers.len())
+}
+
+// ---------------------------------------------------------------------------
+// Syscall entry points
+// ---------------------------------------------------------------------------
+
+fn current() -> Result<ThreadId, Error> {
+    crate::sched::current_id().ok_or(Error::InvalidArgument)
+}
+
+pub fn sys_create(width: u64, height: u64) -> Result<i64, Error> {
+    let width = u32::try_from(width).map_err(|_| Error::InvalidArgument)?;
+    let height = u32::try_from(height).map_err(|_| Error::InvalidArgument)?;
+    Ok(create(current()?, width, height)?.0 as i64)
+}
+
+pub fn sys_scanout() -> Result<i64, Error> {
+    Ok(scanout(current()?)?.0 as i64)
+}
+
+pub fn sys_map(buffer: u64) -> Result<i64, Error> {
+    Ok(map(current()?, BufferId(buffer))? as i64)
+}
+
+pub fn sys_share(buffer: u64, target: u64) -> Result<i64, Error> {
+    let target = usize::try_from(target).map_err(|_| Error::InvalidArgument)?;
+    share(current()?, ThreadId(target), BufferId(buffer))?;
+    Ok(0)
+}
+
+pub fn sys_info(buffer: u64, pointer: u64) -> Result<i64, Error> {
+    let size = core::mem::size_of::<BufferInfo>() as u64;
+    if !userspace::validate_user_buffer(pointer, size, true) {
+        return Err(Error::BadPointer);
+    }
+
+    let info = info(current()?, BufferId(buffer))?;
+
+    // SAFETY: the range was just confirmed present, user-accessible and writable
+    // for the whole struct. Unaligned because nothing obliges user space to
+    // align its buffer.
+    unsafe { core::ptr::write_unaligned(pointer as *mut BufferInfo, info) };
+    Ok(0)
+}

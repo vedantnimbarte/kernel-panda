@@ -10,6 +10,7 @@
 
 pub mod font;
 pub mod framebuffer;
+pub mod input;
 pub mod uart;
 
 use core::fmt;

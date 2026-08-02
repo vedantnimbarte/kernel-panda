@@ -20,6 +20,12 @@ pub mod numbers {
     pub const IPC_SEND: u64 = 5;
     pub const IPC_RECV: u64 = 6;
     pub const IPC_GRANT: u64 = 7;
+    pub const BUF_CREATE: u64 = 8;
+    pub const BUF_MAP: u64 = 9;
+    pub const BUF_SHARE: u64 = 10;
+    pub const BUF_INFO: u64 = 11;
+    pub const BUF_SCANOUT: u64 = 12;
+    pub const READ: u64 = 13;
 }
 
 /// Returned in RAX as a negative value.
@@ -36,6 +42,8 @@ pub enum Error {
     QueueFull = -4,
     NoSuchEndpoint = -5,
     InvalidArgument = -6,
+    /// No physical memory, or no room left in the caller's address space.
+    OutOfMemory = -7,
 }
 
 pub type SyscallResult = Result<i64, Error>;
@@ -72,6 +80,12 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::IPC_SEND => crate::ipc::sys_send(frame.rdi, frame.rsi),
         numbers::IPC_RECV => crate::ipc::sys_recv(frame.rdi, frame.rsi),
         numbers::IPC_GRANT => crate::ipc::sys_grant(frame.rdi, frame.rsi, frame.rdx),
+        numbers::BUF_CREATE => crate::gbm::sys_create(frame.rdi, frame.rsi),
+        numbers::BUF_MAP => crate::gbm::sys_map(frame.rdi),
+        numbers::BUF_SHARE => crate::gbm::sys_share(frame.rdi, frame.rsi),
+        numbers::BUF_INFO => crate::gbm::sys_info(frame.rdi, frame.rsi),
+        numbers::BUF_SCANOUT => crate::gbm::sys_scanout(),
+        numbers::READ => crate::console::input::sys_read(frame.rdi, frame.rsi, frame.rdx),
         _ => Err(Error::UnknownCall),
     };
 

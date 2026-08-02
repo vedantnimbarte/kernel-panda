@@ -136,6 +136,12 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     crate::time::tick();
     apic::end_of_interrupt();
 
+    // Drain the serial port before scheduling. There is no receive interrupt --
+    // routing IRQ 4 would mean programming the IOAPIC, and finding it properly
+    // means ACPI. At 100 Hz this adds at most 10 ms of latency, well inside the
+    // UART's FIFO for anything a person types.
+    crate::console::input::poll();
+
     // May not return until this thread is scheduled again. The switch happens on
     // this thread's stack, below the interrupt frame the CPU just pushed, so
     // resuming later unwinds back out through this handler and `iret`s
