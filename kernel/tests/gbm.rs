@@ -53,10 +53,12 @@ fn a_created_buffer_reports_its_geometry() {
     let buffer = gbm::create(me(), 64, 32).expect("create failed");
     let info = gbm::info(me(), buffer).expect("info failed");
 
+    let depth = gbm::bytes_per_pixel();
     assert_eq!(info.width, 64);
     assert_eq!(info.height, 32);
-    assert_eq!(info.stride, 64 * 4);
-    assert_eq!(info.size, 64 * 32 * 4);
+    assert_eq!(info.bytes_per_pixel, depth);
+    assert_eq!(info.stride, 64 * depth);
+    assert_eq!(info.size, u64::from(64 * 32 * depth));
 
     gbm::destroy(me(), buffer).expect("destroy failed");
 }

@@ -257,7 +257,7 @@ pub fn read_bar(address: Address, index: u8) -> Option<Bar> {
                 (!combined_mask).wrapping_add(1),
             )
         } else {
-            let size = (!(mask & 0xFFFF_FFF0) as u32).wrapping_add(1) as u64;
+            let size = (!(mask & 0xFFFF_FFF0)).wrapping_add(1) as u64;
             (low, size)
         };
 

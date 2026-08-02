@@ -9,9 +9,11 @@ A bare-metal microkernel written from scratch in `no_std` Rust, targeting
 [the project specification](docs/prd.md): a kernel that boots, catches its own
 faults, and manages physical and virtual memory.
 
-**Status:** Phases 1 and 2 complete; Phase 3 through Milestone 4 — interrupts, a
-preemptive scheduler, Ring 3 user space, and capability-mediated IPC. 60 test
-cases across 11 boot-and-assert test kernels, all passing under QEMU.
+**Status:** all 17 milestones of the PRD roadmap are implemented — from a
+freestanding binary through a preemptive scheduler, Ring 3 user space,
+capability-mediated IPC, PCIe enumeration, and a display server that composites
+client buffers onto the screen from Ring 3. 88 test cases across 14
+boot-and-assert test kernels, all passing under QEMU.
 
 ```
 Kernel Panda v0.1.0
@@ -58,6 +60,27 @@ ipc: a blocking logger thread fed over a capability
   [logger] tag 0x0103 word0  30 from thread 0
   [logger] tag 0xcafe word0 48879 from thread 6
   logger exited; endpoint drained to 0
+
+compositor: a ring 3 display server
+  compositor mapped the scanout buffer and is waiting for surfaces
+  presented a blue surface at (120, 260)
+  presented a green surface at (260, 260)
+  presented a red surface at (400, 260)
+  input daemon sent shutdown; both daemons exited
+
+shell: a ring 3 daemon reading the serial port
+panda> help
+commands: help version hello exit
+panda> version
+Kernel Panda, ring 3 shell
+panda> exit
+shell exiting
+
+pci: 6 devices
+  00:00.0  8086:1237  class 06.00  host bridge
+  00:02.0  1234:1111  class 03.00  display controller
+  ...
+    bar0: Memory { address: fd000000, size: 1000000, prefetchable: true }
 ```
 
 Neither worker yields — the interleaving is entirely the timer taking the CPU
@@ -100,7 +123,9 @@ kernel-panda/
     │   ├── sched/  threads, context switch, round-robin scheduler
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
     │   ├── syscall.rs    the entire Ring 3 surface
-    │   └── ipc.rs        endpoints, capabilities, blocking receive
+    │   ├── ipc.rs        endpoints, capabilities, blocking receive
+    │   ├── pci.rs        bus enumeration and BAR decoding
+    │   └── gbm.rs        shared graphics buffers and the scanout
     └── tests/       one standalone boot-and-assert kernel per file
 ```
 
@@ -216,6 +241,23 @@ address space.
 already holds, and requires the `GRANT` right to perform at all. Naming an
 endpoint conveys nothing on its own.
 
+**The display's pixel format is read, not assumed.** QEMU's framebuffer is 24-bit,
+and a client rendering 32-bit pixels into it produces an image sheared a little
+further right on every row. Buffers take their depth from the display so the two
+always agree.
+
+**The compositor never touches the hardware.** It reaches the screen only through
+a shared buffer handle and learns what to draw only through IPC. The scanout
+buffer is a singleton — two handles to one screen would let two compositors fight
+over the same pixels with neither aware of the other — and it refuses to be
+destroyed, because returning MMIO to the frame allocator would be a catastrophic
+double free.
+
+**The compositor tests assert on real pixels.** They read the display's memory
+back and check the colour at the requested coordinates, and that just past the
+surface's edge nothing was touched. A blit that runs one row long, or lands at
+the wrong offset, passes every structural check and fails these.
+
 **The console disables interrupts while it holds its lock.** Without this the
 kernel deadlocks the first time a handler prints: it spins on a lock held by the
 code it interrupted, which cannot run again to release it. The window is small,
@@ -256,8 +298,18 @@ which only means the hang would be intermittent.
   process gets its own page tables, IPC capabilities are the isolation boundary
   rather than a second layer behind it. This is the most significant gap in the
   system and should be closed before anything untrusted runs.
-* User programs are hand-written position-independent blobs copied into a single
-  page. Loading real ELF images is a prerequisite for M5.
+* **User programs are hand-written assembly blobs** copied into a single page. A
+  Rust function lives in kernel pages that are deliberately not user-accessible,
+  so it cannot be executed from Ring 3; the honest fix is a separate userland
+  crate and an ELF loader, and that is the single highest-value thing left to
+  build. Everything in user space is constrained by its absence.
+* The compositor has no damage tracking, no double buffering and no z-order. It
+  blits each surface once, as it arrives.
+* PCI uses the port-based config mechanism, so extended config space above
+  offset 0xFF is unreachable. Getting there means parsing the ACPI MCFG table.
+* Input is polled from the timer rather than driven by an interrupt, which caps
+  throughput at the tick rate. Routing IRQ 4 needs the IOAPIC, and finding the
+  IOAPIC properly needs ACPI.
 * Syscalls run with interrupts disabled, because the gate is an interrupt gate.
   Long-running calls are therefore not preemptible; only `write` is bounded
   today, and every future call has to stay short or the quantum is a fiction.
@@ -275,4 +327,15 @@ which only means the hang would be intermittent.
 - [x] **M4 — IPC.** Bounded endpoint queues, unforgeable sender identity,
       capabilities with `SEND`/`RECEIVE`/`GRANT`, and a blocking receive that
       parks the thread rather than spinning.
-- [ ] M5 — First user-space daemon: a shell over the serial port.
+- [x] **M5 — First user-space daemon.** A line-editing shell over the serial
+      port, running in Ring 3 and parking in the kernel between keystrokes.
+
+## Phase 4 progress
+
+- [x] **M1 — PCIe enumeration.** Full bus sweep, class decoding, BAR sizing.
+- [x] **M2 — Generic buffer management.** Shared graphics buffers with
+      capability-checked handles, plus a scanout buffer wrapping display memory.
+- [x] **M3 — Input daemon.** A Ring 3 process that owns console input, drops
+      control codes, and forwards the rest over IPC.
+- [x] **M4 — Sovereign compositor.** A Ring 3 display server that maps the
+      scanout buffer and blits client surfaces into it.

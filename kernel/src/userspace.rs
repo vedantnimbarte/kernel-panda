@@ -487,7 +487,241 @@ global_asm!(
     options(att_syntax),
 );
 
+// The input daemon. Reads raw bytes from the console and forwards the ones it
+// approves of to a single endpoint, handed to it in R15.
+//
+// It is the sanitiser the PRD asks for: control characters are dropped rather
+// than passed on, so a downstream compositor never sees a byte it did not ask
+// for. It is also the only thing holding a read capability on the console,
+// which is what stops any other process from watching the keyboard.
+global_asm!(
+    ".section .rodata",
+    ".balign 16",
+    ".global USER_INPUT_START",
+    "USER_INPUT_START:",
+    "  subq $128, %rsp",
+    ".Lin_loop:",
+    "  movq $13, %rax", // READ
+    "  xorq %rdi, %rdi",
+    "  movq %rsp, %rsi",
+    "  movq $1, %rdx",
+    "  int $0x80",
+    "  cmpq $1, %rax",
+    "  jne .Lin_loop",
+    "  movzbq (%rsp), %rbx",
+    // Escape ends the session.
+    "  cmpq $0x1b, %rbx",
+    "  je .Lin_quit",
+    // Printable ASCII passes.
+    "  cmpq $0x20, %rbx",
+    "  jb .Lin_control",
+    "  cmpq $0x7e, %rbx",
+    "  ja .Lin_loop", // above printable: drop
+    "  jmp .Lin_send",
+    ".Lin_control:",
+    // Of the control codes, only newline and carriage return mean anything.
+    "  cmpq $0x0a, %rbx",
+    "  je .Lin_send",
+    "  cmpq $0x0d, %rbx",
+    "  je .Lin_send",
+    "  jmp .Lin_loop", // everything else is dropped
+    ".Lin_send:",
+    "  movq $1, 16(%rsp)", // tag 1: key event
+    "  movq %rbx, 24(%rsp)",
+    "  movq $0, 32(%rsp)",
+    "  movq $0, 40(%rsp)",
+    "  movq $0, 48(%rsp)",
+    "  movq $0, 56(%rsp)",
+    "  movq $5, %rax", // IPC_SEND
+    "  movq %r15, %rdi",
+    "  leaq 16(%rsp), %rsi",
+    "  int $0x80",
+    "  jmp .Lin_loop",
+    ".Lin_quit:",
+    // Tag 0 tells the consumer to shut down too.
+    "  movq $0, 16(%rsp)",
+    "  movq $0, 24(%rsp)",
+    "  movq $0, 32(%rsp)",
+    "  movq $0, 40(%rsp)",
+    "  movq $0, 48(%rsp)",
+    "  movq $0, 56(%rsp)",
+    "  movq $5, %rax",
+    "  movq %r15, %rdi",
+    "  leaq 16(%rsp), %rsi",
+    "  int $0x80",
+    "  movq $0, %rax",
+    "  movq $0, %rdi",
+    "  int $0x80",
+    ".global USER_INPUT_END",
+    "USER_INPUT_END:",
+    ".section .text",
+    options(att_syntax),
+);
+
+// The compositor. Maps the scanout buffer, then blits client buffers into it as
+// their handles arrive over IPC.
+//
+// R15 carries its endpoint. Stack layout, all offsets from RSP:
+//     0   scanout BufferInfo (24 bytes)
+//    32   incoming Message (48 bytes)
+//    96   client BufferInfo (24 bytes)
+//   128   x, 136 y, 144 row, 152 client mapping
+global_asm!(
+    ".section .rodata",
+    ".balign 16",
+    ".global USER_COMPOSITOR_START",
+    "USER_COMPOSITOR_START:",
+    "  subq $256, %rsp",
+    "  movq $12, %rax", // BUF_SCANOUT
+    "  int $0x80",
+    "  movq %rax, %r12", // scanout id
+    "  movq $9, %rax",   // BUF_MAP
+    "  movq %r12, %rdi",
+    "  int $0x80",
+    "  movq %rax, %r13", // scanout base
+    "  movq $11, %rax",  // BUF_INFO
+    "  movq %r12, %rdi",
+    "  movq %rsp, %rsi",
+    "  int $0x80",
+    "  movl 8(%rsp), %r14d", // scanout stride
+    ".Lco_loop:",
+    "  movq $6, %rax", // IPC_RECV, parks until something arrives
+    "  movq %r15, %rdi",
+    "  leaq 32(%rsp), %rsi",
+    "  int $0x80",
+    "  movq 32(%rsp), %rbx", // tag
+    "  testq %rbx, %rbx",
+    "  jz .Lco_exit", // tag 0: shut down
+    "  cmpq $2, %rbx",
+    "  jne .Lco_loop", // only "present" is understood
+    // words[0] buffer, words[1] x, words[2] y
+    "  movq $9, %rax", // BUF_MAP
+    "  movq 40(%rsp), %rdi",
+    "  int $0x80",
+    "  movq %rax, 152(%rsp)",
+    "  movq $11, %rax", // BUF_INFO
+    "  movq 40(%rsp), %rdi",
+    "  leaq 96(%rsp), %rsi",
+    "  int $0x80",
+    "  movq 48(%rsp), %rax",
+    "  movq %rax, 128(%rsp)", // x
+    "  movq 56(%rsp), %rax",
+    "  movq %rax, 136(%rsp)", // y
+    "  movq $0, 144(%rsp)",   // row
+    ".Lco_row:",
+    "  movq 144(%rsp), %rbx",
+    "  movl 100(%rsp), %eax", // client height
+    "  cmpq %rax, %rbx",
+    "  jae .Lco_loop",
+    // destination = scanout + (y + row) * scanout_stride + x * 4
+    "  movq 136(%rsp), %rax",
+    "  addq %rbx, %rax",
+    "  imulq %r14, %rax",
+    "  addq %r13, %rax",
+    "  movq 128(%rsp), %rsi",
+    "  movl 108(%rsp), %ecx", // bytes per pixel, from the client's own info
+    "  imulq %rcx, %rsi",
+    "  addq %rsi, %rax",
+    "  movq %rax, %rdi",
+    // source = client + row * client_stride
+    "  movl 104(%rsp), %eax",
+    "  imulq %rbx, %rax",
+    "  addq 152(%rsp), %rax",
+    "  movq %rax, %rsi",
+    // One row. The client's stride is exactly width * bpp, so it is the row
+    // length in bytes as well as the pitch.
+    "  movl 104(%rsp), %ecx",
+    "  cld",
+    "  rep movsb",
+    "  incq %rbx",
+    "  movq %rbx, 144(%rsp)",
+    "  jmp .Lco_row",
+    ".Lco_exit:",
+    "  movq $0, %rax",
+    "  movq $0, %rdi",
+    "  int $0x80",
+    ".global USER_COMPOSITOR_END",
+    "USER_COMPOSITOR_END:",
+    ".section .text",
+    options(att_syntax),
+);
+
+// A graphics client. Allocates a buffer, fills it with one colour, shares it
+// with the compositor and asks for it to be shown.
+//
+// Its parameters come from its own data page rather than a register, because
+// there are more of them than `iretq` can carry. The page sits one page above
+// the code, and the code knows where it is because it is position-independent:
+//     0 colour, 8 x, 16 y, 24 endpoint, 32 width, 40 height, 48 compositor tid
+global_asm!(
+    ".section .rodata",
+    ".balign 16",
+    ".global USER_CLIENT_START",
+    "USER_CLIENT_START:",
+    "  subq $128, %rsp",
+    "  leaq USER_CLIENT_START(%rip), %r12",
+    "  addq $0x1000, %r12", // the data page
+    "  movq $8, %rax",      // BUF_CREATE
+    "  movq 32(%r12), %rdi",
+    "  movq 40(%r12), %rsi",
+    "  int $0x80",
+    "  movq %rax, %r13", // buffer id
+    "  movq $9, %rax",   // BUF_MAP
+    "  movq %r13, %rdi",
+    "  int $0x80",
+    "  movq %rax, %r14", // buffer base
+    // Fill, one pixel at a time. `rep stosl` would be faster but assumes four
+    // bytes per pixel, and this display uses three.
+    "  movq 32(%r12), %rcx",
+    "  imulq 40(%r12), %rcx", // pixel count
+    "  movq 56(%r12), %rbx",  // bytes per pixel
+    "  movq %r14, %rdi",
+    ".Lcl_fill:",
+    "  testq %rcx, %rcx",
+    "  jz .Lcl_filled",
+    "  movq 0(%r12), %rax", // colour, reloaded because the shifts destroy it
+    "  movb %al, 0(%rdi)",
+    "  shrq $8, %rax",
+    "  movb %al, 1(%rdi)",
+    "  shrq $8, %rax",
+    "  movb %al, 2(%rdi)",
+    "  addq %rbx, %rdi",
+    "  decq %rcx",
+    "  jmp .Lcl_fill",
+    ".Lcl_filled:",
+    "  movq $10, %rax", // BUF_SHARE with the compositor
+    "  movq %r13, %rdi",
+    "  movq 48(%r12), %rsi",
+    "  int $0x80",
+    // present(buffer, x, y)
+    "  movq $2, 64(%rsp)",
+    "  movq %r13, 72(%rsp)",
+    "  movq 8(%r12), %rax",
+    "  movq %rax, 80(%rsp)",
+    "  movq 16(%r12), %rax",
+    "  movq %rax, 88(%rsp)",
+    "  movq $0, 96(%rsp)",
+    "  movq $0, 104(%rsp)",
+    "  movq $5, %rax", // IPC_SEND
+    "  movq 24(%r12), %rdi",
+    "  leaq 64(%rsp), %rsi",
+    "  int $0x80",
+    "  movq $0, %rax",
+    "  movq $0, %rdi",
+    "  int $0x80",
+    ".global USER_CLIENT_END",
+    "USER_CLIENT_END:",
+    ".section .text",
+    options(att_syntax),
+);
+
 extern "C" {
+    static USER_INPUT_START: u8;
+    static USER_INPUT_END: u8;
+    static USER_COMPOSITOR_START: u8;
+    static USER_COMPOSITOR_END: u8;
+    static USER_CLIENT_START: u8;
+    static USER_CLIENT_END: u8;
     static USER_SHELL_START: u8;
     static USER_SHELL_END: u8;
     static USER_DEMO_START: u8;
@@ -513,6 +747,39 @@ pub fn demo_program() -> &'static [u8] {
     // SAFETY: the symbols bound a range emitted by one `global_asm!` block, in
     // this order, immutable for the life of the kernel. Same for the two below.
     unsafe { blob(&raw const USER_DEMO_START, &raw const USER_DEMO_END) }
+}
+
+/// Reads the console and forwards sanitised key events to an endpoint.
+pub fn input_program() -> &'static [u8] {
+    // SAFETY: as `demo_program`.
+    unsafe { blob(&raw const USER_INPUT_START, &raw const USER_INPUT_END) }
+}
+
+/// Maps the scanout buffer and blits client buffers into it.
+pub fn compositor_program() -> &'static [u8] {
+    // SAFETY: as `demo_program`.
+    unsafe { blob(&raw const USER_COMPOSITOR_START, &raw const USER_COMPOSITOR_END) }
+}
+
+/// Allocates a buffer, fills it, and asks the compositor to show it.
+pub fn client_program() -> &'static [u8] {
+    // SAFETY: as `demo_program`.
+    unsafe { blob(&raw const USER_CLIENT_START, &raw const USER_CLIENT_END) }
+}
+
+/// Write a program's start-up parameters into its data page.
+///
+/// # Safety
+///
+/// `data` must be the data page returned by `load_program`, mapped writable, and
+/// the program must not be running yet.
+pub unsafe fn write_parameters(data: VirtAddr, values: &[u64]) {
+    assert!(values.len() * 8 <= PAGE_SIZE as usize);
+    for (index, value) in values.iter().enumerate() {
+        // SAFETY: forwarded from this function's contract; the assertion above
+        // keeps every write inside the page.
+        unsafe { core::ptr::write_volatile((data.as_u64() as *mut u64).add(index), *value) };
+    }
 }
 
 /// A line-editing shell over the serial port.

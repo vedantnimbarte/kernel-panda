@@ -27,10 +27,16 @@ use crate::{console, userspace};
 
 const PAGE_SIZE: u64 = 4096;
 
-/// Everything here is 32 bits per pixel. The hardware formats we care about are
-/// all four bytes wide, and a format negotiation is not worth its complexity
-/// until something needs a second one.
-pub const BYTES_PER_PIXEL: u32 = 4;
+/// Pixel width used for newly created buffers.
+///
+/// Taken from the display rather than fixed, because they have to agree: QEMU's
+/// framebuffer is 24-bit, and a client rendering 32-bit pixels into it would
+/// produce an image sheared a little further right on every row. Falling back to
+/// four bytes only matters on a machine with no framebuffer at all, where
+/// nothing will be composited anyway.
+pub fn bytes_per_pixel() -> u32 {
+    console::framebuffer::info().map_or(4, |info| info.bytes_per_pixel as u32)
+}
 
 /// Ceiling on a single allocation, so one process cannot exhaust physical
 /// memory by asking for an enormous buffer.
@@ -107,9 +113,8 @@ pub fn create(owner: ThreadId, width: u32, height: u32) -> Result<BufferId, Erro
         return Err(Error::InvalidArgument);
     }
 
-    let stride = width
-        .checked_mul(BYTES_PER_PIXEL)
-        .ok_or(Error::InvalidArgument)?;
+    let depth = bytes_per_pixel();
+    let stride = width.checked_mul(depth).ok_or(Error::InvalidArgument)?;
     let size = (stride as u64)
         .checked_mul(height as u64)
         .ok_or(Error::InvalidArgument)?;
@@ -148,7 +153,7 @@ pub fn create(owner: ThreadId, width: u32, height: u32) -> Result<BufferId, Erro
                     width,
                     height,
                     stride,
-                    bytes_per_pixel: BYTES_PER_PIXEL,
+                    bytes_per_pixel: depth,
                     size,
                 },
                 frames,

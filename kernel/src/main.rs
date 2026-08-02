@@ -1,4 +1,4 @@
-//! Kernel Panda boot binary.
+﻿//! Kernel Panda boot binary.
 
 #![no_std]
 #![no_main]
@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use panda_kernel::arch::x86_64::apic;
 use panda_kernel::ipc::EndpointId;
 use panda_kernel::{
-    arch::x86_64::halt_loop, console, ipc, memory, pci, println, sched, sync, syscall, time,
+    arch::x86_64::halt_loop, console, gbm, ipc, memory, pci, println, sched, sync, syscall, time,
     userspace, BOOTLOADER_CONFIG,
 };
 
@@ -139,6 +139,63 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("  logger exited; endpoint drained to {}", ipc::queued(endpoint));
     println!();
 
+    println!("compositor: a ring 3 display server");
+    let display = ipc::create(me, 16).expect("could not create an endpoint");
+    DISPLAY_ENDPOINT.store(display.0, Ordering::Release);
+
+    let compositor = sync::without_interrupts(|| {
+        let id = sched::spawn("compositor", compositor_thread).expect("scheduler not running");
+        ipc::grant(me, id, display, ipc::Rights::RECEIVE).expect("grant failed");
+        id
+    });
+    while sched::is_alive(compositor) && !sched::is_blocked(compositor) {
+        sched::yield_now();
+    }
+    println!("  compositor mapped the scanout buffer and is waiting for surfaces");
+
+    let input = sync::without_interrupts(|| {
+        let id = sched::spawn("input", input_daemon_thread).expect("scheduler not running");
+        ipc::grant(me, id, display, ipc::Rights::SEND).expect("grant failed");
+        id
+    });
+
+    // Blue, green and red, side by side. The colour is written low byte first
+    // and the display is BGR, so 0x0000FF lands as blue.
+    for (colour, x, y, name) in [
+        (0x0000FFu64, 120u64, 260u64, "blue"),
+        (0x00FF00, 260, 260, "green"),
+        (0xFF0000, 400, 260, "red"),
+    ] {
+        *CLIENT_PARAMS.lock() = [
+            colour,
+            x,
+            y,
+            display.0,
+            120,
+            90,
+            compositor.0 as u64,
+            gbm::bytes_per_pixel() as u64,
+        ];
+        let client = sync::without_interrupts(|| {
+            let id = sched::spawn("client", client_thread).expect("scheduler not running");
+            ipc::grant(me, id, display, ipc::Rights::SEND).expect("grant failed");
+            id
+        });
+        while sched::is_alive(client) {
+            sched::yield_now();
+        }
+        println!("  presented a {name} surface at ({x}, {y})");
+    }
+
+    // Escape reaches the input daemon, which forwards a shutdown to the
+    // compositor. Nothing in Ring 0 tells either of them to stop.
+    console::input::inject(0x1b);
+    while sched::is_alive(input) || sched::is_alive(compositor) {
+        sched::yield_now();
+    }
+    println!("  input daemon sent shutdown; both daemons exited");
+    println!();
+
     println!("shell: a ring 3 daemon reading the serial port");
     let shell = sched::spawn("shell", shell_thread).expect("scheduler not running");
     for line in ["help", "version", "hello", "exit"] {
@@ -226,6 +283,41 @@ fn ring3_ipc() {
     // SAFETY: `load_program` mapped the entry page user-executable and the stack
     // user-writable.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
+}
+
+static DISPLAY_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
+
+fn compositor_thread() {
+    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
+    let image = userspace::load_program(slot, userspace::compositor_program())
+        .expect("failed to map the compositor");
+    let endpoint = DISPLAY_ENDPOINT.load(Ordering::Acquire);
+    // SAFETY: load_program mapped the entry user-executable and the stack
+    // user-writable.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
+}
+
+fn input_daemon_thread() {
+    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
+    let image = userspace::load_program(slot, userspace::input_program())
+        .expect("failed to map the input daemon");
+    let endpoint = DISPLAY_ENDPOINT.load(Ordering::Acquire);
+    // SAFETY: as above.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
+}
+
+fn client_thread() {
+    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
+    let image = userspace::load_program(slot, userspace::client_program())
+        .expect("failed to map the client");
+
+    let params = *CLIENT_PARAMS.lock();
+    // SAFETY: `image.data` is the writable data page just mapped for this
+    // program, which is not running yet.
+    unsafe { userspace::write_parameters(image.data, &params) };
+    // SAFETY: as above.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
 }
 
 fn shell_thread() {
