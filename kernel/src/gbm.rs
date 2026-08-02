@@ -69,6 +69,14 @@ struct Buffer {
     shared_with: Vec<ThreadId>,
     /// Where each thread has it mapped.
     mappings: Vec<(ThreadId, u64)>,
+    /// Set when the owner exits while someone else still holds a reference.
+    ///
+    /// A buffer cannot simply die with its creator. The whole point of sharing
+    /// one is that a second process is using it, and a client that renders a
+    /// frame and exits immediately is the normal case, not an unusual one --
+    /// freeing on owner exit pulls the surface out from under the compositor
+    /// before it has drawn it.
+    orphaned: bool,
 }
 
 impl Buffer {
@@ -161,6 +169,7 @@ pub fn create(owner: ThreadId, width: u32, height: u32) -> Result<BufferId, Erro
                 owner,
                 shared_with: Vec::new(),
                 mappings: Vec::new(),
+                orphaned: false,
             },
         );
         BufferId(id)
@@ -216,6 +225,7 @@ pub fn scanout(owner: ThreadId) -> Result<BufferId, Error> {
                 owner,
                 shared_with: Vec::new(),
                 mappings: Vec::new(),
+                orphaned: false,
             },
         );
 
@@ -264,7 +274,11 @@ pub fn map(thread: ThreadId, buffer: BufferId) -> Result<u64, Error> {
             return Ok((Vec::new(), 0u64, *existing));
         }
 
-        let slot_base = userspace::slot_base_of(thread.0 as u64);
+        // The thread's allocated slot, not its id. Those were the same thing
+        // until slots became reusable, and conflating them is what let the
+        // seventeenth user program index past the end of the region.
+        let slot = userspace::ensure_slot(thread).ok_or(Error::OutOfMemory)?;
+        let slot_base = userspace::slot_base_of(slot);
         let offset = registry
             .next_offset
             .entry(thread.0)
@@ -357,6 +371,77 @@ pub fn destroy(owner: ThreadId, buffer: BufferId) -> Result<(), Error> {
     });
 
     Ok(())
+}
+
+/// Release everything a thread holds: its own buffers, its mappings of other
+/// people's buffers, and its share entries.
+///
+/// Called when the thread exits. Without it a process that allocated a
+/// framebuffer-sized buffer leaked those frames for the rest of the system's
+/// uptime, and nothing ever noticed.
+pub fn release_thread(thread: ThreadId) {
+    let (frames, unmap) = with(|registry| {
+        let scanout = registry.scanout;
+        let mut frames: Vec<PhysFrame<Size4KiB>> = Vec::new();
+        let mut unmap: Vec<(u64, u64)> = Vec::new();
+
+        // Drop this thread's mappings and share entries everywhere, and mark
+        // anything it owned as orphaned rather than destroying it outright.
+        for (id, buffer) in registry.buffers.iter_mut() {
+            if let Some(index) = buffer.mappings.iter().position(|(t, _)| *t == thread) {
+                let (_, address) = buffer.mappings.remove(index);
+                unmap.push((address, buffer.info.size.div_ceil(PAGE_SIZE)));
+            }
+            buffer.shared_with.retain(|other| *other != thread);
+
+            if buffer.owner == thread && scanout != Some(BufferId(*id)) {
+                buffer.orphaned = true;
+            }
+        }
+
+        // Now free the orphans nobody is left holding. A buffer whose owner has
+        // gone but which a compositor still has mapped stays alive until that
+        // reference goes too -- last one out frees it.
+        let unreferenced: Vec<u64> = registry
+            .buffers
+            .iter()
+            .filter(|(id, buffer)| {
+                buffer.orphaned
+                    && buffer.mappings.is_empty()
+                    && buffer.shared_with.is_empty()
+                    && scanout != Some(BufferId(**id))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in unreferenced {
+            if let Some(buffer) = registry.buffers.remove(&id) {
+                if buffer.owns_frames {
+                    frames.extend(buffer.frames);
+                }
+            }
+        }
+
+        registry.next_offset.remove(&thread.0);
+        (frames, unmap)
+    });
+
+    for (address, pages) in unmap {
+        for index in 0..pages {
+            let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(
+                VirtAddr::new(address + index * PAGE_SIZE),
+            );
+            // `unmap`, not `unmap_and_free`: scanout frames belong to the
+            // display controller and must never reach the frame allocator.
+            let _ = paging::unmap(page);
+        }
+    }
+
+    crate::memory::frame::with(|allocator| {
+        for frame in frames {
+            allocator.deallocate(frame);
+        }
+    });
 }
 
 pub fn info(thread: ThreadId, buffer: BufferId) -> Result<BufferInfo, Error> {

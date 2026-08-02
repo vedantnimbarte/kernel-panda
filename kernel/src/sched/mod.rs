@@ -294,8 +294,15 @@ pub fn is_blocked(id: ThreadId) -> bool {
 /// End the current thread. Its stack is freed by a later `schedule()`, once the
 /// switch away from it has completed.
 pub fn exit_current() -> ! {
+    let id = current_id().expect("exit_current outside a thread");
+
+    // Release resources while the thread is still running and holds no
+    // scheduler lock. `reap` cannot do this: it runs inside the timer interrupt
+    // with the scheduler locked, and freeing memory there would deadlock
+    // against a thread already inside the allocator.
+    crate::release_thread_resources(id);
+
     with(|scheduler| {
-        let id = scheduler.current;
         scheduler.thread_mut(id).state = State::Finished;
     });
 

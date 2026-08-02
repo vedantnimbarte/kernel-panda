@@ -20,6 +20,8 @@ use x86_64::VirtAddr;
 
 use crate::arch::x86_64::gdt;
 use crate::memory::paging::{self, MapError};
+use crate::sched::ThreadId;
+use crate::sync::{without_interrupts, Mutex};
 
 /// Base of everything Ring 3 can reach. Well clear of the kernel, the heap at
 /// 0x4444_4444_0000, and the APIC window at 0x7777_0000_0000.
@@ -48,9 +50,97 @@ const STACK_PAGES: u64 = 4;
 /// Where shared graphics buffers start being mapped, well clear of the stack.
 pub const BUFFER_AREA_OFFSET: u64 = 0x10_0000;
 
-/// Base address of a thread's slot.
+/// Base address of a slot, by index.
 pub fn slot_base_of(slot: u64) -> u64 {
     slot_base(slot)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadError {
+    /// Every user slot is occupied.
+    NoFreeSlot,
+    /// The program does not fit in one page.
+    TooLarge,
+    Mapping(MapError),
+}
+
+/// Which thread occupies each slot.
+///
+/// Slots are allocated from this table rather than derived from the thread id.
+/// Thread ids only ever increase -- reaped slots in the scheduler are never
+/// reused -- so using one as an index meant the seventeenth user program ran off
+/// the end of the region and panicked the kernel.
+static SLOTS: Mutex<[Option<ThreadId>; MAX_SLOTS as usize]> = Mutex::new([None; MAX_SLOTS as usize]);
+
+fn claim_slot(owner: ThreadId) -> Option<u64> {
+    without_interrupts(|| {
+        let mut slots = SLOTS.lock();
+        // Already has one: a thread loading a second program reuses its space
+        // rather than leaking the first.
+        if let Some(index) = slots.iter().position(|slot| *slot == Some(owner)) {
+            return Some(index as u64);
+        }
+        let index = slots.iter().position(Option::is_none)?;
+        slots[index] = Some(owner);
+        Some(index as u64)
+    })
+}
+
+/// The slot a thread occupies, claiming one if it has none.
+///
+/// A thread does not have to be running a user program to need user-accessible
+/// address space -- mapping a shared graphics buffer is reason enough.
+pub fn ensure_slot(owner: ThreadId) -> Option<u64> {
+    claim_slot(owner)
+}
+
+/// The slot a thread occupies, if any.
+pub fn slot_of(owner: ThreadId) -> Option<u64> {
+    without_interrupts(|| {
+        SLOTS
+            .lock()
+            .iter()
+            .position(|slot| *slot == Some(owner))
+            .map(|index| index as u64)
+    })
+}
+
+/// Slots currently in use. Diagnostic, and used by tests.
+pub fn slots_in_use() -> usize {
+    without_interrupts(|| SLOTS.lock().iter().filter(|slot| slot.is_some()).count())
+}
+
+/// Tear down a thread's user address space and return its slot to the pool.
+///
+/// Called when the thread exits. Without this, every user program permanently
+/// consumed both physical frames and one of the sixteen slots, so the system
+/// could run at most sixteen user programs in its entire uptime before refusing
+/// to start another.
+pub fn release_slot(owner: ThreadId) {
+    let Some(slot) = slot_of(owner) else {
+        return;
+    };
+    let base = slot_base(slot);
+
+    // The fixed layout `load_program` established: one code page, one data page,
+    // and the stack.
+    let mut pages = alloc::vec![base + CODE_OFFSET, base + DATA_OFFSET];
+    for index in 0..STACK_PAGES {
+        pages.push(base + STACK_BOTTOM_OFFSET + index * PAGE_SIZE);
+    }
+
+    for address in pages {
+        let page = page_at(address);
+        // Unmapped already if the program never got that far, which is fine.
+        let _ = paging::unmap_and_free(page);
+    }
+
+    without_interrupts(|| {
+        let mut slots = SLOTS.lock();
+        if let Some(entry) = slots.get_mut(slot as usize) {
+            *entry = None;
+        }
+    });
 }
 
 /// Where a loaded program's pieces ended up.
@@ -71,13 +161,15 @@ fn slot_base(slot: u64) -> u64 {
 /// The code page is left read-only afterwards. Nothing forces that -- `EFER.NXE`
 /// is off, so every present page is executable -- but a program that cannot
 /// rewrite its own instructions is one fewer thing to reason about.
-pub fn load_program(slot: u64, code: &[u8]) -> Result<UserImage, MapError> {
-    assert!(slot < MAX_SLOTS, "user slot {slot} is out of range");
-    assert!(
-        code.len() as u64 <= PAGE_SIZE,
-        "user programs larger than one page are not supported yet"
-    );
+pub fn load_program(owner: ThreadId, code: &[u8]) -> Result<UserImage, LoadError> {
+    if code.len() as u64 > PAGE_SIZE {
+        return Err(LoadError::TooLarge);
+    }
 
+    // An error, not an assertion. Running out of address space is a condition
+    // the caller can report; panicking takes the whole system down because one
+    // process asked for too much.
+    let slot = claim_slot(owner).ok_or(LoadError::NoFreeSlot)?;
     let base = slot_base(slot);
     let user_rw = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -86,14 +178,15 @@ pub fn load_program(slot: u64, code: &[u8]) -> Result<UserImage, MapError> {
     let code_page = page_at(base + CODE_OFFSET);
     let data_page = page_at(base + DATA_OFFSET);
 
-    paging::map(code_page, user_rw)?;
-    paging::map(data_page, user_rw)?;
+    paging::map(code_page, user_rw).map_err(LoadError::Mapping)?;
+    paging::map(data_page, user_rw).map_err(LoadError::Mapping)?;
 
     for index in 0..STACK_PAGES {
         paging::map(
             page_at(base + STACK_BOTTOM_OFFSET + index * PAGE_SIZE),
             user_rw,
-        )?;
+        )
+        .map_err(LoadError::Mapping)?;
     }
 
     // SAFETY: the code page was just mapped present and writable, it is `code.len()`

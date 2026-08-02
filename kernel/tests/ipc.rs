@@ -342,8 +342,8 @@ fn try_receive_does_not_block_on_an_empty_endpoint() {
 static USER_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
 fn ring3_sender() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::ipc_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::ipc_program())
         .expect("failed to map user image");
     let endpoint = USER_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: load_program mapped the entry user-executable and the stack

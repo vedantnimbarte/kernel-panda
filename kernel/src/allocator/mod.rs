@@ -16,7 +16,7 @@ pub mod linked_list;
 use core::alloc::Layout;
 use core::mem;
 
-use crate::sync::{Mutex, MutexGuard};
+use crate::sync::{IrqMutex, IrqMutexGuard};
 
 #[cfg(feature = "bump-allocator")]
 pub use bump::BumpAllocator as SelectedAllocator;
@@ -28,16 +28,24 @@ pub use linked_list::LinkedListAllocator as SelectedAllocator;
 /// `GlobalAlloc` takes `&self`, so the allocator's interior mutability has to
 /// come from somewhere. Implementing the trait directly on `Mutex<A>` is not
 /// possible -- neither is local to this crate.
+///
+/// It masks interrupts, and that is not optional. The timer handler allocates:
+/// it reaps finished threads, which drops their boxed control blocks, and it
+/// buffers console input into a growable queue. With a plain spinlock, a tick
+/// landing while any thread sits inside `alloc` deadlocks the machine outright --
+/// the handler spins on a lock whose holder can never be scheduled again.
 pub struct Locked<A> {
-    inner: Mutex<A>,
+    inner: IrqMutex<A>,
 }
 
 impl<A> Locked<A> {
     pub const fn new(inner: A) -> Self {
-        Self { inner: Mutex::new(inner) }
+        Self {
+            inner: IrqMutex::new(inner),
+        }
     }
 
-    pub fn lock(&self) -> MutexGuard<'_, A> {
+    pub fn lock(&self) -> IrqMutexGuard<'_, A> {
         self.inner.lock()
     }
 }

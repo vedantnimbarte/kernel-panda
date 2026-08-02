@@ -96,6 +96,21 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     boot_info
 }
 
+/// Give back everything a thread was holding.
+///
+/// Called from `sched::exit_current`, while the thread is still running: it can
+/// take locks and free memory there. Doing it from `reap` instead would mean
+/// freeing memory inside the timer interrupt with the scheduler lock held, which
+/// is a deadlock waiting for the right moment.
+///
+/// Lives here rather than in `sched` so the scheduler does not have to know what
+/// an endpoint or a graphics buffer is.
+pub fn release_thread_resources(thread: sched::ThreadId) {
+    gbm::release_thread(thread);
+    ipc::release_thread(thread);
+    userspace::release_slot(thread);
+}
+
 /// Hand the bootloader's framebuffer to the console.
 fn adopt_framebuffer(boot_info: &mut BootInfo) {
     let Some(framebuffer) = boot_info.framebuffer.as_mut() else {

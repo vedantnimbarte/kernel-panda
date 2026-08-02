@@ -95,6 +95,8 @@ struct Endpoint {
     capacity: usize,
     /// Threads blocked in `recv` on this endpoint, oldest first.
     waiting: VecDeque<ThreadId>,
+    /// Recorded so the endpoint can be torn down when its creator exits.
+    owner: ThreadId,
 }
 
 struct Registry {
@@ -163,6 +165,7 @@ pub fn create(owner: ThreadId, capacity: usize) -> Result<EndpointId, Error> {
                 queue: VecDeque::new(),
                 capacity,
                 waiting: VecDeque::new(),
+                owner,
             },
         );
 
@@ -246,36 +249,54 @@ pub fn send(sender: ThreadId, endpoint: EndpointId, mut message: Message) -> Res
 /// Take the next message, blocking until one arrives.
 pub fn receive(receiver: ThreadId, endpoint: EndpointId) -> Result<Message, Error> {
     loop {
-        let outcome = with(|registry| {
-            if !registry
-                .rights_of(receiver, endpoint.0)
-                .contains(Rights::RECEIVE)
-            {
-                return Err(Error::NoCapability);
-            }
+        // Interrupts stay off across both the registration and the block, and
+        // splitting them is a lost wakeup: a sender arriving in the gap pops
+        // this thread off the waiter list and calls `unblock`, which does
+        // nothing because the thread is still `Running`. It then blocks with
+        // nothing left to wake it, and sleeps forever.
+        //
+        // The registry lock is still released before blocking -- holding a lock
+        // across a context switch would leave it held by a thread that is no
+        // longer running.
+        let outcome = without_interrupts(|| -> Result<Option<Message>, Error> {
+            let popped = {
+                let mut guard = REGISTRY.lock();
+                let registry = guard.get_or_insert_with(Registry::new);
 
-            let queue = registry
-                .endpoints
-                .get_mut(&endpoint.0)
-                .ok_or(Error::NoSuchEndpoint)?;
-
-            match queue.queue.pop_front() {
-                Some(message) => Ok(Some(message)),
-                None => {
-                    // Register before releasing the lock, so a sender arriving
-                    // immediately afterwards is guaranteed to see us.
-                    queue.waiting.push_back(receiver);
-                    Ok(None)
+                if !registry
+                    .rights_of(receiver, endpoint.0)
+                    .contains(Rights::RECEIVE)
+                {
+                    return Err(Error::NoCapability);
                 }
+
+                let queue = registry
+                    .endpoints
+                    .get_mut(&endpoint.0)
+                    .ok_or(Error::NoSuchEndpoint)?;
+
+                match queue.queue.pop_front() {
+                    Some(message) => Some(message),
+                    None => {
+                        // Guarded, so a thread that loops round after a wake it
+                        // could not use does not accumulate duplicate entries.
+                        if !queue.waiting.contains(&receiver) {
+                            queue.waiting.push_back(receiver);
+                        }
+                        None
+                    }
+                }
+            };
+
+            if popped.is_none() {
+                sched::block_current();
             }
+            Ok(popped)
         })?;
 
-        match outcome {
-            Some(message) => return Ok(message),
-            // Nothing waiting. Sleep until a sender wakes us, then re-check --
-            // the queue is re-examined rather than trusted, so a spurious wake
-            // is harmless.
-            None => sched::block_current(),
+        // Re-check rather than trust the wake: a spurious one is then harmless.
+        if let Some(message) = outcome {
+            return Ok(message);
         }
     }
 }
@@ -297,6 +318,35 @@ pub fn try_receive(receiver: ThreadId, endpoint: EndpointId) -> Result<Option<Me
 
         Ok(queue.queue.pop_front())
     })
+}
+
+/// Forget a thread: drop its capabilities, its endpoints, and any record of it
+/// waiting on someone else's.
+///
+/// Called when the thread exits. Capability lists are keyed by thread id and ids
+/// are never reused, so without this the registry grows for the life of the
+/// system and endpoints outlive every process that could ever have used them.
+pub fn release_thread(thread: ThreadId) {
+    with(|registry| {
+        registry.capabilities.remove(&thread.0);
+
+        let owned: Vec<u64> = registry
+            .endpoints
+            .iter()
+            .filter(|(_, endpoint)| endpoint.owner == thread)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in owned {
+            registry.endpoints.remove(&id);
+        }
+
+        // A thread can be parked on an endpoint it does not own -- leaving a
+        // stale id there would have a later sender wake a thread that no longer
+        // exists, or worse, one that reused the slot.
+        for endpoint in registry.endpoints.values_mut() {
+            endpoint.waiting.retain(|waiter| *waiter != thread);
+        }
+    });
 }
 
 /// Rights a thread holds over an endpoint. Diagnostic, and used by tests.

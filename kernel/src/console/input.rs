@@ -29,16 +29,22 @@ struct Input {
     dropped: u64,
 }
 
+impl Input {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            waiting: VecDeque::new(),
+            dropped: 0,
+        }
+    }
+}
+
 static INPUT: Mutex<Option<Input>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut Input) -> R) -> R {
     without_interrupts(|| {
         let mut guard = INPUT.lock();
-        f(guard.get_or_insert_with(|| Input {
-            bytes: VecDeque::new(),
-            waiting: VecDeque::new(),
-            dropped: 0,
-        }))
+        f(guard.get_or_insert_with(Input::new))
     })
 }
 
@@ -99,17 +105,30 @@ pub fn inject(byte: u8) {
 /// Read up to `limit` bytes, blocking until at least one is available.
 pub fn read(reader: ThreadId, limit: usize, mut sink: impl FnMut(u8)) -> usize {
     loop {
-        let taken = with(|input| {
-            let count = input.bytes.len().min(limit);
-            for _ in 0..count {
-                if let Some(byte) = input.bytes.pop_front() {
-                    sink(byte);
+        // Interrupts stay off across both the registration and the block. If
+        // they were re-enabled in between, a byte arriving in the gap would pop
+        // this thread off the waiter list and call `unblock` while it is still
+        // `Running` -- the wake is dropped, and the thread then sleeps with
+        // nothing left to wake it.
+        let taken = without_interrupts(|| {
+            let count = {
+                let mut guard = INPUT.lock();
+                let input = guard.get_or_insert_with(Input::new);
+
+                let count = input.bytes.len().min(limit);
+                for _ in 0..count {
+                    if let Some(byte) = input.bytes.pop_front() {
+                        sink(byte);
+                    }
                 }
-            }
+                if count == 0 && !input.waiting.contains(&reader) {
+                    input.waiting.push_back(reader);
+                }
+                count
+            };
+
             if count == 0 {
-                // Register before dropping the lock, so a byte arriving
-                // immediately afterwards cannot find an empty waiter list.
-                input.waiting.push_back(reader);
+                sched::block_current();
             }
             count
         });
@@ -117,7 +136,6 @@ pub fn read(reader: ThreadId, limit: usize, mut sink: impl FnMut(u8)) -> usize {
         if taken > 0 {
             return taken;
         }
-        sched::block_current();
     }
 }
 

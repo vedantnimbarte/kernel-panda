@@ -275,8 +275,8 @@ fn ipc_logger() {
 
 /// Sends one message from Ring 3 through a capability it was granted.
 fn ring3_ipc() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::ipc_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::ipc_program())
         .expect("failed to map the user image");
     let endpoint = DEMO_ENDPOINT.load(Ordering::Acquire);
 
@@ -289,8 +289,8 @@ static DISPLAY_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
 
 fn compositor_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::compositor_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::compositor_program())
         .expect("failed to map the compositor");
     let endpoint = DISPLAY_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: load_program mapped the entry user-executable and the stack
@@ -299,8 +299,8 @@ fn compositor_thread() {
 }
 
 fn input_daemon_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::input_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::input_program())
         .expect("failed to map the input daemon");
     let endpoint = DISPLAY_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: as above.
@@ -308,8 +308,8 @@ fn input_daemon_thread() {
 }
 
 fn client_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::client_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::client_program())
         .expect("failed to map the client");
 
     let params = *CLIENT_PARAMS.lock();
@@ -321,8 +321,8 @@ fn client_thread() {
 }
 
 fn shell_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::shell_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::shell_program())
         .expect("failed to map the shell image");
     // SAFETY: load_program mapped the entry user-executable and the stack
     // user-writable.
@@ -349,8 +349,8 @@ fn type_at_shell(shell: sched::ThreadId, line: &str) {
 /// Loads the demo program into its own user slot and drops to Ring 3. Never
 /// returns -- the program ends by calling `exit`.
 fn ring3_demo() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::demo_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::demo_program())
         .expect("failed to map the user image");
 
     // SAFETY: `load_program` mapped both the entry page and the stack as

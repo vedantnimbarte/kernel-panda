@@ -1,4 +1,4 @@
-//! The Ring 3 shell daemon.
+﻿//! The Ring 3 shell daemon.
 //!
 //! Drives the shell by injecting bytes as though they had arrived on the serial
 //! line, then checks it reacted. That covers the whole path: timer-driven input
@@ -47,8 +47,8 @@ fn spin_until(condition: impl Fn() -> bool) -> bool {
 static SHELL_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn shell_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::shell_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::shell_program())
         .expect("failed to map the shell image");
     // SAFETY: load_program mapped the entry user-executable and the stack
     // user-writable.

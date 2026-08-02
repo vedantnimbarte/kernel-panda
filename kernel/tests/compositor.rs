@@ -1,4 +1,4 @@
-//! The input daemon and the Sovereign compositor.
+﻿//! The input daemon and the Sovereign compositor.
 //!
 //! The compositor runs entirely in Ring 3. It reaches the screen only through a
 //! shared buffer handle, and learns what to draw only through IPC. These cases
@@ -73,8 +73,8 @@ static COMPOSITOR_TID: AtomicU64 = AtomicU64::new(0);
 static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
 
 fn compositor_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::compositor_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::compositor_program())
         .expect("failed to map the compositor");
     let endpoint = COMPOSITOR_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: load_program mapped the entry user-executable and the stack
@@ -83,8 +83,8 @@ fn compositor_thread() {
 }
 
 fn client_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::client_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::client_program())
         .expect("failed to map the client");
 
     let params = *CLIENT_PARAMS.lock();
@@ -97,8 +97,8 @@ fn client_thread() {
 }
 
 fn input_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::input_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::input_program())
         .expect("failed to map the input daemon");
     let endpoint = COMPOSITOR_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: as above.

@@ -1,4 +1,4 @@
-//! The Ring 0 to Ring 3 boundary.
+﻿//! The Ring 0 to Ring 3 boundary.
 //!
 //! The case that matters here is `user_code_cannot_read_kernel_memory`. Entering
 //! user space is easy to get *almost* right -- a kernel that drops to CPL 3 but
@@ -50,17 +50,16 @@ fn run_user_program(name: &'static str, entry: fn()) -> bool {
 }
 
 fn demo_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image =
-        userspace::load_program(slot, userspace::demo_program()).expect("failed to map user image");
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::demo_program()).expect("failed to map user image");
     // SAFETY: load_program mapped the entry user-executable and the stack
     // user-writable.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
 }
 
 fn trespass_thread() {
-    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
-    let image = userspace::load_program(slot, userspace::trespass_program())
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::trespass_program())
         .expect("failed to map user image");
     // SAFETY: as above.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
