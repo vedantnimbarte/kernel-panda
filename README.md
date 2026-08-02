@@ -272,6 +272,40 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**Three priorities, and a guard against the obvious consequence.** Strict
+priority starves: a `High` thread that never blocks means nothing below it runs
+again. Every eighth switch is therefore taken from the *lowest* occupied queue
+instead. It is not fair-share and does not pretend to be — it is the minimum that
+keeps "low priority" from meaning "never". Three levels rather than thirty-two,
+because scheduling policy belongs in Ring 3; what the kernel owes is enough
+separation for an input daemon to preempt a compute loop.
+
+The priority test spawns six threads at each level rather than one. With four
+cores and one thread of each, both simply get a core and the choice never
+happens — the queues have to be contended for the result to mean anything.
+
+**A thread can sleep, and a thread can be waited for.** Both had been missing, so
+polling with `yield_now` was the only way to await anything that was not an IPC
+message. Sleepers sit in an unsorted list next to the earliest deadline in it, so
+the timer handler — which runs on every core on every tick — compares two
+integers in the common case and walks the list only when something is actually
+due.
+
+`join` registers the waiter and blocks under a single acquisition of the
+scheduler lock, and `exit_current` takes the waiter list under that same lock.
+That is what makes the race unrepresentable: a join either gets in before the
+thread finishes and is woken, or sees `Finished` and does not park at all. The
+list lives on the thread being waited *for*, so finishing is one look-up rather
+than a scan.
+
+**One processor keeps the clock.** Every core has its own APIC timer and all of
+them reach the same handler, so counting the clock on each made uptime run at
+four times real speed on a four-core machine — and any duration measured in ticks
+come out short by the same factor. Invisible from inside, because everything was
+measured against the same wrong clock. Per-CPU interrupt counts are kept
+separately, which is both the honest diagnostic and what makes the property
+testable.
+
 **An unmap gives back the page tables it emptied, except at level 4.** Removing a
 mapping clears one level 1 entry; the P1 that held it and the P2 above it used to
 stay allocated forever, so a range that is mapped and released repeatedly leaked
@@ -413,9 +447,6 @@ which only means the hang would be intermittent.
   every access goes through the uncached mapping, but it should be tidied up.
 * Calibration trusts a single 10 ms PIT sample. Averaging several would be more
   robust on a loaded host.
-* The scheduler is strict round-robin with no priorities. Threads can now block
-  on IPC, but there is still no sleep and no wait-for-thread, so polling with
-  `yield_now` is the only way to await anything else.
 * One user program is still hand-written assembly: the W^X test, which plants
   two bytes of machine code on its own stack and jumps to them. That is not
   something Rust will express, and it is the right tool for that one job.

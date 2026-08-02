@@ -146,7 +146,7 @@ extern "x86-interrupt" fn page_fault_handler(
 /// in service, and the APIC would deliver nothing further until this thread
 /// happened to be scheduled again -- if it ever were.
 extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
-    crate::time::tick();
+    crate::time::tick(crate::smp::cpu_index());
     apic::end_of_interrupt();
 
     // Drain the serial port before scheduling. There is no receive interrupt --

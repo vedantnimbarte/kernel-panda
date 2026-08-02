@@ -34,12 +34,16 @@ use alloc::vec::Vec;
 use crate::smp::{cpu_index, MAX_CPUS};
 use crate::sync::{without_interrupts, IrqMutex};
 
-pub use thread::{State, Thread, ThreadId, DEFAULT_STACK_SIZE};
+pub use thread::{Priority, State, Thread, ThreadId};
 
 /// Ticks a thread gets before it is preempted. At the timer's 100 Hz that makes
 /// a 10 ms quantum -- short enough to feel responsive, long enough that the
 /// switch cost stays in the noise.
 const TIME_SLICE_TICKS: u32 = 1;
+
+/// How many consecutive switches may be served by priority before the lowest
+/// occupied queue is given one.
+const STARVATION_GUARD: u32 = 8;
 
 const BOOT_THREAD: ThreadId = ThreadId(0);
 
@@ -61,9 +65,34 @@ struct Scheduler {
     /// been reaped; ids are never reused, so a stale id reads as `None` rather
     /// than silently addressing someone else.
     threads: Vec<Option<Box<Thread>>>,
-    /// Runnable threads, oldest first. Idle threads are deliberately never in
-    /// here -- they are each CPU's fallback, not participants.
-    ready: VecDeque<ThreadId>,
+    /// Runnable threads, oldest first, one queue per priority. Idle threads are
+    /// deliberately never in here -- they are each CPU's fallback, not
+    /// participants.
+    ready: [VecDeque<ThreadId>; Priority::COUNT],
+
+    /// Switches served from the highest occupied queue since the last time the
+    /// lowest one got a turn.
+    ///
+    /// Strict priority starves: a `High` thread that never blocks means nothing
+    /// below it ever runs again. Every `STARVATION_GUARD` switches, the choice
+    /// deliberately comes from the *lowest* occupied queue instead. It is not a
+    /// fair-share scheduler and does not pretend to be -- it is the minimum that
+    /// keeps "low priority" from meaning "never".
+    priority_streak: u32,
+
+    /// Sleeping threads and the tick each is due to wake on.
+    ///
+    /// Unsorted, because it is scanned only when `next_wake` says something is
+    /// due, and it is short. A timer wheel would be the answer at a thousand
+    /// sleepers; at a handful it would be machinery for its own sake.
+    sleepers: Vec<(ThreadId, u64)>,
+
+    /// The earliest deadline in `sleepers`, or `u64::MAX` when none.
+    ///
+    /// This is the whole point of the design: the timer handler runs on every
+    /// core on every tick, and all it does in the common case is compare two
+    /// integers.
+    next_wake: u64,
 
     /// Which thread each processor is running.
     current: [Option<ThreadId>; MAX_CPUS],
@@ -145,8 +174,14 @@ impl Scheduler {
         core::mem::take(&mut self.graveyard)
     }
 
-    /// Take the next genuinely runnable thread off the queue, discarding
-    /// entries for threads that have since finished or been reaped.
+    /// Put a runnable thread on the queue its priority names.
+    fn enqueue(&mut self, id: ThreadId) {
+        let level = self.thread(id).priority.index();
+        self.ready[level].push_back(id);
+    }
+
+    /// Take the next genuinely runnable thread, discarding entries for threads
+    /// that have since finished or been reaped.
     ///
     /// A queued thread that is still `on_cpu` is dropped rather than returned.
     /// The invariant is that this cannot happen -- nothing enqueues a thread a
@@ -154,12 +189,71 @@ impl Scheduler {
     /// CPUs on one stack. Dropping the entry is safe because `flush_pending`
     /// enqueues the thread again when the switch away from it completes.
     fn pop_runnable(&mut self) -> Option<ThreadId> {
-        while let Some(id) = self.ready.pop_front() {
-            if matches!(self.thread_opt(id), Some(t) if t.state == State::Ready && !t.on_cpu) {
-                return Some(id);
+        // Normally highest first; every so often lowest first, so that a busy
+        // high-priority thread cannot lock everything below it out forever.
+        let starving = self.priority_streak >= STARVATION_GUARD;
+        let order: [usize; Priority::COUNT] = if starving { [0, 1, 2] } else { [2, 1, 0] };
+
+        for level in order {
+            while let Some(id) = self.ready[level].pop_front() {
+                if matches!(self.thread_opt(id), Some(t) if t.state == State::Ready && !t.on_cpu) {
+                    self.priority_streak = if starving {
+                        0
+                    } else {
+                        self.priority_streak.saturating_add(1)
+                    };
+                    return Some(id);
+                }
             }
         }
         None
+    }
+
+    /// Make a blocked thread runnable again.
+    ///
+    /// Shared by every wake path -- IPC, a lapsed sleep, a thread being joined
+    /// finishing -- because the `on_cpu` rule is easy to get right once and easy
+    /// to forget everywhere else.
+    fn wake(&mut self, id: ThreadId) {
+        let Some(thread) = self.threads.get_mut(id.0).and_then(|slot| slot.as_deref_mut()) else {
+            return;
+        };
+        if thread.state != State::Blocked {
+            return;
+        }
+        thread.state = State::Ready;
+
+        // A wake can land while the thread is still leaving its processor: it
+        // set itself Blocked, and the CPU running it has released the scheduler
+        // lock but not yet reached `context_switch`. Queueing it here would let
+        // another core resume it from a saved stack pointer that has not been
+        // written yet -- a second CPU on a live stack, which reads as a wild
+        // jump or a fault on a null rsp. `flush_pending` queues it once the
+        // switch is genuinely done.
+        if !thread.on_cpu {
+            self.enqueue(id);
+        }
+    }
+
+    /// Wake every sleeper whose deadline has passed, and recompute the next one.
+    fn wake_due_sleepers(&mut self, now: u64) {
+        let mut due = Vec::new();
+        let mut earliest = u64::MAX;
+
+        self.sleepers.retain(|&(id, deadline)| {
+            if deadline <= now {
+                due.push(id);
+                false
+            } else {
+                earliest = earliest.min(deadline);
+                true
+            }
+        });
+
+        self.next_wake = earliest;
+        for id in due {
+            self.wake(id);
+        }
     }
 
     /// Release the thread this CPU switched away from: the switch is complete,
@@ -179,7 +273,7 @@ impl Scheduler {
         let state = thread.state;
 
         if state == State::Ready && !self.idle.contains(&Some(id)) {
-            self.ready.push_back(id);
+            self.enqueue(id);
         }
     }
 
@@ -263,13 +357,16 @@ pub fn init() {
             ThreadId(1),
             "idle",
             idle_loop,
-            DEFAULT_STACK_SIZE,
+            Priority::Low,
             trampoline,
         ));
 
         let mut scheduler = Scheduler {
             threads: alloc::vec![Some(boot), Some(idle)],
-            ready: VecDeque::new(),
+            ready: [const { VecDeque::new() }; Priority::COUNT],
+            priority_streak: 0,
+            sleepers: Vec::new(),
+            next_wake: u64::MAX,
             current: [None; MAX_CPUS],
             idle: [None; MAX_CPUS],
             slice: [TIME_SLICE_TICKS; MAX_CPUS],
@@ -302,17 +399,45 @@ pub fn adopt_secondary_cpu() {
     });
 }
 
-/// Create a runnable thread. Returns its id, or `None` if the scheduler is not
-/// up yet.
+/// Create a runnable thread at [`Priority::Normal`]. Returns its id, or `None`
+/// if the scheduler is not up yet.
 pub fn spawn(name: &'static str, entry: fn()) -> Option<ThreadId> {
+    spawn_with_priority(name, entry, Priority::Normal)
+}
+
+/// Create a runnable thread at a chosen priority.
+pub fn spawn_with_priority(
+    name: &'static str,
+    entry: fn(),
+    priority: Priority,
+) -> Option<ThreadId> {
     with(|scheduler| {
         let id = ThreadId(scheduler.threads.len());
-        let thread = Box::new(Thread::new(id, name, entry, DEFAULT_STACK_SIZE, trampoline));
+        let thread = Box::new(Thread::new(id, name, entry, priority, trampoline));
 
         scheduler.threads.push(Some(thread));
-        scheduler.ready.push_back(id);
+        scheduler.enqueue(id);
         id
     })
+}
+
+/// Change a thread's priority.
+///
+/// Takes effect at its next switch: a thread already in a queue stays there
+/// until it is picked up, and is filed by its new priority when it next goes
+/// back. Re-filing it immediately would mean finding and removing it from a
+/// queue, and the delay is at most one quantum.
+pub fn set_priority(id: ThreadId, priority: Priority) {
+    with(|scheduler| {
+        if let Some(thread) = scheduler.threads.get_mut(id.0).and_then(|s| s.as_deref_mut()) {
+            thread.priority = priority;
+        }
+    });
+}
+
+/// A thread's priority, if it still exists.
+pub fn priority_of(id: ThreadId) -> Option<Priority> {
+    with(|scheduler| scheduler.thread_opt(id).map(|thread| thread.priority)).flatten()
 }
 
 /// Hand the CPU to the next runnable thread, if there is one.
@@ -392,30 +517,92 @@ pub fn block_current() {
 /// Return a blocked thread to the ready queue. Does nothing if it is not
 /// blocked, so a duplicate wake is harmless.
 pub fn unblock(id: ThreadId) {
-    with(|scheduler| {
-        let Some(thread) = scheduler
-            .threads
-            .get_mut(id.0)
-            .and_then(|slot| slot.as_deref_mut())
-        else {
-            return;
-        };
-        if thread.state != State::Blocked {
-            return;
-        }
-        thread.state = State::Ready;
+    with(|scheduler| scheduler.wake(id));
+}
 
-        // A wake can land while the thread is still leaving its processor: it
-        // set itself Blocked, and the CPU running it has released the scheduler
-        // lock but not yet reached `context_switch`. Queueing it here would let
-        // another core resume it from a saved stack pointer that has not been
-        // written yet -- which is a second CPU running on a live stack, and
-        // reads as a wild jump or a fault on a null rsp. `flush_pending` puts it
-        // in the queue once the switch is genuinely done.
-        if !thread.on_cpu {
-            scheduler.ready.push_back(id);
+/// Park the current thread for at least `ticks` timer interrupts.
+///
+/// "At least": the thread becomes runnable at the deadline and runs when a
+/// processor gets to it. A sleep is a floor, never a promise.
+///
+/// Sleeping zero ticks yields instead of parking, so a caller computing a
+/// duration that rounds to nothing does not lose its wake-up.
+pub fn sleep_ticks(ticks: u64) {
+    if ticks == 0 {
+        yield_now();
+        return;
+    }
+
+    let parked = with(|scheduler| {
+        let cpu = cpu_index();
+        let Some(id) = scheduler.current[cpu] else {
+            return false;
+        };
+
+        let deadline = crate::time::ticks().saturating_add(ticks);
+        scheduler.thread_mut(id).state = State::Blocked;
+        scheduler.sleepers.push((id, deadline));
+        scheduler.next_wake = scheduler.next_wake.min(deadline);
+        true
+    })
+    .unwrap_or(false);
+
+    if parked {
+        schedule();
+    }
+}
+
+/// Park the current thread for at least `ms` milliseconds.
+///
+/// Rounds *up* to whole ticks: a caller asking for 1 ms at a 100 Hz timer wants
+/// a short pause, not a busy yield.
+pub fn sleep_ms(ms: u64) {
+    let hz = crate::time::frequency_hz();
+    if hz == 0 {
+        // No timer, so no deadline can ever come due. Yielding is the honest
+        // answer -- parking would be a hang.
+        yield_now();
+        return;
+    }
+    sleep_ticks(ms.saturating_mul(hz).div_ceil(1000));
+}
+
+/// Wait until `id` has finished. Returns immediately if it already has, or if
+/// no such thread exists.
+///
+/// The registration and the block happen under one acquisition of the scheduler
+/// lock, which is what makes this safe against the thread finishing in between:
+/// `exit_current` takes the joiner list under the same lock, so it either sees
+/// this waiter and wakes it, or has already finished and this returns without
+/// parking.
+///
+/// Joining oneself would park forever and is refused.
+pub fn join(id: ThreadId) {
+    let parked = with(|scheduler| {
+        let cpu = cpu_index();
+        let Some(me) = scheduler.current[cpu] else {
+            return false;
+        };
+        if me == id {
+            return false;
         }
-    });
+
+        // Gone, or on its way out with its joiner list already taken.
+        match scheduler.thread_opt(id) {
+            None => return false,
+            Some(thread) if thread.state == State::Finished => return false,
+            _ => {}
+        }
+
+        scheduler.thread_mut(id).joiners.push(me);
+        scheduler.thread_mut(me).state = State::Blocked;
+        true
+    })
+    .unwrap_or(false);
+
+    if parked {
+        schedule();
+    }
 }
 
 /// End the current thread. Its stack is freed by a later `schedule()`, once the
@@ -431,6 +618,16 @@ pub fn exit_current() -> ! {
 
     with(|scheduler| {
         scheduler.thread_mut(id).state = State::Finished;
+
+        // Take the list before waking anyone: this thread is about to be
+        // reaped, and the list goes with it. Waking under the same lock that
+        // set `Finished` is what closes the race with a `join` arriving now --
+        // it either got in before this and is on the list, or it sees
+        // `Finished` and does not park at all.
+        let joiners = core::mem::take(&mut scheduler.thread_mut(id).joiners);
+        for joiner in joiners {
+            scheduler.wake(joiner);
+        }
     });
 
     schedule();
@@ -443,9 +640,17 @@ pub fn exit_current() -> ! {
 pub fn on_timer_tick() {
     let expired = {
         let cpu = cpu_index();
+        let now = crate::time::ticks();
         let mut guard = SCHEDULER.lock();
         match guard.as_mut() {
             Some(scheduler) => {
+                // One comparison in the common case. Every core runs this on
+                // every tick, so the sleeper list is only walked when something
+                // in it is actually due.
+                if now >= scheduler.next_wake {
+                    scheduler.wake_due_sleepers(now);
+                }
+
                 scheduler.slice[cpu] = scheduler.slice[cpu].saturating_sub(1);
                 scheduler.slice[cpu] == 0
             }

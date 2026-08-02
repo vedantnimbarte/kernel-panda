@@ -1,14 +1,35 @@
 ﻿//! Thread control blocks.
 
+extern crate alloc;
+
 use super::context;
 use crate::memory::kstack::{self, KernelStack};
 
-/// Kept for callers that still name it; the real size is fixed by the stack
-/// region's slot layout.
-pub const DEFAULT_STACK_SIZE: usize = 32 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ThreadId(pub usize);
+
+/// How urgently a thread wants the CPU.
+///
+/// Three levels, not thirty-two. A microkernel's scheduling policy belongs in
+/// Ring 3; what the kernel owes is enough separation for an interrupt-servicing
+/// daemon to preempt a compute loop, and no more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    /// Background work that should never delay anything else.
+    Low = 0,
+    /// Everything, unless there is a reason otherwise.
+    Normal = 1,
+    /// Latency-sensitive: input, the compositor, anything a person waits on.
+    High = 2,
+}
+
+impl Priority {
+    pub const COUNT: usize = 3;
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -16,8 +37,9 @@ pub enum State {
     Ready,
     /// Currently on the CPU.
     Running,
-    /// Waiting for something -- today, a message on an IPC endpoint. Not in the
-    /// ready queue, and only `sched::unblock` puts it back.
+    /// Waiting for something: a message on an IPC endpoint, a deadline, or
+    /// another thread to finish. Not in the ready queue, and only a wake puts it
+    /// back.
     Blocked,
     /// Returned from its entry point. Its stack is freed by the next
     /// `schedule()` that runs after it has been switched away from.
@@ -28,6 +50,15 @@ pub struct Thread {
     pub id: ThreadId,
     pub name: &'static str,
     pub state: State,
+    pub priority: Priority,
+
+    /// Threads parked in `join` waiting for this one to finish.
+    ///
+    /// Held on the thread being waited *for*, not the waiter, so that finishing
+    /// is a single look-up: `exit_current` takes this list and wakes everyone on
+    /// it. A `Vec` because joining is rare and the list is almost always empty
+    /// or one long.
+    pub joiners: alloc::vec::Vec<ThreadId>,
 
     /// Where this thread's registers are parked while it is off the CPU.
     ///
@@ -92,7 +123,7 @@ impl Thread {
         id: ThreadId,
         name: &'static str,
         entry: fn(),
-        _stack_size: usize,
+        priority: Priority,
         trampoline: unsafe extern "C" fn() -> !,
     ) -> Self {
         let stack = kstack::allocate().expect("out of kernel stack address space");
@@ -109,6 +140,8 @@ impl Thread {
             id,
             name,
             state: State::Ready,
+            priority,
+            joiners: alloc::vec::Vec::new(),
             stack_pointer,
             entry: Some(entry),
             address_space: None,
@@ -128,6 +161,8 @@ impl Thread {
             id,
             name,
             state: State::Running,
+            priority: Priority::Normal,
+            joiners: alloc::vec::Vec::new(),
             stack_pointer: 0,
             entry: None,
             address_space: None,

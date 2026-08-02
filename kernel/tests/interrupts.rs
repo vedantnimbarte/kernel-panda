@@ -100,6 +100,39 @@ fn uptime_advances() {
 }
 
 #[test_case]
+fn only_one_processor_keeps_the_clock() {
+    // Every core has its own APIC timer and every one of them reaches the same
+    // handler. Counting the clock on all of them makes uptime run at the number
+    // of cores times real speed, and any duration measured in ticks come out
+    // short by the same factor -- which is invisible from inside, because
+    // everything is measured against the same wrong clock.
+    let start = time::ticks();
+    assert!(wait_for(|| time::ticks() >= start + 5), "the clock stopped");
+
+    let clock = time::ticks();
+    let boot_cpu = time::cpu_ticks(0);
+
+    // The clock is the boot processor's own interrupt count. A handful of ticks
+    // of slack: the two are read one after the other, not atomically.
+    assert!(
+        clock.abs_diff(boot_cpu) <= 4,
+        "the clock reads {clock} but the boot processor has taken {boot_cpu} \
+         timer interrupts; something else is advancing it"
+    );
+
+    let others: u64 = (1..panda_kernel::smp::MAX_CPUS)
+        .map(time::cpu_ticks)
+        .sum();
+    if panda_kernel::smp::online_count() > 1 {
+        assert!(
+            others > 0,
+            "no processor other than the boot one is taking timer interrupts, \
+             so this case is not testing anything"
+        );
+    }
+}
+
+#[test_case]
 fn the_console_survives_printing_under_interrupt_pressure() {
     // The console lock is taken with interrupts disabled on this CPU. Before
     // that fix, a timer interrupt landing while the lock was held would deadlock

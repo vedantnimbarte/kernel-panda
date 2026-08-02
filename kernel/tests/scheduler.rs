@@ -189,6 +189,175 @@ fn threads_run_on_separate_stacks() {
     );
 }
 
+// --- sleeping ---------------------------------------------------------------
+
+static SLEEPER_WOKE_AT: AtomicU64 = AtomicU64::new(0);
+static SLEEP_TICKS: AtomicU64 = AtomicU64::new(0);
+
+fn sleep_then_record() {
+    sched::sleep_ticks(SLEEP_TICKS.load(Ordering::Acquire));
+    SLEEPER_WOKE_AT.store(panda_kernel::time::ticks(), Ordering::Release);
+}
+
+#[test_case]
+fn a_sleeping_thread_wakes_no_earlier_than_its_deadline() {
+    const NAP: u64 = 10;
+    SLEEP_TICKS.store(NAP, Ordering::Release);
+    SLEEPER_WOKE_AT.store(0, Ordering::Release);
+
+    let started = panda_kernel::time::ticks();
+    let thread = sched::spawn("napper", sleep_then_record).expect("spawn failed");
+
+    assert!(
+        spin_until(|| SLEEPER_WOKE_AT.load(Ordering::Acquire) != 0),
+        "the sleeping thread never woke; a deadline that is never checked is a \
+         thread that is gone for good"
+    );
+    assert!(
+        spin_until(|| !sched::is_alive(thread)),
+        "the sleeper never finished"
+    );
+
+    let woke = SLEEPER_WOKE_AT.load(Ordering::Acquire);
+    assert!(
+        woke >= started + NAP,
+        "a thread asked to sleep {NAP} ticks woke after {} -- a sleep is a floor",
+        woke.saturating_sub(started)
+    );
+}
+
+#[test_case]
+fn a_sleeping_thread_is_not_on_the_ready_queue() {
+    // The distinction is sleeping versus spinning. A thread that yielded in a
+    // loop would report Ready every time it is looked at.
+    SLEEP_TICKS.store(60, Ordering::Release);
+    SLEEPER_WOKE_AT.store(0, Ordering::Release);
+
+    let thread = sched::spawn("long-napper", sleep_then_record).expect("spawn failed");
+    assert!(
+        spin_until(|| sched::is_blocked(thread)),
+        "a thread in the middle of a sleep never appeared blocked, so it is \
+         burning CPU rather than waiting"
+    );
+
+    assert!(
+        spin_until(|| SLEEPER_WOKE_AT.load(Ordering::Acquire) != 0),
+        "the long sleeper never woke"
+    );
+}
+
+// --- joining ----------------------------------------------------------------
+
+static JOIN_FLAG: AtomicU64 = AtomicU64::new(0);
+
+fn slow_worker() {
+    sched::sleep_ticks(5);
+    JOIN_FLAG.store(1, Ordering::Release);
+}
+
+#[test_case]
+fn join_returns_only_after_the_thread_has_finished() {
+    JOIN_FLAG.store(0, Ordering::Release);
+    let worker = sched::spawn("joinee", slow_worker).expect("spawn failed");
+
+    sched::join(worker);
+
+    assert_eq!(
+        JOIN_FLAG.load(Ordering::Acquire),
+        1,
+        "join returned before the thread it was waiting for had done its work"
+    );
+}
+
+#[test_case]
+fn joining_a_thread_that_has_already_finished_returns() {
+    JOIN_FLAG.store(0, Ordering::Release);
+    let worker = sched::spawn("quick-joinee", bump).expect("spawn failed");
+    assert!(
+        spin_until(|| !sched::is_alive(worker)),
+        "the worker never finished"
+    );
+
+    // Reaped, so there is nothing left to register with. Parking here would be
+    // a hang with no possible wake-up.
+    sched::join(worker);
+}
+
+#[test_case]
+fn joining_yourself_does_not_park_forever() {
+    let me = sched::current_id().expect("no current thread");
+    sched::join(me);
+}
+
+// --- priority ---------------------------------------------------------------
+
+static HIGH_RUNS: AtomicU64 = AtomicU64::new(0);
+static LOW_RUNS: AtomicU64 = AtomicU64::new(0);
+static PRIORITY_STOP: AtomicBool = AtomicBool::new(false);
+
+fn high_priority_loop() {
+    while !PRIORITY_STOP.load(Ordering::Acquire) {
+        HIGH_RUNS.fetch_add(1, Ordering::Relaxed);
+        sched::yield_now();
+    }
+}
+
+fn low_priority_loop() {
+    while !PRIORITY_STOP.load(Ordering::Acquire) {
+        LOW_RUNS.fetch_add(1, Ordering::Relaxed);
+        sched::yield_now();
+    }
+}
+
+#[test_case]
+fn a_high_priority_thread_runs_more_often_than_a_low_one() {
+    // Enough of each to keep every core busy. With four cores and one thread of
+    // each priority, both simply get a core and priority never comes into it --
+    // the queues have to be contended for the choice to mean anything.
+    const EACH: usize = 6;
+
+    HIGH_RUNS.store(0, Ordering::Relaxed);
+    LOW_RUNS.store(0, Ordering::Relaxed);
+    PRIORITY_STOP.store(false, Ordering::Release);
+
+    let mut threads = [sched::ThreadId(0); EACH * 2];
+    for slot in threads.iter_mut().take(EACH) {
+        *slot = sched::spawn_with_priority("high", high_priority_loop, sched::Priority::High)
+            .expect("spawn failed");
+    }
+    for slot in threads.iter_mut().skip(EACH) {
+        *slot = sched::spawn_with_priority("low", low_priority_loop, sched::Priority::Low)
+            .expect("spawn failed");
+    }
+
+    assert_eq!(sched::priority_of(threads[0]), Some(sched::Priority::High));
+    assert_eq!(
+        sched::priority_of(threads[EACH]),
+        Some(sched::Priority::Low)
+    );
+
+    sched::sleep_ticks(20);
+    PRIORITY_STOP.store(true, Ordering::Release);
+
+    let high_runs = HIGH_RUNS.load(Ordering::Relaxed);
+    let low_runs = LOW_RUNS.load(Ordering::Relaxed);
+
+    for thread in threads {
+        sched::join(thread);
+    }
+
+    assert!(
+        high_runs > low_runs,
+        "the high-priority threads ran {high_runs} times against the low ones' \
+         {low_runs}; priority is not being honoured"
+    );
+    assert!(
+        low_runs > 0,
+        "the low-priority threads never ran at all in {high_runs} switches -- \
+         strict priority starves, and the guard against it is not working"
+    );
+}
+
 #[test_case]
 fn finished_threads_are_reaped() {
     // Let anything left over from earlier cases drain first, so the baseline is
