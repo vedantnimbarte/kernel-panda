@@ -586,9 +586,11 @@ pub fn sys_info(buffer: u64, pointer: u64) -> Result<i64, Error> {
 
     let info = info(current()?, BufferId(buffer))?;
 
-    // SAFETY: the range was just confirmed present, user-accessible and writable
-    // for the whole struct. Unaligned because nothing obliges user space to
-    // align its buffer.
-    unsafe { core::ptr::write_unaligned(pointer as *mut BufferInfo, info) };
+    crate::arch::x86_64::with_user_access(|| {
+        // SAFETY: the range was just confirmed present, user-accessible and
+        // writable for the whole struct, and the guard lets Ring 0 reach it.
+        // Unaligned because nothing obliges user space to align its buffer.
+        unsafe { core::ptr::write_unaligned(pointer as *mut BufferInfo, info) };
+    });
     Ok(0)
 }

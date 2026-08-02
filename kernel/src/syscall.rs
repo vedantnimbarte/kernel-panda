@@ -113,16 +113,23 @@ fn sys_write(descriptor: u64, pointer: u64, length: u64) -> SyscallResult {
         return Err(Error::BadPointer);
     }
 
-    // SAFETY: `validate_user_buffer` established that every page across
-    // `length` bytes from `pointer` is present and user-readable, so this slice
-    // refers to live memory for its whole extent.
-    let bytes = unsafe { core::slice::from_raw_parts(pointer as *const u8, length as usize) };
+    // The whole access, validation through print, happens inside one SMAP
+    // window. Printing from inside it is deliberate: the guard masks interrupts,
+    // so nothing else runs on this processor while AC is set, and copying the
+    // buffer out first would cost `MAX_WRITE` bytes of a 32 KiB kernel stack.
+    crate::arch::x86_64::with_user_access(|| {
+        // SAFETY: `validate_user_buffer` established that every page across
+        // `length` bytes from `pointer` is present and user-readable, so this
+        // slice refers to live memory for its whole extent, and the guard makes
+        // it reachable from Ring 0.
+        let bytes = unsafe { core::slice::from_raw_parts(pointer as *const u8, length as usize) };
 
-    // Reject invalid UTF-8 rather than printing replacement characters: a user
-    // program sending garbage should learn that it did.
-    let text = core::str::from_utf8(bytes).map_err(|_| Error::InvalidArgument)?;
-    crate::print!("{text}");
+        // Reject invalid UTF-8 rather than printing replacement characters: a
+        // user program sending garbage should learn that it did.
+        let text = core::str::from_utf8(bytes).map_err(|_| Error::InvalidArgument)?;
+        crate::print!("{text}");
 
-    USER_BYTES_WRITTEN.fetch_add(length, Ordering::Relaxed);
-    Ok(length as i64)
+        USER_BYTES_WRITTEN.fetch_add(length, Ordering::Relaxed);
+        Ok(length as i64)
+    })
 }

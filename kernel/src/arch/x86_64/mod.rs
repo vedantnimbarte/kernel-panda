@@ -7,9 +7,34 @@ pub mod pic;
 pub mod qemu;
 pub mod syscall;
 
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use x86_64::instructions::{hlt, interrupts};
 
 use crate::time;
+
+/// What [`enable_memory_protections`] managed to turn on.
+///
+/// Each of these depends on the processor, and writing an unsupported CR4 bit
+/// raises a general protection fault, so none of them is assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Protections {
+    pub nx: bool,
+    pub smep: bool,
+    pub smap: bool,
+}
+
+/// Whether STAC and CLAC may be executed at all.
+///
+/// Cached because every user-memory access consults it, and the alternative --
+/// reading CR4 -- is a privileged, serialising instruction on a hot path. It is
+/// a property of the processor model, so every core in the system agrees.
+///
+/// Note that this tracks *support*, not CR4.SMAP: STAC and CLAC raise an invalid
+/// opcode if the CPU does not implement SMAP, but are harmless no-ops in effect
+/// when the CPU implements it and the bit happens to be clear.
+static SMAP_USABLE: AtomicBool = AtomicBool::new(false);
 
 /// Turn on the CPU's memory-protection features.
 ///
@@ -17,10 +42,10 @@ use crate::time;
 /// of a page table entry is reserved, and setting it faults on every access to
 /// that page rather than being ignored.
 ///
-/// Returns what was actually enabled -- SMEP is not present on every CPU, and
-/// writing an unsupported CR4 bit raises a general protection fault, so it is
-/// checked rather than assumed.
-pub fn enable_memory_protections() -> (bool, bool) {
+/// Called once per processor: EFER and CR4 are per-CPU registers, so a core that
+/// skips this runs with the protections off while the rest of the system
+/// believes they are on.
+pub fn enable_memory_protections() -> Protections {
     use x86_64::registers::control::{Cr4, Cr4Flags};
     use x86_64::registers::model_specific::{Efer, EferFlags};
 
@@ -31,9 +56,11 @@ pub fn enable_memory_protections() -> (bool, bool) {
         Efer::update(|flags| flags.insert(EferFlags::NO_EXECUTE_ENABLE));
     }
 
-    // CPUID leaf 7, subleaf 0, EBX bit 7. Safe to call: no target feature beyond
-    // the baseline is required.
-    let smep_supported = core::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 7) != 0;
+    // CPUID leaf 7, subleaf 0: EBX bit 7 is SMEP, bit 20 is SMAP. Safe to call:
+    // no target feature beyond the baseline is required.
+    let features = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+    let smep_supported = features & (1 << 7) != 0;
+    let smap_supported = features & (1 << 20) != 0;
 
     if smep_supported {
         // SAFETY: SMEP only forbids Ring 0 from *executing* user-accessible
@@ -45,7 +72,24 @@ pub fn enable_memory_protections() -> (bool, bool) {
         }
     }
 
-    (true, smep_supported)
+    if smap_supported {
+        // Published before the bit is set, so that nothing can observe SMAP
+        // active while still believing STAC would fault.
+        SMAP_USABLE.store(true, Ordering::Release);
+
+        // SAFETY: SMAP forbids Ring 0 from reading or writing user-accessible
+        // pages unless EFLAGS.AC is set. Every place the kernel legitimately
+        // does that goes through `UserAccess`, which sets AC for the duration.
+        unsafe {
+            Cr4::update(|flags| flags.insert(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION));
+        }
+    }
+
+    Protections {
+        nx: true,
+        smep: smep_supported,
+        smap: smap_supported,
+    }
 }
 
 /// Whether NX is active.
@@ -58,6 +102,75 @@ pub fn nx_enabled() -> bool {
 pub fn smep_enabled() -> bool {
     use x86_64::registers::control::{Cr4, Cr4Flags};
     Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION)
+}
+
+/// Whether SMAP is active.
+pub fn smap_enabled() -> bool {
+    use x86_64::registers::control::{Cr4, Cr4Flags};
+    Cr4::read().contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION)
+}
+
+/// Permission for this processor to touch user-accessible pages, for as long as
+/// the guard lives.
+///
+/// SMAP makes every supervisor read or write of a user page fault unless
+/// `EFLAGS.AC` is set. That is the point: a kernel bug that dereferences an
+/// attacker-supplied pointer somewhere it did not mean to now faults instead of
+/// quietly succeeding. The handful of places the kernel *does* mean to -- copying
+/// a syscall's buffer, filling a program's image before it starts -- say so by
+/// holding one of these.
+///
+/// The guard also masks interrupts. Nothing clears `AC` on the way into a
+/// handler, so an interrupt landing inside the window would run the whole
+/// handler with SMAP disabled, and a context switch there would carry the
+/// relaxation into an unrelated thread. Every window here is a bounded copy, so
+/// the latency cost is small and the alternative is a protection that lapses at
+/// moments an attacker can provoke.
+#[must_use = "user memory may only be touched while the guard is alive"]
+pub struct UserAccess {
+    interrupts_were_enabled: bool,
+}
+
+impl UserAccess {
+    /// Open the window.
+    pub fn begin() -> Self {
+        let interrupts_were_enabled = interrupts::are_enabled();
+        interrupts::disable();
+
+        if SMAP_USABLE.load(Ordering::Acquire) {
+            // SAFETY: STAC is only invalid when the processor does not implement
+            // SMAP, which is exactly what the flag records. It touches no memory
+            // and sets EFLAGS.AC, which `Drop` clears again.
+            unsafe { asm!("stac", options(nomem, nostack)) };
+        }
+
+        Self {
+            interrupts_were_enabled,
+        }
+    }
+}
+
+impl Drop for UserAccess {
+    fn drop(&mut self) {
+        if SMAP_USABLE.load(Ordering::Acquire) {
+            // SAFETY: as in `begin`; CLAC has the same availability rule and
+            // simply clears the bit again.
+            unsafe { asm!("clac", options(nomem, nostack)) };
+        }
+
+        if self.interrupts_were_enabled {
+            interrupts::enable();
+        }
+    }
+}
+
+/// Run `f` with permission to touch user-accessible pages.
+///
+/// The closure form is the one to reach for: it makes the window an expression
+/// rather than a scope somebody can accidentally extend.
+pub fn with_user_access<R>(f: impl FnOnce() -> R) -> R {
+    let _access = UserAccess::begin();
+    f()
 }
 
 /// Install the descriptor tables.

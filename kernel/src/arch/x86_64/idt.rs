@@ -119,6 +119,18 @@ extern "x86-interrupt" fn page_fault_handler(
         crate::sched::exit_current();
     }
 
+    // A kernel-mode fault a test asked for. Everything else falls through to the
+    // panic, which is the right response to the kernel dereferencing something
+    // it should not have.
+    if crate::testing::take_expected_fault(crate::sched::current_id()) {
+        println!(
+            "expected kernel fault on {faulting_address:#018x} ({error_code:?}); \
+             thread '{}' terminated",
+            crate::sched::current_name().unwrap_or("?")
+        );
+        crate::sched::exit_current();
+    }
+
     panic!(
         "EXCEPTION: PAGE FAULT\n\
          accessed address: {faulting_address:#018x}\n\

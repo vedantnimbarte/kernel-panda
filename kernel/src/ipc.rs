@@ -439,10 +439,13 @@ pub fn sys_recv(endpoint: u64, pointer: u64) -> SyscallResult {
         return Err(Error::BadPointer);
     }
 
-    // SAFETY: the range was just confirmed present, user-accessible and
-    // writable across the whole struct. `write_unaligned` because nothing
-    // obliges user space to align its buffer.
-    unsafe { core::ptr::write_unaligned(pointer as *mut Message, message) };
+    crate::arch::x86_64::with_user_access(|| {
+        // SAFETY: the range was just confirmed present, user-accessible and
+        // writable across the whole struct, and the guard lets Ring 0 reach it.
+        // `write_unaligned` because nothing obliges user space to align its
+        // buffer.
+        unsafe { core::ptr::write_unaligned(pointer as *mut Message, message) };
+    });
 
     Ok(0)
 }
@@ -453,7 +456,10 @@ fn read_user_message(pointer: u64) -> Result<Message, Error> {
         return Err(Error::BadPointer);
     }
 
-    // SAFETY: validated above as present and user-readable for the full struct.
-    // `read_unaligned` because user space is under no obligation to align it.
-    Ok(unsafe { core::ptr::read_unaligned(pointer as *const Message) })
+    Ok(crate::arch::x86_64::with_user_access(|| {
+        // SAFETY: validated above as present and user-readable for the full
+        // struct, and the guard lets Ring 0 reach it. `read_unaligned` because
+        // user space is under no obligation to align it.
+        unsafe { core::ptr::read_unaligned(pointer as *const Message) }
+    }))
 }

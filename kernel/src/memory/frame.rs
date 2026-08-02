@@ -15,7 +15,7 @@ use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Si
 use x86_64::PhysAddr;
 
 use super::PAGE_SIZE;
-use crate::sync::{Mutex, Once};
+use crate::sync::{IrqMutex, Once};
 
 pub struct BitmapFrameAllocator {
     /// One bit per frame; bit set means allocated.
@@ -138,7 +138,20 @@ fn frame_at(index: usize) -> PhysFrame<Size4KiB> {
     PhysFrame::containing_address(PhysAddr::new(index as u64 * PAGE_SIZE))
 }
 
-static ALLOCATOR: Once<Mutex<BitmapFrameAllocator>> = Once::new();
+/// Interrupt-masking, and it has to be.
+///
+/// The timer handler reaches this lock: a tick schedules, scheduling drops
+/// threads that have finished, and dropping one unmaps its kernel stack and
+/// returns the frames. With a plain spinlock, a tick landing on the very CPU
+/// that is holding it -- anywhere in `gbm::create`, `paging::map`, a teardown --
+/// spins forever, because the holder cannot run again to release it.
+///
+/// It only became reachable from interrupt context when kernel stacks moved from
+/// the heap to their own mappings. Before that, dropping a thread touched the
+/// heap allocator, which has masked interrupts for exactly this reason since the
+/// scheduler existed. The symptom was a hang once every thirty runs or so, in
+/// whichever test allocated the most physical memory.
+static ALLOCATOR: Once<IrqMutex<BitmapFrameAllocator>> = Once::new();
 
 /// Build the bitmap from the bootloader's memory map.
 ///
@@ -229,7 +242,7 @@ pub unsafe fn init(regions: &MemoryRegions, physical_memory_offset: u64) {
         allocator.mark_used(frame);
     }
 
-    ALLOCATOR.call_once(|| Mutex::new(allocator));
+    ALLOCATOR.call_once(|| IrqMutex::new(allocator));
 }
 
 /// Run `f` with exclusive access to the frame allocator.

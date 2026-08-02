@@ -17,6 +17,7 @@ use panda_kernel::gbm::{self, BufferId};
 use panda_kernel::memory::frame;
 use panda_kernel::sched::ThreadId;
 use panda_kernel::syscall::Error;
+use panda_kernel::arch::x86_64::with_user_access;
 use panda_kernel::{arch::x86_64::halt_loop, sched, testing, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
@@ -68,21 +69,25 @@ fn a_mapped_buffer_is_readable_and_writable() {
     let buffer = gbm::create(me(), 64, 32).expect("create failed");
     let address = gbm::map(me(), buffer).expect("map failed");
 
-    // SAFETY: `map` returned a range of `size` bytes mapped present and
-    // writable, owned by this buffer alone.
-    unsafe {
-        let pixels = address as *mut u32;
-        for index in 0..(64 * 32) {
-            pixels.add(index).write_volatile(0xDEAD_0000 | index as u32);
+    // Buffers are user-accessible pages, so Ring 0 needs SMAP relaxed to touch
+    // one even from a kernel thread that owns it.
+    with_user_access(|| {
+        // SAFETY: `map` returned a range of `size` bytes mapped present and
+        // writable, owned by this buffer alone.
+        unsafe {
+            let pixels = address as *mut u32;
+            for index in 0..(64 * 32) {
+                pixels.add(index).write_volatile(0xDEAD_0000 | index as u32);
+            }
+            for index in 0..(64 * 32) {
+                assert_eq!(
+                    pixels.add(index).read_volatile(),
+                    0xDEAD_0000 | index as u32,
+                    "buffer memory did not read back"
+                );
+            }
         }
-        for index in 0..(64 * 32) {
-            assert_eq!(
-                pixels.add(index).read_volatile(),
-                0xDEAD_0000 | index as u32,
-                "buffer memory did not read back"
-            );
-        }
-    }
+    });
 
     gbm::destroy(me(), buffer).expect("destroy failed");
 }

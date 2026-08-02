@@ -310,6 +310,11 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, Str
     // running the tests on one core would leave every SMP path untested -- and
     // the races it would hide are exactly the ones worth finding early.
     cmd.args(["-smp", "4"]);
+    // The default `qemu64` model advertises neither SMEP nor SMAP, so the kernel
+    // detects them as absent and skips them -- which means every protection they
+    // provide goes untested, and a missing `stac` reads as working code. Asking
+    // for them explicitly is what makes those paths real here.
+    cmd.args(["-cpu", "qemu64,+smep,+smap"]);
     cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     // Turn a triple fault into a dead VM instead of an invisible reboot loop.
     cmd.arg("-no-reboot");

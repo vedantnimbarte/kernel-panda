@@ -174,8 +174,10 @@ fn hammer_the_page_tables() {
             if let Ok(address) = panda_kernel::gbm::map(me, buffer) {
                 // Touch it, so a translation is genuinely cached before the
                 // unmap that follows has to shoot it down.
-                // SAFETY: just mapped present and writable.
-                unsafe { (address as *mut u64).write_volatile(0xA5A5_A5A5) };
+                panda_kernel::arch::x86_64::with_user_access(|| {
+                    // SAFETY: just mapped present and writable.
+                    unsafe { (address as *mut u64).write_volatile(0xA5A5_A5A5) };
+                });
             }
             let _ = panda_kernel::gbm::destroy(me, buffer);
         }

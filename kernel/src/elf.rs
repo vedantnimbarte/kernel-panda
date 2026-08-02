@@ -159,23 +159,27 @@ pub fn load(
             address += PAGE_SIZE;
         }
 
-        // SAFETY: the span was just mapped present and writable in `space`, and
-        // the caller guarantees `space` is the active one.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                source.as_ptr(),
-                virtual_address as *mut u8,
-                file_size as usize,
-            );
-            // .bss lives in the gap between file size and memory size and must
-            // start zeroed; the frames come from the allocator with whatever the
-            // last owner left in them.
-            core::ptr::write_bytes(
-                (virtual_address + file_size) as *mut u8,
-                0,
-                (memory_size - file_size) as usize,
-            );
-        }
+        // The staging mapping is user-accessible, so SMAP applies even though
+        // this is the kernel writing to its own freshly created pages.
+        crate::arch::x86_64::with_user_access(|| {
+            // SAFETY: the span was just mapped present and writable in `space`,
+            // and the caller guarantees `space` is the active one.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    virtual_address as *mut u8,
+                    file_size as usize,
+                );
+                // .bss lives in the gap between file size and memory size and
+                // must start zeroed; the frames come from the allocator with
+                // whatever the last owner left in them.
+                core::ptr::write_bytes(
+                    (virtual_address + file_size) as *mut u8,
+                    0,
+                    (memory_size - file_size) as usize,
+                );
+            }
+        });
 
         highest = highest.max(last);
     }

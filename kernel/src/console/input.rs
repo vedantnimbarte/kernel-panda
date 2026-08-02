@@ -155,20 +155,31 @@ pub fn sys_read(descriptor: u64, pointer: u64, length: u64) -> Result<i64, Error
     }
 
     let reader = sched::current_id().ok_or(Error::InvalidArgument)?;
-    let mut offset = 0u64;
 
-    let count = read(reader, length as usize, |byte| {
-        // SAFETY: the whole range was validated as present, user-accessible and
-        // writable, and `offset` never exceeds `length` because `read` is
-        // capped at the same limit.
-        unsafe { core::ptr::write_volatile((pointer + offset) as *mut u8, byte) };
-        offset += 1;
+    // Bytes land in a kernel buffer first and are handed over in one copy
+    // afterwards. Writing straight into user memory from the sink would put a
+    // fallible access inside the `INPUT` lock, where a fault has nowhere to go,
+    // and it would have to open an SMAP window per byte. A short call returning
+    // fewer bytes than asked for is exactly what `read` already means.
+    const CHUNK: usize = 256;
+    let mut buffer = [0u8; CHUNK];
+    let mut filled = 0usize;
+
+    let count = read(reader, (length as usize).min(CHUNK), |byte| {
+        buffer[filled] = byte;
+        filled += 1;
     });
 
-    // No re-validation after the fact: the writes have already happened, so a
-    // check here would prove nothing. The pre-check is the real one, and it
+    // No re-validation after the fact: the pre-check is the real one, and it
     // holds because user mappings are never torn down while their thread lives.
     // That stops being true the moment buffers become unmappable, and this
     // becomes a validate-inside-the-loop.
+    crate::arch::x86_64::with_user_access(|| {
+        // SAFETY: the whole range was validated as present, user-accessible and
+        // writable; `count` is at most `CHUNK` and at most `length`; and the
+        // guard lets Ring 0 reach the destination.
+        unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), pointer as *mut u8, count) };
+    });
+
     Ok(count as i64)
 }

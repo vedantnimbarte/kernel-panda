@@ -291,16 +291,19 @@ pub fn load_program(owner: ThreadId, code: &[u8]) -> Result<UserImage, LoadError
         .map_err(LoadError::Mapping)?;
     }
 
-    // SAFETY: the code page was just mapped present and writable, it is `code.len()`
-    // bytes or more, and nothing else references it yet -- the thread that will
-    // run this program has not been started.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            code.as_ptr(),
-            (base + CODE_OFFSET) as *mut u8,
-            code.len(),
-        );
-    }
+    crate::arch::x86_64::with_user_access(|| {
+        // SAFETY: the code page was just mapped present and writable, it is
+        // `code.len()` bytes or more, nothing else references it yet -- the
+        // thread that will run this program has not been started -- and the
+        // guard lets Ring 0 write a user-accessible page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                code.as_ptr(),
+                (base + CODE_OFFSET) as *mut u8,
+                code.len(),
+            );
+        }
+    });
 
     // Drop WRITABLE now the contents are in place. The space is active, so the
     // global helper edits the right tables.
@@ -481,10 +484,13 @@ pub fn stack_execution_program() -> &'static [u8] {
 /// the program must not be running yet.
 pub unsafe fn write_parameters(data: VirtAddr, values: &[u64]) {
     assert!(values.len() * 8 <= PAGE_SIZE as usize);
-    for (index, value) in values.iter().enumerate() {
-        // SAFETY: forwarded from this function's contract; the assertion above
-        // keeps every write inside the page.
-        unsafe { core::ptr::write_volatile((data.as_u64() as *mut u64).add(index), *value) };
-    }
+    crate::arch::x86_64::with_user_access(|| {
+        for (index, value) in values.iter().enumerate() {
+            // SAFETY: forwarded from this function's contract; the assertion
+            // above keeps every write inside the page, and the guard lets Ring 0
+            // write a user-accessible one.
+            unsafe { core::ptr::write_volatile((data.as_u64() as *mut u64).add(index), *value) };
+        }
+    });
 }
 

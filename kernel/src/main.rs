@@ -36,13 +36,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     println!("  descriptor tbls: GDT + TSS + IDT loaded");
     println!(
-        "  protections    : NX {}, SMEP {}",
+        "  protections    : NX {}, SMEP {}, SMAP {}",
         if apic::is_initialised() && panda_kernel::arch::x86_64::nx_enabled() {
             "on"
         } else {
             "off"
         },
         if panda_kernel::arch::x86_64::smep_enabled() {
+            "on"
+        } else {
+            "unsupported"
+        },
+        if panda_kernel::arch::x86_64::smap_enabled() {
             "on"
         } else {
             "unsupported"

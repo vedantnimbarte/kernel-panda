@@ -272,6 +272,29 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**The kernel has to ask before it may touch user memory.** With SMAP on, every
+supervisor read or write of a user-accessible page faults unless `EFLAGS.AC` is
+set. The handful of places that legitimately do it — copying a syscall's buffer,
+filling a program's image before it starts — hold a `UserAccess` guard, which
+sets `AC` and clears it again on drop. Everywhere else, a stray dereference of an
+attacker-supplied pointer now faults instead of quietly succeeding.
+
+The guard also masks interrupts. Nothing clears `AC` on the way into a handler,
+so an interrupt landing inside the window would run the entire handler with SMAP
+disabled, and a context switch there would carry the relaxation into an unrelated
+thread. Every window is a bounded copy, so the cost is small and the alternative
+is a protection that lapses at moments an attacker can choose.
+
+`ring0_cannot_touch_user_memory_without_asking` is the proof, and it needed a
+small piece of machinery to write: a kernel-mode page fault normally panics, so
+the test arms a one-shot flag that turns the expected fault into a thread death
+instead. Its partner case performs the same access through the guard and requires
+it to succeed, so the pair cannot both pass for a trivial reason.
+
+The test harness runs QEMU as `-cpu qemu64,+smep,+smap`. The default model
+advertises neither, the kernel would detect them as absent and skip them, and a
+missing `stac` would read as working code.
+
 **Kernel stacks are mapped, not allocated, with an unmapped guard page beneath
 each.** A stack on the heap has nothing below it but more heap, so overflowing it
 writes into another allocation and surfaces later as corruption somewhere
@@ -319,6 +342,19 @@ back and check the colour at the requested coordinates, and that just past the
 surface's edge nothing was touched. A blit that runs one row long, or lands at
 the wrong offset, passes every structural check and fails these.
 
+**Any lock the timer handler can reach masks interrupts.** The console, the heap,
+the scheduler, the page tables and the frame allocator all do. The rule is not
+about multi-core exclusion — the spin still provides that — it is about a CPU
+deadlocking against itself: a tick that lands on the very core holding a lock,
+and then needs it, spins forever, because the holder cannot run again to release
+it.
+
+Which locks qualify changes as the kernel grows, and that is the trap. The frame
+allocator did not qualify until kernel stacks moved off the heap: after that, a
+tick could schedule, scheduling could drop a finished thread, and dropping one
+unmaps a stack and returns its frames. It hung about one run in thirty, in
+whichever test allocated the most physical memory.
+
 **The console disables interrupts while it holds its lock.** Without this the
 kernel deadlocks the first time a handler prints: it spins on a lock held by the
 code it interrupted, which cannot run again to release it. The window is small,
@@ -337,8 +373,6 @@ which only means the hang would be intermittent.
 
 ## Hardening left for later
 
-* No SMAP. The kernel legitimately reads and writes user buffers during
-  syscalls, so enabling it means bracketing every such access with `stac`/`clac`.
 * Quotas are fixed constants, identical for every process. Real ones would be
   per-process policy set by whoever spawned it.
 * The ACPI IOAPIC address is read but never used — nothing routes a device

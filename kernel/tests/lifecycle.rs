@@ -17,6 +17,7 @@ use panda_kernel::ipc::{self, EndpointId, Rights};
 use panda_kernel::memory::{frame, paging};
 use x86_64::VirtAddr;
 use panda_kernel::sched::ThreadId;
+use panda_kernel::arch::x86_64::with_user_access;
 use panda_kernel::{arch::x86_64::halt_loop, gbm, sched, testing, userspace, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
@@ -167,8 +168,10 @@ fn one_process_cannot_read_another_address_space() {
     let buffer = gbm::create(sched::current_id().unwrap(), 64, 64).expect("create failed");
     let address = gbm::map(sched::current_id().unwrap(), buffer).expect("map failed");
 
-    // SAFETY: just mapped present and writable.
-    unsafe { (address as *mut u64).write_volatile(0xFEED_FACE) };
+    with_user_access(|| {
+        // SAFETY: just mapped present and writable.
+        unsafe { (address as *mut u64).write_volatile(0xFEED_FACE) };
+    });
 
     PEEK_TARGET.store(address, Ordering::Release);
     let before = panda_kernel::syscall::user_bytes_written();
@@ -249,10 +252,12 @@ fn a_shared_buffer_outlives_the_thread_that_made_it() {
 
     // Still usable, not merely present.
     let address = gbm::map(boot, buffer).expect("could not map the shared buffer");
-    // SAFETY: just mapped present and writable for the whole buffer.
-    unsafe {
-        let pixels = address as *mut u32;
-        pixels.write_volatile(0x1234_5678);
-        assert_eq!(pixels.read_volatile(), 0x1234_5678);
-    }
+    with_user_access(|| {
+        // SAFETY: just mapped present and writable for the whole buffer.
+        unsafe {
+            let pixels = address as *mut u32;
+            pixels.write_volatile(0x1234_5678);
+            assert_eq!(pixels.read_volatile(), 0x1234_5678);
+        }
+    });
 }

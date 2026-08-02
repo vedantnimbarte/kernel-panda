@@ -119,16 +119,88 @@ fn stack_execution_thread() {
 }
 
 #[test_case]
-fn nx_and_smep_are_active() {
+fn nx_smep_and_smap_are_active() {
     assert!(
         panda_kernel::arch::x86_64::nx_enabled(),
         "EFER.NXE is clear, so every present page is executable"
     );
-    // SMEP is not on every CPU and writing an unsupported CR4 bit faults, so
-    // this reports rather than demands.
+    // Neither SMEP nor SMAP is on every CPU, and writing an unsupported CR4 bit
+    // faults, so these report rather than demand. Under QEMU the test harness
+    // asks for a model that has both, so a note here means the model changed.
     if !panda_kernel::arch::x86_64::smep_enabled() {
         panda_kernel::serial_println!("  (note: this CPU does not support SMEP)");
     }
+    if !panda_kernel::arch::x86_64::smap_enabled() {
+        panda_kernel::serial_println!("  (note: this CPU does not support SMAP)");
+    }
+}
+
+/// Maps a buffer -- user-accessible by definition -- and reads it without asking
+/// for permission first. With SMAP on, that faults.
+fn unguarded_user_read_thread() {
+    let me = sched::current_id().expect("no current thread");
+    let buffer = panda_kernel::gbm::create(me, 16, 16).expect("create failed");
+    let address = panda_kernel::gbm::map(me, buffer).expect("map failed");
+
+    // Armed as late as possible, so an unrelated fault in the setup above still
+    // panics the way it should.
+    testing::expect_page_fault(me);
+
+    // SAFETY: the page is mapped present and writable. The access is
+    // architecturally forbidden from Ring 0 with SMAP enabled and AC clear,
+    // which is the whole point -- it is expected to fault, and the handler has
+    // been told to kill this thread rather than panic when it does.
+    let value = unsafe { (address as *const u64).read_volatile() };
+    core::hint::black_box(value);
+
+    UNGUARDED_READ_RETURNED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+static UNGUARDED_READ_RETURNED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[test_case]
+fn ring0_cannot_touch_user_memory_without_asking() {
+    if !panda_kernel::arch::x86_64::smap_enabled() {
+        panda_kernel::serial_println!("  (skipped: this CPU does not support SMAP)");
+        return;
+    }
+
+    UNGUARDED_READ_RETURNED.store(false, core::sync::atomic::Ordering::Release);
+    assert!(
+        run_user_program("smap-probe", unguarded_user_read_thread),
+        "the probe thread never finished"
+    );
+
+    assert!(
+        testing::page_fault_observed(),
+        "a kernel thread read a user-accessible page with AC clear and nothing \
+         stopped it; SMAP is not being enforced"
+    );
+    assert!(
+        !UNGUARDED_READ_RETURNED.load(core::sync::atomic::Ordering::Acquire),
+        "the unguarded read completed instead of faulting"
+    );
+}
+
+#[test_case]
+fn the_guard_is_what_makes_user_memory_reachable() {
+    // The other half of the pair: the same access, bracketed, must work --
+    // otherwise the syscall paths that copy user buffers would all be broken and
+    // the test above would pass for the wrong reason.
+    let me = sched::current_id().expect("no current thread");
+    let buffer = panda_kernel::gbm::create(me, 16, 16).expect("create failed");
+    let address = panda_kernel::gbm::map(me, buffer).expect("map failed");
+
+    panda_kernel::arch::x86_64::with_user_access(|| {
+        // SAFETY: mapped present and writable, and the guard grants Ring 0
+        // access to user pages for its lifetime.
+        unsafe {
+            let cell = address as *mut u64;
+            cell.write_volatile(0x5A5A_5A5A_5A5A_5A5A);
+            assert_eq!(cell.read_volatile(), 0x5A5A_5A5A_5A5A_5A5A);
+        }
+    });
 }
 
 #[test_case]
