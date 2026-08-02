@@ -4,6 +4,9 @@
 //! every integration test kernel under `tests/` share exactly one implementation.
 
 #![no_std]
+// Required for `extern "x86-interrupt"` exception handlers, which need the
+// compiler to emit an iret-based epilogue and preserve the full register set.
+#![feature(abi_x86_interrupt)]
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::BootInfo;
@@ -11,6 +14,7 @@ use bootloader_api::BootInfo;
 pub mod arch;
 pub mod console;
 pub mod sync;
+pub mod testing;
 
 /// Boot-time requests handed to the bootloader.
 ///
@@ -42,6 +46,10 @@ pub const BOOTLOADER_CONFIG: BootloaderConfig = {
 pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // Serial first: everything after this point can report its own failures.
     let serial_ok = console::init();
+
+    // Then the descriptor tables, so a fault during the rest of boot produces a
+    // readable diagnostic instead of a silent reset.
+    arch::x86_64::init();
 
     if !serial_ok {
         crate::println!("warning: UART loopback self-test failed; serial output may be lost");

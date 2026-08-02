@@ -32,3 +32,14 @@ spin = { version = "0.9", default-features = false, features = [
     "once",
     "lazy",
 ] }
+
+# Test targets keep cargo's default `harness = true`. That is what makes cargo
+# pass `--test` to rustc, which is in turn what activates `custom_test_frameworks`
+# and generates the `test_main` entry point. With `harness = false` the
+# `#[test_case]` items are stripped and `test_main` never exists.
+#
+# The exception is a test that deliberately cannot return -- `stack_overflow` has
+# no cases to collect, needs its own IDT, and ends by killing the VM.
+[[test]]
+name = "stack_overflow"
+harness = false

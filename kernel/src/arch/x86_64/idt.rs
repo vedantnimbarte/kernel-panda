@@ -1,0 +1,95 @@
+//! Interrupt Descriptor Table and CPU exception handlers.
+//!
+//! Only CPU exceptions are wired up here. Hardware interrupts (the APIC timer,
+//! the keyboard) belong to Phase 3 and deliberately stay masked until there is a
+//! scheduler to receive them.
+//!
+//! The page-fault handler is the most valuable thing in this file: for the whole
+//! of Phase 2 it is the difference between "the machine rebooted" and "you tried
+//! to write to 0xdeadbeef from a non-present page".
+
+use x86_64::registers::control::Cr2;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+
+use crate::println;
+use crate::sync::Lazy;
+
+use super::gdt;
+
+static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
+    let mut idt = InterruptDescriptorTable::new();
+
+    idt.breakpoint.set_handler_fn(breakpoint_handler);
+    idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+    idt.general_protection_fault
+        .set_handler_fn(general_protection_fault_handler);
+    idt.page_fault.set_handler_fn(page_fault_handler);
+
+    // SAFETY: `DOUBLE_FAULT_IST_INDEX` is the slot `gdt.rs` filled with the
+    // address of a dedicated, correctly aligned stack, and that GDT is loaded
+    // before this IDT. Pointing the entry at an unpopulated IST slot would make
+    // every double fault a triple fault instead.
+    unsafe {
+        idt.double_fault
+            .set_handler_fn(double_fault_handler)
+            .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+    }
+
+    idt
+});
+
+/// Install the IDT. `gdt::init` must already have run.
+pub fn init() {
+    IDT.load();
+}
+
+/// `int3`. Recoverable by design -- this returns and execution continues, which
+/// is what makes it a good liveness check for the whole IDT path.
+///
+/// Kept to a single line: unlike the fatal handlers below, this one can fire in
+/// a loop, and a full frame dump each time buries everything else.
+extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
+    println!(
+        "EXCEPTION: BREAKPOINT at {:#018x}",
+        frame.instruction_pointer.as_u64()
+    );
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    panic!("EXCEPTION: INVALID OPCODE\n{frame:#?}");
+}
+
+extern "x86-interrupt" fn general_protection_fault_handler(
+    frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    // The error code is a segment selector index when the fault came from a
+    // segment-related operation, and zero otherwise.
+    panic!("EXCEPTION: GENERAL PROTECTION FAULT (selector {error_code:#x})\n{frame:#?}");
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    // CR2 holds the linear address whose translation failed. `read_raw` avoids
+    // the non-canonical-address error case: when a fault is caused by a garbage
+    // pointer, the raw bits are precisely what we want to see.
+    let faulting_address = Cr2::read_raw();
+
+    panic!(
+        "EXCEPTION: PAGE FAULT\n\
+         accessed address: {faulting_address:#018x}\n\
+         error code:       {error_code:?}\n\
+         {frame:#?}"
+    );
+}
+
+/// Raised when the CPU hits a second fault while trying to service the first,
+/// or when a fault handler is itself unreachable. Diverging: there is no
+/// meaningful way to resume.
+extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error_code: u64) -> ! {
+    // The double-fault error code is architecturally always zero; it is printed
+    // only so a non-zero value would be visible if one ever appeared.
+    panic!("EXCEPTION: DOUBLE FAULT (code {error_code})\n{frame:#?}");
+}
