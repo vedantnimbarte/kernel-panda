@@ -14,8 +14,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use panda_kernel::arch::x86_64::apic;
 use panda_kernel::ipc::EndpointId;
 use panda_kernel::{
-    arch::x86_64::halt_loop, console, ipc, memory, println, sched, sync, syscall, time, userspace,
-    BOOTLOADER_CONFIG,
+    arch::x86_64::halt_loop, console, ipc, memory, pci, println, sched, sync, syscall, time,
+    userspace, BOOTLOADER_CONFIG,
 };
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
@@ -137,6 +137,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         sched::yield_now();
     }
     println!("  logger exited; endpoint drained to {}", ipc::queued(endpoint));
+    println!();
+
+    pci::log_devices();
+    if let Some(display) = pci::find_display() {
+        println!(
+            "  display at {:02x}:{:02x}.{}",
+            display.address.bus, display.address.device, display.address.function
+        );
+        for index in 0..6 {
+            if let Some(bar) = pci::read_bar(display.address, index) {
+                println!("    bar{index}: {bar:x?}");
+            }
+        }
+    }
     println!();
 
     halt_loop()

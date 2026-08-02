@@ -193,6 +193,22 @@ pub fn non_zero_byte_count() -> usize {
     }
 }
 
+/// Virtual address of the framebuffer, if one was adopted.
+///
+/// Lets a test translate it and confirm it falls inside the display
+/// controller's PCI base address register -- tying the bootloader's view of the
+/// hardware to the kernel's own.
+pub fn buffer_address() -> Option<u64> {
+    CONSOLE
+        .get()
+        .map(|console| console.lock().buffer.as_ptr() as u64)
+}
+
+/// Bytes the framebuffer spans.
+pub fn buffer_len() -> usize {
+    CONSOLE.get().map_or(0, |console| console.lock().buffer.len())
+}
+
 /// Blank the screen and return the cursor to the top-left.
 pub fn clear() {
     if let Some(console) = CONSOLE.get() {

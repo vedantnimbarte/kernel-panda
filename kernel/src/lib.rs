@@ -26,6 +26,7 @@ pub mod arch;
 pub mod console;
 pub mod ipc;
 pub mod memory;
+pub mod pci;
 pub mod sched;
 pub mod sync;
 pub mod syscall;
