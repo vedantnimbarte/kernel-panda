@@ -16,6 +16,8 @@ use core::fmt;
 
 use bootloader_api::info::FrameBufferInfo;
 
+use crate::sync;
+
 /// Bring up the serial console. Returns `false` if the UART self-test failed.
 pub fn init() -> bool {
     uart::init()
@@ -26,15 +28,27 @@ pub fn init_framebuffer(info: FrameBufferInfo, buffer: &'static mut [u8]) {
     framebuffer::init(info, buffer);
 }
 
+/// Both sinks are written with interrupts disabled on this CPU.
+///
+/// Without this the console deadlocks the moment a hardware interrupt is
+/// unmasked: a handler that prints would spin forever on a lock that the code
+/// it interrupted is still holding, and that code cannot run again to release
+/// it. The window is small, which only means the hang is intermittent.
+///
+/// The critical section is a few hundred cycles of formatting, so the added
+/// interrupt latency is not worth a lock-free design yet. It will be, once the
+/// scheduler starts caring about jitter.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    uart::_print(args);
-    framebuffer::_print(args);
+    sync::without_interrupts(|| {
+        uart::_print(args);
+        framebuffer::_print(args);
+    });
 }
 
 #[doc(hidden)]
 pub fn _serial_print(args: fmt::Arguments) {
-    uart::_print(args);
+    sync::without_interrupts(|| uart::_print(args));
 }
 
 #[macro_export]

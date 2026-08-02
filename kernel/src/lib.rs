@@ -7,6 +7,12 @@
 // Required for `extern "x86-interrupt"` exception handlers, which need the
 // compiler to emit an iret-based epilogue and preserve the full register set.
 #![feature(abi_x86_interrupt)]
+// An `unsafe fn` body is not automatically an unsafe block. Every unsafe
+// operation has to be written out and justified individually, even inside a
+// function that is already unsafe to call -- otherwise "this function is unsafe"
+// silently licenses every dereference in it, which is exactly the blanket
+// permission the auditability requirement is meant to rule out.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 // The kernel heap is set up during `init`, after which `Box`, `Vec` and friends
 // are available. Nothing before that point may allocate.
