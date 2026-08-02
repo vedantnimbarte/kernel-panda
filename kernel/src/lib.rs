@@ -13,6 +13,7 @@ use bootloader_api::BootInfo;
 
 pub mod arch;
 pub mod console;
+pub mod memory;
 pub mod sync;
 pub mod testing;
 
@@ -52,6 +53,11 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     arch::x86_64::init();
 
     adopt_framebuffer(boot_info);
+
+    // Memory last: it needs the console up to report the map it finds, and the
+    // IDT installed so a bad mapping surfaces as a page fault with an address
+    // rather than as a reset.
+    memory::init(boot_info);
 
     if !serial_ok {
         crate::println!("warning: UART loopback self-test failed; serial output may be lost");

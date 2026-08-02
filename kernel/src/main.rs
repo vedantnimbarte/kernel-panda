@@ -6,12 +6,12 @@
 use core::panic::PanicInfo;
 
 use bootloader_api::{entry_point, BootInfo};
-use panda_kernel::{arch::x86_64::halt_loop, console, println, BOOTLOADER_CONFIG};
+use panda_kernel::{arch::x86_64::halt_loop, console, memory, println, BOOTLOADER_CONFIG};
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
-    panda_kernel::init(boot_info);
+    let boot_info = panda_kernel::init(boot_info);
 
     println!();
     println!("Kernel Panda v{}", env!("CARGO_PKG_VERSION"));
@@ -25,6 +25,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     );
     println!("  descriptor tbls: GDT + TSS + IDT loaded");
+    println!();
+
+    memory::log_memory_map(&boot_info.memory_regions);
+    println!();
+    memory::log_usage();
     println!();
 
     halt_loop()
