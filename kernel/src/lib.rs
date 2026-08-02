@@ -27,6 +27,7 @@ pub mod console;
 pub mod memory;
 pub mod sync;
 pub mod testing;
+pub mod time;
 
 /// Boot-time requests handed to the bootloader.
 ///
@@ -69,6 +70,14 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // IDT installed so a bad mapping surfaces as a page fault with an address
     // rather than as a reset. It ends by turning `alloc` on.
     memory::init(boot_info);
+
+    // Interrupts last of all. The APIC needs its MMIO page mapped, so it cannot
+    // come up before memory does -- and nothing may be unmasked until the
+    // console lock is interrupt-safe, which it now is.
+    if let Err(error) = arch::x86_64::enable_interrupts() {
+        // Survivable: the kernel just has no sense of time.
+        crate::println!("warning: could not start the APIC timer: {error:?}");
+    }
 
     if !serial_ok {
         crate::println!("warning: UART loopback self-test failed; serial output may be lost");

@@ -9,14 +9,15 @@ A bare-metal microkernel written from scratch in `no_std` Rust, targeting
 [the project specification](docs/prd.md): a kernel that boots, catches its own
 faults, and manages physical and virtual memory.
 
-**Status:** Phases 1 and 2 complete. 27 test cases across 7 boot-and-assert test
-kernels, all passing under QEMU.
+**Status:** Phases 1 and 2 complete, Phase 3 started (hardware interrupts).
+33 test cases across 8 boot-and-assert test kernels, all passing under QEMU.
 
 ```
 Kernel Panda v0.1.0
   serial console : COM1 @ 38400 8N1
   framebuffer    : online
   descriptor tbls: GDT + TSS + IDT loaded
+  timer          : Local APIC, periodic
 
 physical memory map:
   0x00000000000..0x0000009fc00    639 KiB  Usable
@@ -28,6 +29,13 @@ frames: 65504 total (255 MiB), 62830 free (245 MiB), 2674 in use
 heap:   1048576 bytes total, 0 allocated, 0 peak, 0 live allocations
 
 alloc smoke test: [1, 4, 9, 16, 25, 36, 49, 64]
+
+timer at 100 Hz, waiting for ticks:
+  uptime   270 ms  (27 ticks)
+  uptime   470 ms  (47 ticks)
+  uptime   670 ms  (67 ticks)
+  uptime   870 ms  (87 ticks)
+  uptime  1070 ms  (107 ticks)
 ```
 
 ## Building and running
@@ -59,7 +67,7 @@ kernel-panda/
 └── kernel/          the kernel itself (its own cargo workspace)
     ├── src/
     │   ├── console/   16550 UART, framebuffer text console, 8x8 font
-    │   ├── arch/x86_64/   GDT + TSS, IDT + exception handlers, QEMU exit device
+    │   ├── arch/x86_64/   GDT + TSS, IDT, Local APIC + timer, 8259 masking
     │   ├── memory/    memory map, bitmap frame allocator, page tables, heap region
     │   └── allocator/ bump and linked-list `GlobalAlloc` implementations
     └── tests/       one standalone boot-and-assert kernel per file
@@ -121,6 +129,25 @@ outcomes otherwise look identical from outside.
 `Box::new` faults under `--features bump-allocator`, the fault is in the page
 mapping, not the allocator. Both pass the full suite.
 
+**Local APIC, not the 8259 PIC.** The PRD rules out legacy hardware support, and
+per-CPU delivery is a prerequisite for SMP later, so PIC-based delivery would be
+throwaway work. The PIC is still remapped clear of the exception vectors and then
+fully masked — masking alone is not enough, because a spurious IRQ 7 can be
+delivered on a masked controller, and at power-on those land on vectors that look
+exactly like CPU exceptions.
+
+**The timer is calibrated, not assumed.** The APIC counts at the core crystal
+frequency, which varies by machine and is not dependably reported by CPUID. It is
+measured at boot against PIT channel 2 — channel 2 because its output is readable
+from a port, so calibration needs no interrupt, which matters when interrupts are
+still masked. The poll is bounded so a machine whose PIT never asserts fails
+cleanly instead of hanging the boot.
+
+**The console disables interrupts while it holds its lock.** Without this the
+kernel deadlocks the first time a handler prints: it spins on a lock held by the
+code it interrupted, which cannot run again to release it. The window is small,
+which only means the hang would be intermittent.
+
 ## Deviations from the PRD
 
 * **No VGA text buffer** (§4 Phase 1 M3). UEFI hands off in graphics mode and
@@ -135,13 +162,21 @@ mapping, not the allocator. Both pass the full suite.
 ## Hardening left for later
 
 * `NO_EXECUTE` on the heap mapping, once `EFER.NXE` is confirmed enabled.
-* Interrupt-safe console locking. Today a fault raised while the console lock is
-  held would deadlock the handler. Harmless while only exceptions are wired up;
-  it must be fixed before the APIC timer is unmasked in Phase 3.
-* `spin::Mutex` has no priority awareness and is not aware of interrupt context.
-  Replace behind `sync.rs` when the scheduler lands.
+* `spin::Mutex` still has no priority awareness. The console now takes its locks
+  with interrupts disabled, which is enough for a single core, but the primitive
+  behind `sync.rs` will need replacing when the scheduler lands.
+* The APIC MMIO page is mapped uncached at its own virtual address while the
+  bootloader's physical-memory window also maps it cached. Two mappings with
+  different cache attributes is architecturally discouraged; it works here, and
+  every access goes through the uncached mapping, but it should be tidied up.
+* Calibration trusts a single 10 ms PIT sample. Averaging several would be more
+  robust on a loaded host.
 
-## Next: Phase 3
+## Phase 3 progress
 
-APIC timer, preemptive scheduler, the Ring 0 → Ring 3 transition, the IPC ring
-buffer, and the first user-space daemon.
+- [x] **M1 — Hardware interrupts.** Local APIC, calibrated periodic timer at
+      100 Hz, tick counter and uptime, interrupt-safe console.
+- [ ] M2 — Preemptive thread scheduler.
+- [ ] M3 — Ring 0 → Ring 3 context switch.
+- [ ] M4 — The IPC ring buffer.
+- [ ] M5 — First user-space daemon: a shell over the serial port.

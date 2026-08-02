@@ -1,0 +1,115 @@
+//! Hardware interrupt delivery via the Local APIC timer.
+//!
+//! Every case here has a bounded spin rather than a `hlt` wait. If interrupt
+//! delivery is broken -- which is precisely what these tests exist to detect --
+//! a `hlt` loop never wakes and the run dies on the host's timeout with no
+//! diagnostic. A bounded spin fails with a message instead.
+
+#![no_std]
+#![no_main]
+#![feature(custom_test_frameworks)]
+#![test_runner(panda_kernel::testing::runner)]
+#![reexport_test_harness_main = "test_main"]
+
+use core::panic::PanicInfo;
+
+use bootloader_api::{entry_point, BootInfo};
+use panda_kernel::arch::x86_64::apic;
+use panda_kernel::{arch::x86_64::halt_loop, println, sync, testing, time, BOOTLOADER_CONFIG};
+
+entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
+
+fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    panda_kernel::init(boot_info);
+    test_main();
+    halt_loop()
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    testing::panic_handler(info)
+}
+
+/// Generous enough that a slow host does not cause a false failure, small
+/// enough to fail well inside the harness timeout.
+const SPIN_BUDGET: u64 = 2_000_000_000;
+
+/// Spin until `condition` holds, or give up.
+fn wait_for(condition: impl Fn() -> bool) -> bool {
+    for _ in 0..SPIN_BUDGET {
+        if condition() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+#[test_case]
+fn the_apic_came_up() {
+    assert!(
+        apic::is_initialised(),
+        "the Local APIC was never mapped or enabled"
+    );
+}
+
+#[test_case]
+fn interrupts_are_enabled_after_init() {
+    assert!(
+        sync::interrupts_enabled(),
+        "init finished with interrupts still masked"
+    );
+}
+
+#[test_case]
+fn the_timer_actually_fires() {
+    let start = time::ticks();
+    assert!(
+        wait_for(|| time::ticks() > start),
+        "no timer interrupt arrived within the spin budget -- the APIC is \
+         enabled but nothing is being delivered"
+    );
+}
+
+#[test_case]
+fn ticks_keep_arriving() {
+    // One tick could be a fluke of boot ordering. Ten means the timer is in
+    // periodic mode and the handler is acknowledging properly -- a missing EOI
+    // delivers exactly one interrupt and then goes silent forever.
+    let target = time::ticks() + 10;
+    assert!(
+        wait_for(|| time::ticks() >= target),
+        "the timer stopped after the first few ticks; the handler is probably \
+         not sending an end-of-interrupt"
+    );
+}
+
+#[test_case]
+fn uptime_advances() {
+    assert_eq!(
+        time::frequency_hz(),
+        apic::TIMER_HZ as u64,
+        "the recorded tick rate does not match what the timer was programmed for"
+    );
+
+    let start = time::uptime_ms();
+    assert!(
+        wait_for(|| time::uptime_ms() > start),
+        "uptime never moved"
+    );
+}
+
+#[test_case]
+fn the_console_survives_printing_under_interrupt_pressure() {
+    // The console lock is taken with interrupts disabled on this CPU. Before
+    // that fix, a timer interrupt landing while the lock was held would deadlock
+    // the handler against the code it interrupted. This hammers that window.
+    let start = time::ticks();
+    for line in 0..200 {
+        println!("interrupt pressure line {line}");
+    }
+    assert!(
+        time::ticks() > start,
+        "no ticks arrived during 200 prints -- interrupts are being lost"
+    );
+}

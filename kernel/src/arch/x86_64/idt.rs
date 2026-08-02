@@ -1,12 +1,12 @@
 //! Interrupt Descriptor Table and CPU exception handlers.
 //!
-//! Only CPU exceptions are wired up here. Hardware interrupts (the APIC timer,
-//! the keyboard) belong to Phase 3 and deliberately stay masked until there is a
-//! scheduler to receive them.
+//! CPU exceptions, plus the two APIC-delivered vectors the kernel currently
+//! uses. Device interrupts beyond the timer belong to Ring 3 drivers and will
+//! arrive through IPC rather than through entries in this table.
 //!
-//! The page-fault handler is the most valuable thing in this file: for the whole
-//! of Phase 2 it is the difference between "the machine rebooted" and "you tried
-//! to write to 0xdeadbeef from a non-present page".
+//! The page-fault handler is the most valuable thing in this file: it is the
+//! difference between "the machine rebooted" and "you tried to write to
+//! 0xdeadbeef from a non-present page".
 
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -14,7 +14,7 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 use crate::println;
 use crate::sync::Lazy;
 
-use super::gdt;
+use super::{apic, gdt};
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
@@ -34,6 +34,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
+
+    idt[apic::TIMER_VECTOR].set_handler_fn(timer_handler);
+    idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
     idt
 });
@@ -84,6 +87,21 @@ extern "x86-interrupt" fn page_fault_handler(
          {frame:#?}"
     );
 }
+
+/// The APIC timer. Runs on every tick, so it does nothing but bump the counter
+/// and acknowledge -- no printing, no locks, no allocation.
+extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+    crate::time::tick();
+    apic::end_of_interrupt();
+}
+
+/// Fires when an interrupt is withdrawn between being raised and being
+/// delivered.
+///
+/// Deliberately does *not* acknowledge. The APIC never set an in-service bit for
+/// a spurious interrupt, so an EOI here would retire whichever real interrupt is
+/// actually in service and lose it.
+extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
 
 /// Raised when the CPU hits a second fault while trying to service the first,
 /// or when a fault handler is itself unreachable. Diverging: there is no
