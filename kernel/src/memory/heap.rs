@@ -31,10 +31,11 @@ pub fn init() -> Result<(), MapError> {
         )
     };
 
-    // NO_EXECUTE would be the right flag for a data-only region, but it faults
-    // unless EFER.NXE is on. Left off until that is verified rather than
-    // assumed; see the hardening notes in README.md.
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    // The heap holds data and nothing else. `arch::enable_memory_protections`
+    // has turned NXE on by the time this runs, so the bit is honoured rather
+    // than reserved.
+    let flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
 
     for page in page_range {
         paging::map(page, flags)?;

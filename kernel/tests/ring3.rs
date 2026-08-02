@@ -108,6 +108,39 @@ fn user_code_cannot_read_kernel_memory() {
     );
 }
 
+fn stack_execution_thread() {
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::stack_execution_program())
+        .expect("failed to map user image");
+    // SAFETY: as above.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+}
+
+#[test_case]
+fn nx_and_smep_are_active() {
+    assert!(
+        panda_kernel::arch::x86_64::nx_enabled(),
+        "EFER.NXE is clear, so every present page is executable"
+    );
+    // SMEP is not on every CPU and writing an unsupported CR4 bit faults, so
+    // this reports rather than demands.
+    if !panda_kernel::arch::x86_64::smep_enabled() {
+        panda_kernel::serial_println!("  (note: this CPU does not support SMEP)");
+    }
+}
+
+#[test_case]
+fn user_code_cannot_execute_its_own_stack() {
+    // The program writes `jmp -2` onto its stack and jumps to it. Enforced, that
+    // faults and the thread dies. Unenforced, it spins forever and this fails by
+    // timing out -- which is the point: an executable stack is the oldest exploit
+    // primitive there is.
+    assert!(
+        run_user_program("user-nx", stack_execution_thread),
+        "a user thread executed its own stack; W^X is not being enforced"
+    );
+}
+
 #[test_case]
 fn the_kernel_survives_a_user_fault() {
     // Reaching this case at all means the fault above did not panic the kernel,

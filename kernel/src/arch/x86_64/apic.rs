@@ -121,7 +121,8 @@ pub unsafe fn init() -> Result<u32, ApicError> {
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::NO_CACHE
-        | PageTableFlags::WRITE_THROUGH;
+        | PageTableFlags::WRITE_THROUGH
+        | PageTableFlags::NO_EXECUTE;
 
     // SAFETY: `physical_base` is the APIC's MMIO window as reported by the CPU
     // itself. It sits far above the highest usable RAM address, so it is not

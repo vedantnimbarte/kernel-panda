@@ -114,6 +114,7 @@ fn start_compositor() -> (EndpointId, ThreadId) {
     let compositor = sync::without_interrupts(|| {
         let id = sched::spawn("compositor", compositor_thread).expect("spawn failed");
         ipc::grant(me(), id, endpoint, Rights::RECEIVE).expect("grant failed");
+        gbm::allow_display_server(id);
         id
     });
     COMPOSITOR_TID.store(compositor.0 as u64, Ordering::Release);

@@ -186,12 +186,16 @@ fn sharing_a_buffer_grants_access() {
     SHARED_BUFFER.store(buffer.0, Ordering::Release);
     INSIDER_RAN.store(false, Ordering::Release);
 
-    let thread = panda_kernel::sync::without_interrupts(|| {
+    // Checked inside the same interrupts-off region as the grant. Once the
+    // thread can run it may finish and be torn down, at which point it is
+    // correctly removed from the share list -- so asserting afterwards is a race
+    // against the thread's own exit rather than a test of the grant.
+    let granted = panda_kernel::sync::without_interrupts(|| {
         let id = sched::spawn("insider", insider).expect("spawn failed");
         gbm::share(me(), id, buffer).expect("share failed");
-        id
+        gbm::may_access(id, buffer)
     });
-    assert!(gbm::may_access(thread, buffer));
+    assert!(granted, "the share did not take effect");
 
     assert!(
         spin_until(|| INSIDER_RAN.load(Ordering::Acquire)),
@@ -218,7 +222,24 @@ fn sharing_requires_ownership() {
 // --- scanout ----------------------------------------------------------------
 
 #[test_case]
+fn the_scanout_buffer_needs_a_display_server_capability() {
+    // Reaching the screen is authority. Any process being able to ask for the
+    // framebuffer and receive it would mean reading everything displayed and
+    // drawing over it at will.
+    assert!(
+        !gbm::is_display_server(ThreadId(1)),
+        "the idle thread was somehow designated a display server"
+    );
+    assert_eq!(
+        gbm::scanout(ThreadId(1)),
+        Err(Error::NoCapability),
+        "a thread with no display capability was handed the framebuffer"
+    );
+}
+
+#[test_case]
 fn the_scanout_buffer_matches_the_display() {
+    gbm::allow_display_server(me());
     let scanout = gbm::scanout(me()).expect("no scanout buffer");
     let info = gbm::info(me(), scanout).expect("info failed");
     let display = framebuffer::info().expect("no framebuffer");
@@ -234,6 +255,7 @@ fn the_scanout_buffer_matches_the_display() {
 
 #[test_case]
 fn the_scanout_buffer_is_a_singleton() {
+    gbm::allow_display_server(me());
     let first = gbm::scanout(me()).expect("no scanout buffer");
     let second = gbm::scanout(me()).expect("no scanout buffer");
     assert_eq!(
@@ -244,6 +266,7 @@ fn the_scanout_buffer_is_a_singleton() {
 
 #[test_case]
 fn the_scanout_buffer_cannot_be_destroyed() {
+    gbm::allow_display_server(me());
     let scanout = gbm::scanout(me()).expect("no scanout buffer");
     assert_eq!(
         gbm::destroy(me(), scanout),

@@ -171,20 +171,27 @@ pub fn load_program(owner: ThreadId, code: &[u8]) -> Result<UserImage, LoadError
     // process asked for too much.
     let slot = claim_slot(owner).ok_or(LoadError::NoFreeSlot)?;
     let base = slot_base(slot);
+
+    // Writable while the code is copied in; narrowed below.
     let user_rw = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE;
+
+    // W^X for everything that is not code. An executable stack is the oldest
+    // exploit primitive there is: any bug that lets a process write to its own
+    // stack and jump there becomes arbitrary code execution.
+    let user_data = user_rw | PageTableFlags::NO_EXECUTE;
 
     let code_page = page_at(base + CODE_OFFSET);
     let data_page = page_at(base + DATA_OFFSET);
 
     paging::map(code_page, user_rw).map_err(LoadError::Mapping)?;
-    paging::map(data_page, user_rw).map_err(LoadError::Mapping)?;
+    paging::map(data_page, user_data).map_err(LoadError::Mapping)?;
 
     for index in 0..STACK_PAGES {
         paging::map(
             page_at(base + STACK_BOTTOM_OFFSET + index * PAGE_SIZE),
-            user_rw,
+            user_data,
         )
         .map_err(LoadError::Mapping)?;
     }
@@ -808,7 +815,31 @@ global_asm!(
     options(att_syntax),
 );
 
+// Writes an instruction onto its own stack and jumps to it.
+//
+// With W^X enforced this faults immediately and the thread is killed. Without
+// it, the two bytes are `jmp -2` -- an infinite loop -- so the thread stays alive
+// forever and the test fails by timing out rather than passing by accident. A
+// `ret` would have been ambiguous: it faults either way.
+global_asm!(
+    ".section .rodata",
+    ".balign 16",
+    ".global USER_NXTEST_START",
+    "USER_NXTEST_START:",
+    "  subq $32, %rsp",
+    "  movw $0xFEEB, (%rsp)", // EB FE = jmp -2
+    "  jmp *%rsp",
+    "1:",
+    "  jmp 1b",
+    ".global USER_NXTEST_END",
+    "USER_NXTEST_END:",
+    ".section .text",
+    options(att_syntax),
+);
+
 extern "C" {
+    static USER_NXTEST_START: u8;
+    static USER_NXTEST_END: u8;
     static USER_INPUT_START: u8;
     static USER_INPUT_END: u8;
     static USER_COMPOSITOR_START: u8;
@@ -840,6 +871,12 @@ pub fn demo_program() -> &'static [u8] {
     // SAFETY: the symbols bound a range emitted by one `global_asm!` block, in
     // this order, immutable for the life of the kernel. Same for the two below.
     unsafe { blob(&raw const USER_DEMO_START, &raw const USER_DEMO_END) }
+}
+
+/// Tries to execute its own stack. Should be killed by the page-fault handler.
+pub fn stack_execution_program() -> &'static [u8] {
+    // SAFETY: as `demo_program`.
+    unsafe { blob(&raw const USER_NXTEST_START, &raw const USER_NXTEST_END) }
 }
 
 /// Reads the console and forwards sanitised key events to an endpoint.

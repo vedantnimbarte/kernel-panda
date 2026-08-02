@@ -36,6 +36,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     println!("  descriptor tbls: GDT + TSS + IDT loaded");
     println!(
+        "  protections    : NX {}, SMEP {}",
+        if apic::is_initialised() && panda_kernel::arch::x86_64::nx_enabled() {
+            "on"
+        } else {
+            "off"
+        },
+        if panda_kernel::arch::x86_64::smep_enabled() {
+            "on"
+        } else {
+            "unsupported"
+        }
+    );
+    println!(
         "  timer          : {}",
         if apic::is_initialised() {
             "Local APIC, periodic"
@@ -146,6 +159,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let compositor = sync::without_interrupts(|| {
         let id = sched::spawn("compositor", compositor_thread).expect("scheduler not running");
         ipc::grant(me, id, display, ipc::Rights::RECEIVE).expect("grant failed");
+        // Only this thread may reach the screen. Nothing else spawned below can
+        // ask for the framebuffer and be handed it.
+        gbm::allow_display_server(id);
         id
     });
     while sched::is_alive(compositor) && !sched::is_blocked(compositor) {

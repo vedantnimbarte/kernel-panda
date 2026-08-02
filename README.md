@@ -276,11 +276,14 @@ which only means the hang would be intermittent.
 
 ## Hardening left for later
 
+* No SMAP. The kernel legitimately reads and writes user buffers during
+  syscalls, so enabling it means bracketing every such access with `stac`/`clac`.
+* No per-process quotas yet: Ring 3 can still create endpoints and buffers until
+  memory runs out.
 * **Intermediate page tables are never reclaimed.** `unmap_and_free` releases the
   leaf frame and leaves the P3/P2/P1 tables above it standing, so the first use
   of any address range costs a few frames permanently. Freeing them means
   walking up and checking each level for emptiness.
-* `NO_EXECUTE` on the heap mapping, once `EFER.NXE` is confirmed enabled.
 * `spin::Mutex` still has no priority awareness. The console now takes its locks
   with interrupts disabled, which is enough for a single core, but the primitive
   behind `sync.rs` will need replacing when the scheduler lands.

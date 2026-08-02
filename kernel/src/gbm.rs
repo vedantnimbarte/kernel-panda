@@ -93,6 +93,14 @@ struct Registry {
     next_offset: BTreeMap<usize, u64>,
     /// The scanout buffer, created on first request and shared thereafter.
     scanout: Option<BufferId>,
+    /// Threads permitted to obtain the scanout buffer at all.
+    ///
+    /// Reaching the screen is authority, not a service. Without this list any
+    /// Ring 3 process could ask for the framebuffer and be handed it, which
+    /// means reading everything displayed and drawing anything it liked over
+    /// the top -- in a system whose whole point is that a process gets only what
+    /// it was given.
+    display_servers: Vec<ThreadId>,
 }
 
 impl Registry {
@@ -102,6 +110,7 @@ impl Registry {
             next_id: 1,
             next_offset: BTreeMap::new(),
             scanout: None,
+            display_servers: Vec::new(),
         }
     }
 }
@@ -182,6 +191,12 @@ pub fn create(owner: ThreadId, width: u32, height: u32) -> Result<BufferId, Erro
 /// independent handles to it would let two compositors fight over the same
 /// pixels without either knowing.
 pub fn scanout(owner: ThreadId) -> Result<BufferId, Error> {
+    // Checked before anything else is looked up, so a caller with no business
+    // here cannot even learn whether a display exists.
+    if !is_display_server(owner) {
+        return Err(Error::NoCapability);
+    }
+
     let info = console::framebuffer::info().ok_or(Error::NoSuchEndpoint)?;
     let virtual_base = console::framebuffer::buffer_address().ok_or(Error::NoSuchEndpoint)?;
     let physical_base = paging::translate(VirtAddr::new(virtual_base))
@@ -232,6 +247,24 @@ pub fn scanout(owner: ThreadId) -> Result<BufferId, Error> {
         registry.scanout = Some(BufferId(id));
         BufferId(id)
     }))
+}
+
+/// Designate a thread as a display server, letting it obtain the scanout buffer.
+///
+/// Deliberately not a syscall. Ring 3 must not be able to promote itself to
+/// owning the screen; the grant comes from whoever spawned the display server,
+/// which today is the kernel and later would be a service manager.
+pub fn allow_display_server(thread: ThreadId) {
+    with(|registry| {
+        if !registry.display_servers.contains(&thread) {
+            registry.display_servers.push(thread);
+        }
+    });
+}
+
+/// Whether a thread may obtain the scanout buffer.
+pub fn is_display_server(thread: ThreadId) -> bool {
+    with(|registry| registry.display_servers.contains(&thread))
 }
 
 /// Let `target` map this buffer. Owner only.
@@ -301,7 +334,12 @@ pub fn map(thread: ThreadId, buffer: BufferId) -> Result<u64, Error> {
         return Ok(address);
     }
 
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    // Pixels, never instructions. A shared buffer a client can write and a
+    // compositor maps would otherwise be an ideal place to stage code.
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
     for (index, frame) in frames.iter().enumerate() {
         let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(VirtAddr::new(
             address + index as u64 * PAGE_SIZE,
@@ -423,6 +461,7 @@ pub fn release_thread(thread: ThreadId) {
         }
 
         registry.next_offset.remove(&thread.0);
+        registry.display_servers.retain(|other| *other != thread);
         (frames, unmap)
     });
 

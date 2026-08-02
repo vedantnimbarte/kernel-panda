@@ -70,6 +70,10 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // readable diagnostic instead of a silent reset.
     arch::x86_64::init();
 
+    // Before any mapping is created, because NX has to be enabled before a page
+    // table entry may carry the bit.
+    arch::x86_64::enable_memory_protections();
+
     adopt_framebuffer(boot_info);
 
     // Memory last: it needs the console up to report the map it finds, and the
