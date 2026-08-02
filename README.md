@@ -272,6 +272,25 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**An unmap gives back the page tables it emptied, except at level 4.** Removing a
+mapping clears one level 1 entry; the P1 that held it and the P2 above it used to
+stay allocated forever, so a range that is mapped and released repeatedly leaked
+a frame per level per region. Each unmap now walks back up and frees whatever it
+left empty.
+
+Level 4 is deliberately excluded. Every entry there outside the user slot is
+shared *by pointer* with every process's cloned table, so clearing one would
+unmap a whole kernel region from every address space at once and hand a live
+table to the allocator. The user slot has its own path — `AddressSpace::release`
+frees that subtree wholesale when the process exits. Everything below level 4 is
+the same physical table in every space, so freeing one there is right rather than
+merely tolerable: the mapping really has gone everywhere.
+
+Freeing a table means invalidating more than one address. Processors cache
+*paging structures* as well as translations, so a P2 that still remembers a P1
+just handed back would walk into whatever gets allocated next — the local TLB is
+flushed wholesale and the other cores are told to do the same.
+
 **The kernel has to ask before it may touch user memory.** With SMAP on, every
 supervisor read or write of a user-accessible page faults unless `EFLAGS.AC` is
 set. The handful of places that legitimately do it — copying a syscall's buffer,
@@ -379,9 +398,6 @@ which only means the hang would be intermittent.
   interrupt yet, so console input is still polled.
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
   timing is exactly where this class of code breaks.
-* Intermediate page tables are reclaimed for a process's user region when it
-  exits, but not for kernel mappings — an unmapped kernel range leaves its
-  P3/P2/P1 standing.
 * `spin::Mutex` still has no priority awareness and no fairness — a contended
   lock is won by whichever core asks at the right moment.
 * The scheduler is one shared ready queue behind one lock. Correct, but every

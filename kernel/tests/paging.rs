@@ -69,20 +69,59 @@ fn a_mapped_page_is_writable_and_translates() {
 #[test_case]
 fn unmapping_releases_the_frame_and_the_translation() {
     let page = scratch_page(1);
+    let before = frame::with(|allocator| allocator.free_frames());
     paging::map(page, RW).expect("mapping failed");
 
-    let before = frame::with(|allocator| allocator.free_frames());
+    let while_mapped = frame::with(|allocator| allocator.free_frames());
     paging::unmap_and_free(page).expect("unmap failed");
+    let after = frame::with(|allocator| allocator.free_frames());
 
-    assert_eq!(
-        frame::with(|allocator| allocator.free_frames()),
-        before + 1,
+    assert!(
+        after > while_mapped,
         "unmap_and_free did not return the frame to the allocator"
+    );
+    assert_eq!(
+        after, before,
+        "mapping and unmapping one page did not balance"
     );
     assert_eq!(
         paging::translate(page.start_address()),
         None,
         "the address still translates after being unmapped"
+    );
+}
+
+#[test_case]
+fn an_emptied_region_gives_back_its_page_tables() {
+    // Its own 1 GiB slot, so the level 2 and level 1 tables under it are created
+    // by this test and belong to nobody else.
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(0x_6670_0000_0000));
+
+    // Warm it once first. The level 3 table for this 512 GiB slot is created on
+    // first use and deliberately never reclaimed -- every process's cloned level
+    // 4 table points at it, so freeing it would unmap the region everywhere and
+    // hand a live table to the allocator. Measuring across a cold region would
+    // count that one frame as a leak.
+    paging::map(page, RW).expect("warm-up mapping failed");
+    paging::unmap_and_free(page).expect("warm-up unmap failed");
+
+    let before = frame::with(|allocator| allocator.free_frames());
+    paging::map(page, RW).expect("mapping failed");
+    let spent = before - frame::with(|allocator| allocator.free_frames());
+
+    assert!(
+        spent > 1,
+        "mapping the first page of an empty region cost {spent} frame(s); the \
+         intermediate tables it needs should have cost more"
+    );
+
+    paging::unmap_and_free(page).expect("unmap failed");
+    assert_eq!(
+        frame::with(|allocator| allocator.free_frames()),
+        before,
+        "the page came back but the page tables that described it did not -- an \
+         address range that is mapped and released repeatedly leaks one frame \
+         per level per region"
     );
 }
 

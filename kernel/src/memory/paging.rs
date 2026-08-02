@@ -212,6 +212,102 @@ unsafe fn free_table_tree(frame: PhysFrame<Size4KiB>, level: u8, offset: VirtAdd
     crate::memory::frame::with(|allocator| allocator.deallocate(frame));
 }
 
+/// Borrow a page table through the physical memory window.
+///
+/// # Safety
+///
+/// `frame` must hold a live page table, and the caller must hold `PAGING` --
+/// this hands out a `&mut` to memory that is reachable from several places at
+/// once.
+unsafe fn table_at(frame: PhysFrame<Size4KiB>, offset: VirtAddr) -> &'static mut PageTable {
+    // SAFETY: forwarded from this function's contract; the window maps every
+    // physical address, and a page table is 4 KiB and frame aligned.
+    unsafe { &mut *((offset + frame.start_address().as_u64()).as_mut_ptr::<PageTable>()) }
+}
+
+fn table_is_empty(table: &PageTable) -> bool {
+    table.iter().all(|entry| entry.is_unused())
+}
+
+/// Free page tables that the last unmap left with nothing in them.
+///
+/// Unmapping a page clears one level 1 entry and stops. The P1 that held it, and
+/// the P2 and P3 above, stay allocated forever -- so a workload that maps and
+/// unmaps across a wide address range leaks 4 KiB per level per region, and
+/// nothing ever gives it back.
+///
+/// Level 4 is deliberately never touched. Every entry there outside the user
+/// slot is shared *by pointer* with every process's cloned table, so clearing
+/// one would unmap a whole kernel region from every space at once and hand a
+/// live table back to the allocator. The user slot has its own path:
+/// `AddressSpace::release` frees that subtree wholesale when the process exits.
+///
+/// The levels below level 4 are the same physical tables in every space, so
+/// freeing one there is right rather than merely tolerable -- the mapping really
+/// has gone everywhere.
+///
+/// Returns true if anything was freed, which the caller needs to know: dropping
+/// a table invalidates cached *paging structures*, not just page translations,
+/// and those survive a single-address invalidation.
+///
+/// # Safety
+///
+/// `page` must have just been unmapped from `space`, and `PAGING` must be held.
+unsafe fn reclaim_empty_tables(
+    space: &AddressSpace,
+    page: Page<Size4KiB>,
+    offset: VirtAddr,
+) -> bool {
+    // Walk down, remembering each table and the index within it that leads to
+    // the next. `parents[i]` is the table at level 4 - i; `children[i]` is the
+    // frame its entry points at.
+    let indices = [page.p4_index(), page.p3_index(), page.p2_index()];
+    let mut parents = [space.frame(); 3];
+    let mut children = [space.frame(); 3];
+
+    let mut current = space.frame();
+    for level in 0..3 {
+        // SAFETY: `current` is a live page table -- the level 4 frame on the
+        // first pass, and thereafter one reached through a present, non-huge
+        // entry. The caller holds `PAGING`.
+        let table = unsafe { table_at(current, offset) };
+        let entry = &table[indices[level]];
+        let flags = entry.flags();
+        if !flags.contains(PageTableFlags::PRESENT) || flags.contains(PageTableFlags::HUGE_PAGE) {
+            return false;
+        }
+        let Ok(child) = entry.frame() else {
+            return false;
+        };
+
+        parents[level] = current;
+        children[level] = child;
+        current = child;
+    }
+
+    // Bottom up, stopping at the first table that still has something in it: a
+    // P2 cannot be empty while the P1 under it survives. Level 0 -- clearing an
+    // entry in the level 4 table -- is excluded for the reason above.
+    let mut freed = false;
+    for level in (1..3).rev() {
+        // SAFETY: a live page table reached through the walk above.
+        let child = unsafe { table_at(children[level], offset) };
+        if !table_is_empty(child) {
+            break;
+        }
+
+        // SAFETY: likewise, and the entry being cleared is the one that points
+        // at the table about to be freed.
+        let parent = unsafe { table_at(parents[level], offset) };
+        parent[indices[level]].set_unused();
+
+        frame::with(|allocator| allocator.deallocate(children[level]));
+        freed = true;
+    }
+
+    freed
+}
+
 static KERNEL_SPACE: Once<AddressSpace> = Once::new();
 
 /// Base of the complete physical memory window.
@@ -289,13 +385,23 @@ pub unsafe fn map_to_frame(
 
 /// Remove a mapping and return the frame it pointed at, without freeing it.
 pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
-    with_mapper(|mapper| {
-        let (frame, flush) = mapper.unmap(page)?;
-        // Stale TLB entries would let the unmapped address keep working, which
-        // hides use-after-free bugs until the worst possible moment.
-        flush.flush();
-        Ok(frame)
-    })
+    let space = AddressSpace::active();
+    let frame = with_space(
+        &space,
+        |mapper| -> Result<PhysFrame<Size4KiB>, UnmapError> {
+            let (frame, flush) = mapper.unmap(page)?;
+            // Stale TLB entries would let the unmapped address keep working,
+            // which hides use-after-free bugs until the worst possible moment.
+            flush.flush();
+            Ok(frame)
+        },
+    )?;
+
+    let freed_tables = reclaim_tables_for(&space, page);
+    if freed_tables {
+        shoot_down_if_shared(&space);
+    }
+    Ok(frame)
 }
 
 /// Remove a mapping and return its frame to the physical allocator.
@@ -447,8 +553,40 @@ pub fn unmap_in(
         },
     )?;
 
+    reclaim_tables_for(space, page);
     shoot_down_if_shared(space);
     Ok(frame)
+}
+
+/// Take the paging lock and drop any table the unmap of `page` emptied.
+///
+/// Runs after the mapper has been given back rather than alongside it: an
+/// `OffsetPageTable` holds a `&mut` to the level 4 table, and reaching into the
+/// same tables through the physical window while it is alive would be two
+/// mutable paths to one object.
+///
+/// Re-checking emptiness under the lock is what makes the gap between the two
+/// harmless. Every edit goes through this lock, so a table that gained an entry
+/// in between is simply seen to be non-empty and left alone.
+fn reclaim_tables_for(space: &AddressSpace, page: Page<Size4KiB>) -> bool {
+    without_interrupts(|| {
+        let _guard = PAGING.lock();
+        let Some(offset) = PHYSICAL_OFFSET.get().copied() else {
+            return false;
+        };
+
+        // SAFETY: the page was just unmapped from `space`, and the lock is held.
+        let freed = unsafe { reclaim_empty_tables(space, page, offset) };
+
+        if freed {
+            // Invalidating one address is not enough here. Processors cache
+            // *paging structures* as well as translations, so a P2 that still
+            // remembers a P1 we have just handed back to the allocator would
+            // walk into whatever gets allocated next.
+            x86_64::instructions::tlb::flush_all();
+        }
+        freed
+    })
 }
 
 /// Ask the other processors to forget their translations, if this space is one

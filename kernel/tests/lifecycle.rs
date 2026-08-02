@@ -90,11 +90,9 @@ fn slots_are_returned_when_a_thread_exits() {
 #[test_case]
 fn a_user_program_returns_its_frames() {
     // Warm the slot first, then measure. The first program to use a slot also
-    // causes intermediate page tables to be allocated for that address range,
-    // and those are never reclaimed -- `unmap_and_free` releases the leaf frame
-    // and leaves the tables above it standing. That is a separate leak, recorded
-    // in the README; measuring across a warm slot isolates the thing this case
-    // is actually about, which is whether a program's own pages come back.
+    // builds the page tables for that address range, so a cold measurement
+    // conflates "did the program's pages come back" -- which is what this case
+    // is about -- with how the tables above them are accounted for.
     run_to_completion("frame-warmup", demo_thread);
     for _ in 0..50 {
         sched::yield_now();

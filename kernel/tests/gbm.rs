@@ -117,6 +117,13 @@ fn an_absurd_allocation_is_refused() {
 
 #[test_case]
 fn destroying_returns_the_frames() {
+    // Warm the region first. Mapping into a range nothing has used yet also
+    // builds the page tables that describe it, and destroying the buffer now
+    // reclaims those too -- so a cold measurement would see *more* frames come
+    // back than went out, which is not what this case is about.
+    let warmup = gbm::create(me(), 256, 256).expect("warm-up create failed");
+    gbm::destroy(me(), warmup).expect("warm-up destroy failed");
+
     let before = frame::with(|allocator| allocator.free_frames());
 
     let buffer = gbm::create(me(), 256, 256).expect("create failed");
