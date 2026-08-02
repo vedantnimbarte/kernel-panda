@@ -1,0 +1,15 @@
+[build]
+target = "x86_64-unknown-none"
+
+# `compiler-builtins-mem` is not optional: without it the first struct copy in
+# the kernel fails to link on a missing `memcpy`.
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+# Points at the compiled xtask binary rather than `cargo run -p xtask`, because a
+# nested cargo launched from this directory would inherit the [unstable] block
+# above and try to build xtask itself for bare metal.
+# Keep in sync with xtask::runner_binary_path().
+[target.x86_64-unknown-none]
+runner = ["../target/release/xtask.exe", "runner"]

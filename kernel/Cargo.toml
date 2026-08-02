@@ -1,0 +1,34 @@
+[package]
+name = "panda-kernel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Kernel Panda: a bare-metal microkernel in no_std Rust"
+
+[[bin]]
+name = "panda"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lib]
+name = "panda_kernel"
+path = "src/lib.rs"
+test = false
+bench = false
+# Doc-tests would be compiled and run on the host, where none of this links.
+doctest = false
+
+# Every dependency here ships inside the kernel image and must earn its place
+# against the auditability requirement. Three, and only three:
+#   bootloader_api - mandated by the chosen boot path
+#   x86_64         - IDT/GDT/page-table structures; pure Rust, no C
+#   spin           - spinlocks, wrapped behind crate::sync so it can be swapped out
+[dependencies]
+bootloader_api = "0.11"
+x86_64 = "0.15"
+spin = { version = "0.9", default-features = false, features = [
+    "spin_mutex",
+    "once",
+    "lazy",
+] }
