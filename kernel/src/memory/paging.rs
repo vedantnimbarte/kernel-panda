@@ -214,6 +214,16 @@ unsafe fn free_table_tree(frame: PhysFrame<Size4KiB>, level: u8, offset: VirtAdd
 
 static KERNEL_SPACE: Once<AddressSpace> = Once::new();
 
+/// Base of the complete physical memory window.
+///
+/// Anything with a physical address -- ACPI tables, MMIO, another CPU's page
+/// tables -- is reachable by adding this to it.
+pub fn physical_offset() -> VirtAddr {
+    *PHYSICAL_OFFSET
+        .get()
+        .expect("physical memory window used before memory::init")
+}
+
 /// The address space kernel threads run in.
 pub fn kernel_space() -> AddressSpace {
     *KERNEL_SPACE
@@ -427,11 +437,30 @@ pub fn unmap_in(
     space: &AddressSpace,
     page: Page<Size4KiB>,
 ) -> Result<PhysFrame<Size4KiB>, UnmapError> {
-    with_space(space, |mapper| {
-        let (frame, flush) = mapper.unmap(page)?;
-        flush.flush();
-        Ok(frame)
-    })
+    let frame = with_space(
+        space,
+        |mapper| -> Result<PhysFrame<Size4KiB>, UnmapError> {
+            let (frame, flush) = mapper.unmap(page)?;
+            // Flushes this CPU only. The TLB is not coherent across processors.
+            flush.flush();
+            Ok(frame)
+        },
+    )?;
+
+    shoot_down_if_shared(space);
+    Ok(frame)
+}
+
+/// Ask the other processors to forget their translations, if this space is one
+/// they share.
+///
+/// Only the kernel's own tables are shared. A process's are used by whichever
+/// CPU is running it, and the CR3 reload on the way in already flushes
+/// everything non-global -- so a shootdown there would be pure cost.
+fn shoot_down_if_shared(space: &AddressSpace) {
+    if KERNEL_SPACE.get() == Some(space) {
+        crate::arch::x86_64::apic::broadcast_tlb_shootdown();
+    }
 }
 
 /// Remove a mapping from `space` and return its frame to the allocator.
@@ -447,13 +476,18 @@ pub fn set_flags_in(
     page: Page<Size4KiB>,
     flags: PageTableFlags,
 ) -> Result<(), FlagUpdateError> {
-    with_space(space, |mapper| {
+    with_space(space, |mapper| -> Result<(), FlagUpdateError> {
         // SAFETY: only narrows or widens permissions on a mapping that already
         // exists; it cannot point the page at different memory.
         let flush = unsafe { mapper.update_flags(page, flags) }?;
         flush.flush();
         Ok(())
-    })
+    })?;
+
+    // Narrowing permissions matters as much as unmapping: another CPU holding a
+    // writable entry for a page just made read-only would keep writing to it.
+    shoot_down_if_shared(space);
+    Ok(())
 }
 
 /// Page flags for an address within `space`.

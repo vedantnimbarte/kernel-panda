@@ -21,6 +21,7 @@ extern crate alloc;
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::BootInfo;
 
+pub mod acpi;
 pub mod allocator;
 pub mod arch;
 pub mod console;
@@ -30,6 +31,7 @@ pub mod ipc;
 pub mod memory;
 pub mod pci;
 pub mod sched;
+pub mod smp;
 pub mod sync;
 pub mod syscall;
 pub mod testing;
@@ -86,12 +88,37 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // the first timer tick -- that handler preempts through it.
     sched::init();
 
+    // Read the firmware tables before interrupts, so the APIC address the timer
+    // uses can be cross-checked against what ACPI reports.
+    if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
+        // SAFETY: the address comes from the bootloader, and physical memory is
+        // mapped by this point.
+        match unsafe { acpi::topology(rsdp) } {
+            Ok(found) => smp::record_topology(found),
+            Err(error) => crate::println!("warning: could not read ACPI tables: {error:?}"),
+        }
+    }
+
     // Interrupts last of all. The APIC needs its MMIO page mapped, so it cannot
     // come up before memory does -- and nothing may be unmasked until the
     // console lock is interrupt-safe, which it now is.
     if let Err(error) = arch::x86_64::enable_interrupts() {
         // Survivable: the kernel just has no sense of time.
         crate::println!("warning: could not start the APIC timer: {error:?}");
+    }
+
+    // Other processors last of all: they need the APIC calibrated, the heap for
+    // their stacks, and the scheduler ready to adopt them.
+    //
+    // SAFETY: called once, from the boot processor, with everything they depend
+    // on already up.
+    let started = unsafe { smp::start_application_processors() };
+    if started > 0 {
+        crate::println!(
+            "smp: {} of {} processors online",
+            smp::online_count(),
+            smp::processor_count()
+        );
     }
 
     if !serial_ok {

@@ -37,6 +37,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 
     idt[apic::TIMER_VECTOR].set_handler_fn(timer_handler);
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
+    idt[apic::TLB_SHOOTDOWN_VECTOR].set_handler_fn(tlb_shootdown_handler);
 
     super::syscall::register(&mut idt);
 
@@ -147,6 +148,18 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     // resuming later unwinds back out through this handler and `iret`s
     // correctly.
     crate::sched::on_timer_tick();
+}
+
+/// Another processor changed a shared mapping and this one must forget what it
+/// had cached.
+///
+/// Reloads CR3, which discards every non-global entry. Invalidating just the
+/// affected page would be cheaper, but it would mean carrying the address across
+/// the interrupt, and shootdowns are rare enough that the whole-TLB flush is not
+/// worth the machinery.
+extern "x86-interrupt" fn tlb_shootdown_handler(_frame: InterruptStackFrame) {
+    x86_64::instructions::tlb::flush_all();
+    apic::end_of_interrupt();
 }
 
 /// Fires when an interrupt is withdrawn between being raised and being

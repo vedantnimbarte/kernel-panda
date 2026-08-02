@@ -12,8 +12,10 @@ faults, and manages physical and virtual memory.
 **Status:** all 17 milestones of the PRD roadmap are implemented — from a
 freestanding binary through a preemptive scheduler, Ring 3 user space,
 capability-mediated IPC, PCIe enumeration, and a display server that composites
-client buffers onto the screen from Ring 3. 88 test cases across 14
-boot-and-assert test kernels, all passing under QEMU.
+client buffers onto the screen from Ring 3 — plus a hardening pass covering
+per-process address spaces, W^X, resource quotas and multiprocessing.
+**108 test cases across 17 boot-and-assert test kernels, all passing on four
+cores under QEMU.**
 
 ```
 Kernel Panda v0.1.0
@@ -240,6 +242,25 @@ the access needs. Checking only the base is the classic confused-deputy hole, so
 there are tests for a range that runs off the end and for a length that wraps the
 address space.
 
+**The kernel runs on every core.** Application processors come out of reset in
+16-bit real mode, so they are started through a trampoline that walks them back
+up to long mode — copied into low memory and *identity mapped*, because the
+instant it enables paging it keeps executing at the address it is already at.
+Every address inside that page is a compile-time constant offset, so nothing is
+patched at runtime.
+
+Each CPU has its own GDT, TSS and double-fault stack. `privilege_stack_table[0]`
+names the stack *that* processor traps onto; sharing one would have two cores
+landing on the same stack and destroying each other's frames — corruption rather
+than a fault.
+
+**The scheduler does not enqueue an outgoing thread until its registers are
+saved.** Releasing the lock before a context switch was safe with one core
+because nothing could observe the gap. With more, another CPU could pick the
+outgoing thread off the ready queue and resume a context that is still live in
+our registers. The incoming context performs the enqueue instead, once the
+switch has completed.
+
 **Each process has its own page tables.** A new address space is a clone of the
 kernel's level 4 table with one slot — the 512 GiB entry covering the whole user
 region — replaced by a private subtree. Kernel mappings are therefore shared *by
@@ -304,9 +325,15 @@ which only means the hang would be intermittent.
 * Intermediate page tables are reclaimed for a process's user region when it
   exits, but not for kernel mappings — an unmapped kernel range leaves its
   P3/P2/P1 standing.
-* `spin::Mutex` still has no priority awareness. The console now takes its locks
-  with interrupts disabled, which is enough for a single core, but the primitive
-  behind `sync.rs` will need replacing when the scheduler lands.
+* `spin::Mutex` still has no priority awareness and no fairness — a contended
+  lock is won by whichever core asks at the right moment.
+* The scheduler is one shared ready queue behind one lock. Correct, but every
+  core contends for it on every switch; per-CPU queues with work stealing would
+  scale further.
+* TLB shootdown flushes the whole TLB rather than one page, and does not wait for
+  the other cores to acknowledge. Sufficient here because shootdowns only follow
+  an unmap the sender has already completed, but a finer implementation would
+  invalidate a single address and confirm receipt.
 * The APIC MMIO page is mapped uncached at its own virtual address while the
   bootloader's physical-memory window also maps it cached. Two mappings with
   different cache attributes is architecturally discouraged; it works here, and

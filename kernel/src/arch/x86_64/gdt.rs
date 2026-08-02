@@ -1,22 +1,27 @@
-//! Global Descriptor Table and Task State Segment.
+//! Global Descriptor Tables and Task State Segments, one set per CPU.
 //!
 //! In 64-bit mode segmentation is mostly vestigial, but the GDT is still needed
 //! for three things: valid code and data selectors for each privilege level, a
 //! TSS holding the stack the CPU switches to when it enters Ring 0, and the
 //! Interrupt Stack Table.
 //!
-//! This must be loaded *before* the IDT. A double fault raised while the stack
+//! Every one of those is per-CPU. `privilege_stack_table[0]` names the stack
+//! *this* processor traps onto, and the IST names the stack *this* processor
+//! takes a double fault on. Sharing either between cores means two CPUs landing
+//! on the same stack at the same time and quietly destroying each other's
+//! frames -- a failure that looks like random corruption rather than a fault.
+//!
+//! This must be loaded before the IDT. A double fault raised while the stack
 //! pointer is invalid -- which is exactly what a stack overflow produces --
 //! cannot push an exception frame, so the CPU escalates straight to a triple
 //! fault and the machine resets. The IST stack is what breaks that chain.
 //!
 //! ## Descriptor order
 //!
-//! The order below is not arbitrary. `SYSCALL` derives SS from CS+8, and
-//! `SYSRET` derives its two selectors from a single base +8 and +16. Keeping the
-//! conventional kernel-code, kernel-data, user-data, user-code layout costs
-//! nothing today -- entry is through an interrupt gate -- and leaves the door
-//! open to switching to `SYSCALL` later without shuffling every selector.
+//! `SYSCALL` derives SS from CS+8, and `SYSRET` derives its two selectors from a
+//! single base +8 and +16. Keeping the conventional kernel-code, kernel-data,
+//! user-data, user-code layout costs nothing today -- entry is through an
+//! interrupt gate -- and leaves the door open to switching later.
 
 use core::cell::UnsafeCell;
 
@@ -26,7 +31,7 @@ use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
-use crate::sync::Lazy;
+use crate::smp::MAX_CPUS;
 
 /// IST slot reserved for the double-fault handler. Referenced by `idt.rs`.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
@@ -43,26 +48,35 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
 #[allow(dead_code)]
 struct Stack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
-static mut DOUBLE_FAULT_STACK: Stack = Stack([0; DOUBLE_FAULT_STACK_SIZE]);
+/// One double-fault stack per CPU.
+static mut DOUBLE_FAULT_STACKS: [Stack; MAX_CPUS] =
+    [const { Stack([0; DOUBLE_FAULT_STACK_SIZE]) }; MAX_CPUS];
 
-/// The TSS has to be mutable after the GDT is built: `privilege_stack_table[0]`
-/// is the stack the CPU switches to when it takes an interrupt from Ring 3, and
-/// that must point at the *current* thread's kernel stack, so it is rewritten on
-/// every context switch.
+/// Per-CPU tables.
 ///
-/// An `UnsafeCell` rather than a `static mut` because the descriptor needs the
+/// `UnsafeCell` rather than plain statics because the descriptor needs each
 /// TSS's address while later writes go through the same memory; going through
 /// the cell keeps that from being an aliasing violation.
-#[repr(transparent)]
-struct TssCell(UnsafeCell<TaskStateSegment>);
+struct CpuTables {
+    gdt: UnsafeCell<GlobalDescriptorTable>,
+    tss: UnsafeCell<TaskStateSegment>,
+    selectors: UnsafeCell<Option<Selectors>>,
+}
 
-// SAFETY: the only writes are to `privilege_stack_table[0]`, from
-// `set_kernel_stack`, which the scheduler calls with interrupts disabled on the
-// single core this kernel supports. The CPU itself only ever reads the TSS.
-unsafe impl Sync for TssCell {}
+// SAFETY: each entry is touched only by the CPU it belongs to, and only from
+// `init_for_cpu` (once, during that CPU's start-up) and `set_kernel_stack`
+// (with interrupts disabled). No entry is ever accessed by another processor.
+unsafe impl Sync for CpuTables {}
 
-static TSS: TssCell = TssCell(UnsafeCell::new(TaskStateSegment::new()));
+static TABLES: [CpuTables; MAX_CPUS] = [const {
+    CpuTables {
+        gdt: UnsafeCell::new(GlobalDescriptorTable::new()),
+        tss: UnsafeCell::new(TaskStateSegment::new()),
+        selectors: UnsafeCell::new(None),
+    }
+}; MAX_CPUS];
 
+#[derive(Clone, Copy)]
 pub struct Selectors {
     pub kernel_code: SegmentSelector,
     pub kernel_data: SegmentSelector,
@@ -71,53 +85,54 @@ pub struct Selectors {
     pub tss: SegmentSelector,
 }
 
-static GDT: Lazy<(GlobalDescriptorTable, Selectors)> = Lazy::new(|| {
-    // Populate the TSS before any descriptor is built from it.
-    //
-    // SAFETY: this closure runs once, before the GDT is loaded and therefore
-    // before the CPU can read the TSS. Nothing else holds a reference to it.
-    unsafe {
-        let tss = TSS.0.get();
-        let bottom = VirtAddr::from_ptr(&raw const DOUBLE_FAULT_STACK);
+/// Build and load this CPU's descriptor tables.
+///
+/// `cpu` is the dense processor index; it selects which set of tables and which
+/// double-fault stack this processor owns.
+pub fn init_for_cpu(cpu: usize) {
+    assert!(cpu < MAX_CPUS, "processor index {cpu} exceeds MAX_CPUS");
+    let tables = &TABLES[cpu];
+
+    // SAFETY: this runs once, on the processor that owns these tables, before
+    // the GDT is loaded and therefore before the CPU can read the TSS. Nothing
+    // else holds a reference to either.
+    let selectors = unsafe {
+        let tss = tables.tss.get();
+
+        // `&raw mut` rather than a reference: taking one to a `static mut` is
+        // undefined behaviour the moment anything else aliases it, and only the
+        // address is wanted.
+        let stack = &raw mut DOUBLE_FAULT_STACKS[cpu];
+        let bottom = VirtAddr::from_ptr(stack);
         // x86 stacks grow downward, so the CPU wants the *top* address.
         (*tss).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             bottom + DOUBLE_FAULT_STACK_SIZE as u64;
-    }
 
-    let mut gdt = GlobalDescriptorTable::new();
-    let kernel_code = gdt.append(Descriptor::kernel_code_segment());
-    let kernel_data = gdt.append(Descriptor::kernel_data_segment());
-    let user_data = gdt.append(Descriptor::user_data_segment());
-    let user_code = gdt.append(Descriptor::user_code_segment());
+        let gdt = tables.gdt.get();
+        let kernel_code = (*gdt).append(Descriptor::kernel_code_segment());
+        let kernel_data = (*gdt).append(Descriptor::kernel_data_segment());
+        let user_data = (*gdt).append(Descriptor::user_data_segment());
+        let user_code = (*gdt).append(Descriptor::user_code_segment());
+        // The unchecked constructor takes a pointer, which is what allows the
+        // TSS to keep changing after the descriptor is built.
+        let tss_selector = (*gdt).append(Descriptor::tss_segment_unchecked(tss));
 
-    // SAFETY: the TSS lives in a `static`, so this pointer is valid for the
-    // lifetime of the kernel -- which is what the unchecked variant asks for.
-    // The checked variant cannot be used because it wants a `&'static` shared
-    // reference to memory we intend to keep mutating.
-    let tss = gdt.append(unsafe { Descriptor::tss_segment_unchecked(TSS.0.get()) });
-
-    (
-        gdt,
-        Selectors {
+        let selectors = Selectors {
             kernel_code,
             kernel_data,
             user_data,
             user_code,
-            tss,
-        },
-    )
-});
+            tss: tss_selector,
+        };
+        *tables.selectors.get() = Some(selectors);
 
-/// Load the GDT, reload the segment registers, and install the TSS.
-pub fn init() {
-    let (gdt, selectors) = &*GDT;
-    gdt.load();
+        (*gdt).load_unsafe();
+        selectors
+    };
 
-    // SAFETY: the selectors were produced by `append` on the GDT loaded on the
-    // line above, so each indexes a valid descriptor of the right type. Reloading
-    // CS and SS from a live GDT is the architecturally prescribed sequence, and
-    // the TSS descriptor points at a `'static` TaskStateSegment that outlives
-    // every use.
+    // SAFETY: the selectors index descriptors in the GDT loaded on the line
+    // above. Reloading CS and SS from a live GDT is the architecturally
+    // prescribed sequence.
     unsafe {
         CS::set_reg(selectors.kernel_code);
         SS::set_reg(selectors.kernel_data);
@@ -127,21 +142,31 @@ pub fn init() {
     }
 }
 
-pub fn selectors() -> &'static Selectors {
-    &GDT.1
+/// Load the boot processor's tables.
+pub fn init() {
+    init_for_cpu(0);
 }
 
-/// Point `privilege_stack_table[0]` at `top`.
+/// This CPU's selectors.
+pub fn selectors() -> Selectors {
+    let cpu = crate::smp::cpu_index();
+    // SAFETY: written once by `init_for_cpu` on this processor before anything
+    // can call this, and never mutated afterwards.
+    unsafe { (*TABLES[cpu].selectors.get()).expect("descriptor tables not loaded on this CPU") }
+}
+
+/// Point this CPU's `privilege_stack_table[0]` at `top`.
 ///
 /// This is the stack the CPU switches to the instant it takes an interrupt while
 /// executing Ring 3 code, so it must name the kernel stack belonging to the
-/// thread that is currently on the CPU. The scheduler updates it on every switch;
-/// getting it wrong means a user thread's trap lands on some other thread's
-/// stack and quietly corrupts it.
+/// thread currently on *this* processor. The scheduler updates it on every
+/// switch; getting it wrong means a user thread's trap lands on some other
+/// thread's stack and quietly corrupts it.
 pub fn set_kernel_stack(top: VirtAddr) {
-    // SAFETY: the only mutation of the TSS, performed with interrupts disabled
-    // on a single core, so the CPU cannot be reading the field concurrently.
+    let cpu = crate::smp::cpu_index();
+    // SAFETY: the only mutation of this CPU's TSS, performed with interrupts
+    // disabled by the scheduler, and no other processor ever touches this entry.
     unsafe {
-        (*TSS.0.get()).privilege_stack_table[0] = top;
+        (*TABLES[cpu].tss.get()).privilege_stack_table[0] = top;
     }
 }

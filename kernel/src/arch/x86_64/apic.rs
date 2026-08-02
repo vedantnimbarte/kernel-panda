@@ -60,6 +60,9 @@ pub const TIMER_VECTOR: u8 = 0x30;
 /// Conventionally the highest vector. Never actually handled meaningfully.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
+/// Asks every other processor to drop its cached translations.
+pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xFD;
+
 /// How often the timer should fire once calibration is done.
 pub const TIMER_HZ: u32 = 100;
 
@@ -146,6 +149,7 @@ pub unsafe fn init() -> Result<u32, ApicError> {
         );
 
         let apic_hz = calibrate()?;
+        CALIBRATED_HZ.store(apic_hz as u64, Ordering::Release);
 
         // Periodic mode from here on: one interrupt every 1/TIMER_HZ seconds.
         write_reg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
@@ -153,6 +157,167 @@ pub unsafe fn init() -> Result<u32, ApicError> {
         write_reg(REG_TIMER_INITIAL_COUNT, apic_hz / TIMER_HZ);
 
         Ok(apic_hz)
+    }
+}
+
+/// Local APIC ID register.
+const REG_ID: usize = 0x020;
+/// Interrupt Command Register, low and high halves.
+const REG_ICR_LOW: usize = 0x300;
+const REG_ICR_HIGH: usize = 0x310;
+
+/// ICR bit 12: the previous IPI has not been delivered yet.
+const ICR_DELIVERY_PENDING: u32 = 1 << 12;
+/// Delivery mode 101: INIT.
+const ICR_INIT: u32 = 0x0000_4500;
+/// Delivery mode 110: Startup.
+const ICR_STARTUP: u32 = 0x0000_4600;
+
+/// The measured tick rate, so secondary processors do not each repeat the PIT
+/// calibration -- it is a property of the machine, not of the CPU.
+static CALIBRATED_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// This processor's Local APIC id.
+pub fn id() -> u8 {
+    if APIC_VIRT.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    // SAFETY: the base is non-zero, so the MMIO page is mapped. The id register
+    // is read-only and has no side effects.
+    let raw = unsafe { read_reg(REG_ID) };
+    // The id lives in the top eight bits.
+    (raw >> 24) as u8
+}
+
+/// Bring up the Local APIC on a processor that is not the boot processor.
+///
+/// Skips calibration: the tick rate was measured once on the boot processor and
+/// is a property of the board's crystal, not of the core reading it.
+///
+/// # Safety
+///
+/// Call once per secondary processor, with interrupts disabled, after the boot
+/// processor has finished `init`.
+pub unsafe fn init_for_secondary() -> Result<(), ApicError> {
+    if !is_supported() {
+        return Err(ApicError::NotSupported);
+    }
+    if APIC_VIRT.load(Ordering::Acquire) == 0 {
+        return Err(ApicError::NotSupported);
+    }
+
+    // SAFETY: the MMIO window was mapped by the boot processor into the page
+    // tables this CPU is already using.
+    unsafe {
+        let base = Msr::new(IA32_APIC_BASE).read();
+        Msr::new(IA32_APIC_BASE).write(base | APIC_BASE_ENABLE);
+
+        write_reg(
+            REG_SPURIOUS,
+            SPURIOUS_SOFTWARE_ENABLE | SPURIOUS_VECTOR as u32,
+        );
+
+        let hz = CALIBRATED_HZ.load(Ordering::Acquire);
+        if hz == 0 {
+            return Err(ApicError::CalibrationFailed);
+        }
+
+        write_reg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+        write_reg(REG_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
+        write_reg(REG_TIMER_INITIAL_COUNT, (hz as u32) / TIMER_HZ);
+    }
+
+    Ok(())
+}
+
+/// Wait for the last inter-processor interrupt to be accepted.
+///
+/// # Safety
+///
+/// The APIC must be mapped.
+unsafe fn wait_for_delivery() {
+    for _ in 0..1_000_000 {
+        // SAFETY: forwarded from this function's contract.
+        if unsafe { read_reg(REG_ICR_LOW) } & ICR_DELIVERY_PENDING == 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Send the INIT-SIPI-SIPI sequence that takes a processor out of reset.
+///
+/// The doubled startup IPI is not superstition: the Intel manual's own
+/// algorithm sends two, because on some parts the first is dropped if it
+/// arrives while the processor is still settling from INIT. A CPU that already
+/// started ignores the second.
+///
+/// # Safety
+///
+/// `apic_id` must name a real processor, and `trampoline` must be a page-aligned
+/// physical address below 1 MiB holding valid real-mode startup code.
+pub unsafe fn start_processor(apic_id: u8, trampoline: u64) {
+    let vector = ((trampoline >> 12) & 0xFF) as u32;
+    let destination = (apic_id as u32) << 24;
+
+    // SAFETY: the caller guarantees the target and the trampoline; the ICR is
+    // the architecturally defined way to reach another processor.
+    unsafe {
+        write_reg(REG_ICR_HIGH, destination);
+        write_reg(REG_ICR_LOW, ICR_INIT);
+        wait_for_delivery();
+
+        // The manual asks for 10 ms after INIT. The timer is running by now, so
+        // wait on real ticks rather than guessing at a spin count.
+        let deadline = crate::time::ticks() + 2;
+        while crate::time::ticks() < deadline {
+            core::hint::spin_loop();
+        }
+
+        for _ in 0..2 {
+            write_reg(REG_ICR_HIGH, destination);
+            write_reg(REG_ICR_LOW, ICR_STARTUP | vector);
+            wait_for_delivery();
+
+            // Roughly 200 microseconds. Precision does not matter here; being
+            // too slow only delays boot.
+            for _ in 0..200_000 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Tell every other processor to discard its cached page translations.
+///
+/// The TLB is per-CPU and the hardware does not keep them coherent. Unmapping a
+/// page that other processors share -- anything in the kernel's own address
+/// space -- leaves them translating an address whose frame has been handed to
+/// someone else. Nothing faults; they simply keep reading and writing memory
+/// that is no longer theirs, which is the worst shape a bug can take.
+///
+/// A process's own tables need no shootdown: only one CPU runs it at a time, and
+/// the CR3 reload on the way in flushes everything non-global.
+pub fn broadcast_tlb_shootdown() {
+    if APIC_VIRT.load(Ordering::Acquire) == 0 || crate::smp::online_count() <= 1 {
+        return;
+    }
+
+    // Destination shorthand 0b11: every processor except this one. Using the
+    // shorthand rather than looping over ids means no list to keep in step with
+    // reality, and no chance of missing a CPU that came up late.
+    const ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
+    const LEVEL_ASSERT: u32 = 1 << 14;
+
+    // SAFETY: the APIC is mapped, and this is the architecturally defined way to
+    // interrupt other processors.
+    unsafe {
+        write_reg(REG_ICR_HIGH, 0);
+        write_reg(
+            REG_ICR_LOW,
+            ALL_EXCLUDING_SELF | LEVEL_ASSERT | TLB_SHOOTDOWN_VECTOR as u32,
+        );
+        wait_for_delivery();
     }
 }
 

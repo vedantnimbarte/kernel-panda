@@ -306,6 +306,10 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, Str
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", qpath(image)));
     cmd.args(["-m", "256M"]);
+    // Four cores by default. The kernel targets multi-processor hardware, so
+    // running the tests on one core would leave every SMP path untested -- and
+    // the races it would hide are exactly the ones worth finding early.
+    cmd.args(["-smp", "4"]);
     cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     // Turn a triple fault into a dead VM instead of an invisible reboot loop.
     cmd.arg("-no-reboot");
