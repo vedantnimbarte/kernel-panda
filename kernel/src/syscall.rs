@@ -68,6 +68,10 @@ pub fn dispatch(frame: &mut SyscallFrame) {
             Ok(0)
         }
         numbers::GET_TID => Ok(sched::current_id().map_or(-1, |id| id.0 as i64)),
+        numbers::IPC_CREATE => crate::ipc::sys_create(frame.rdi),
+        numbers::IPC_SEND => crate::ipc::sys_send(frame.rdi, frame.rsi),
+        numbers::IPC_RECV => crate::ipc::sys_recv(frame.rdi, frame.rsi),
+        numbers::IPC_GRANT => crate::ipc::sys_grant(frame.rdi, frame.rsi, frame.rdx),
         _ => Err(Error::UnknownCall),
     };
 

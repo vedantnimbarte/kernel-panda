@@ -20,6 +20,9 @@ pub enum State {
     Ready,
     /// Currently on the CPU.
     Running,
+    /// Waiting for something -- today, a message on an IPC endpoint. Not in the
+    /// ready queue, and only `sched::unblock` puts it back.
+    Blocked,
     /// Returned from its entry point. Its stack is freed by the next
     /// `schedule()` that runs after it has been switched away from.
     Finished,

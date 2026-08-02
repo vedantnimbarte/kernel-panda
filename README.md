@@ -9,9 +9,9 @@ A bare-metal microkernel written from scratch in `no_std` Rust, targeting
 [the project specification](docs/prd.md): a kernel that boots, catches its own
 faults, and manages physical and virtual memory.
 
-**Status:** Phases 1 and 2 complete, Phase 3 underway (interrupts and a
-preemptive scheduler). 40 test cases across 9 boot-and-assert test kernels, all
-passing under QEMU.
+**Status:** Phases 1 and 2 complete; Phase 3 through Milestone 4 — interrupts, a
+preemptive scheduler, Ring 3 user space, and capability-mediated IPC. 60 test
+cases across 11 boot-and-assert test kernels, all passing under QEMU.
 
 ```
 Kernel Panda v0.1.0
@@ -46,10 +46,24 @@ scheduler: spawning two workers that never yield
   [worker-b] step 3 of 3
   [worker-a] step 3 of 3
   both workers finished; 3 threads live, running as 'boot'
+
+ring 3: loading a user program and dropping privilege
+  [ring 3] hello from user space
+  [ring 3] still running after a yield
+  user program exited after writing 72 bytes through syscalls
+
+ipc: a blocking logger thread fed over a capability
+  [logger] tag 0x0101 word0  10 from thread 0
+  [logger] tag 0x0102 word0  20 from thread 0
+  [logger] tag 0x0103 word0  30 from thread 0
+  [logger] tag 0xcafe word0 48879 from thread 6
+  logger exited; endpoint drained to 0
 ```
 
-Neither worker yields. The interleaving above is entirely the timer taking the
-CPU away from them.
+Neither worker yields — the interleaving is entirely the timer taking the CPU
+away from them. Thread 6 is a Ring 3 process sending through a SEND-only
+capability; the kernel stamped its identity into the message, overwriting the
+value the program had put there.
 
 ## Building and running
 
@@ -83,7 +97,10 @@ kernel-panda/
     │   ├── arch/x86_64/   GDT + TSS, IDT, Local APIC + timer, 8259 masking
     │   ├── memory/    memory map, bitmap frame allocator, page tables, heap region
     │   ├── allocator/ bump and linked-list `GlobalAlloc` implementations
-    │   └── sched/  threads, context switch, round-robin scheduler
+    │   ├── sched/  threads, context switch, round-robin scheduler
+    │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
+    │   ├── syscall.rs    the entire Ring 3 surface
+    │   └── ipc.rs        endpoints, capabilities, blocking receive
     └── tests/       one standalone boot-and-assert kernel per file
 ```
 
@@ -173,6 +190,32 @@ safe only because the whole scheduler runs with interrupts disabled on a single
 core, so nothing can observe the gap. It is the first thing that will need
 rethinking for SMP.
 
+**Entry to the kernel is an interrupt gate, not `SYSCALL`.** An interrupt gate
+switches to the stack in `TSS.privilege_stack_table[0]` automatically, where
+`SYSCALL` does not switch stacks at all and needs `swapgs` plus a per-CPU block
+to find one. The gate costs more cycles and buys a great deal less that can go
+quietly wrong. The ABI does not depend on the mechanism, so it can be swapped
+later.
+
+**A user fault kills the thread, not the kernel.** PRD 1.2 asks that a fault in
+unprivileged code never take the system down, so the page-fault and GP handlers
+check the saved CS and, if the fault came from Ring 3, destroy that thread and
+carry on. `ring3.rs` proves it by running a program that dereferences the kernel
+heap: the fault reports `PROTECTION_VIOLATION | USER_MODE`, meaning the page is
+mapped and the `USER_ACCESSIBLE` bit is what stopped it — not a lucky unmapped
+address.
+
+**Every pointer from Ring 3 is walked before it is believed.** A user pointer is
+an attacker-controlled integer. Validation checks both that the range lies inside
+the user region *and* that every page it spans is present with the permissions
+the access needs. Checking only the base is the classic confused-deputy hole, so
+there are tests for a range that runs off the end and for a length that wraps the
+address space.
+
+**Authority narrows, never widens.** A grant is intersected with what the granter
+already holds, and requires the `GRANT` right to perform at all. Naming an
+endpoint conveys nothing on its own.
+
 **The console disables interrupts while it holds its lock.** Without this the
 kernel deadlocks the first time a handler prints: it spins on a lock held by the
 code it interrupted, which cannot run again to release it. The window is small,
@@ -204,9 +247,20 @@ which only means the hang would be intermittent.
 * Kernel stacks come from the heap, so they have no guard page. A thread that
   overflows its 32 KiB corrupts whatever the allocator put beneath it, silently.
   They should move to guard-paged mappings of their own.
-* The scheduler is strict round-robin with no priorities and no blocking. There
-  is no way to sleep or wait on anything yet, so `yield_now` in a loop is the
-  only way to wait — which burns a slice each time round.
+* The scheduler is strict round-robin with no priorities. Threads can now block
+  on IPC, but there is still no sleep and no wait-for-thread, so polling with
+  `yield_now` is the only way to await anything else.
+* **There is one address space.** Ring 3 is kept out of kernel memory by page
+  permissions, which is a real privilege boundary — but user processes are not
+  isolated from *each other*, since they can name each other's pages. Until each
+  process gets its own page tables, IPC capabilities are the isolation boundary
+  rather than a second layer behind it. This is the most significant gap in the
+  system and should be closed before anything untrusted runs.
+* User programs are hand-written position-independent blobs copied into a single
+  page. Loading real ELF images is a prerequisite for M5.
+* Syscalls run with interrupts disabled, because the gate is an interrupt gate.
+  Long-running calls are therefore not preemptible; only `write` is bounded
+  today, and every future call has to stay short or the quantum is a fiction.
 
 ## Phase 3 progress
 
@@ -215,6 +269,10 @@ which only means the hang would be intermittent.
 - [x] **M2 — Preemptive thread scheduler.** Kernel threads with their own
       stacks, round-robin over a 10 ms quantum, timer-driven preemption,
       `yield_now`, and reaping of finished threads.
-- [ ] M3 — Ring 0 → Ring 3 context switch.
-- [ ] M4 — The IPC ring buffer.
+- [x] **M3 — Ring 0 → Ring 3.** User code and data segments, a per-thread Ring 0
+      stack in the TSS, an `int 0x80` syscall gate, user page mapping with
+      validated pointers, and user faults that kill only the faulting thread.
+- [x] **M4 — IPC.** Bounded endpoint queues, unforgeable sender identity,
+      capabilities with `SEND`/`RECEIVE`/`GRANT`, and a blocking receive that
+      parks the thread rather than spinning.
 - [ ] M5 — First user-space daemon: a shell over the serial port.

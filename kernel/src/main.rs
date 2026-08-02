@@ -9,11 +9,12 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use bootloader_api::{entry_point, BootInfo};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use panda_kernel::arch::x86_64::apic;
+use panda_kernel::ipc::EndpointId;
 use panda_kernel::{
-    arch::x86_64::halt_loop, console, memory, println, sched, syscall, time, userspace,
+    arch::x86_64::halt_loop, console, ipc, memory, println, sched, sync, syscall, time, userspace,
     BOOTLOADER_CONFIG,
 };
 
@@ -94,6 +95,50 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     println!();
 
+    println!("ipc: a blocking logger thread fed over a capability");
+    let me = sched::current_id().expect("boot has no thread id");
+    let endpoint = ipc::create(me, 8).expect("could not create an endpoint");
+    DEMO_ENDPOINT.store(endpoint.0, Ordering::Release);
+
+    // Spawn and grant without a preemption window between them, or the logger
+    // could wake first and be turned away for want of a capability.
+    let logger = sync::without_interrupts(|| {
+        let id = sched::spawn("ipc-logger", ipc_logger).expect("scheduler not running");
+        ipc::grant(me, id, endpoint, ipc::Rights::RECEIVE).expect("grant failed");
+        id
+    });
+
+    for n in 1..=3u64 {
+        ipc::send(
+            me,
+            endpoint,
+            ipc::Message {
+                tag: 0x100 + n,
+                words: [n * 10, 0, 0, 0],
+                sender: 0,
+            },
+        )
+        .expect("send failed");
+    }
+
+    // A Ring 3 process sends over the same endpoint, holding only SEND.
+    let user_sender = sync::without_interrupts(|| {
+        let id = sched::spawn("user-ipc", ring3_ipc).expect("scheduler not running");
+        ipc::grant(me, id, endpoint, ipc::Rights::SEND).expect("grant failed");
+        id
+    });
+    while sched::is_alive(user_sender) {
+        sched::yield_now();
+    }
+
+    // Zero tag tells the logger to stop.
+    ipc::send(me, endpoint, ipc::Message::default()).expect("send failed");
+    while sched::is_alive(logger) {
+        sched::yield_now();
+    }
+    println!("  logger exited; endpoint drained to {}", ipc::queued(endpoint));
+    println!();
+
     halt_loop()
 }
 
@@ -125,6 +170,38 @@ fn worker_b() {
         busy_wait_ticks(10);
     }
     WORKER_B_DONE.store(true, Ordering::Release);
+}
+
+/// Endpoint the demo threads talk over. Set before either is spawned.
+static DEMO_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+
+/// Blocks on the endpoint and prints whatever turns up, until a zero tag ends it.
+fn ipc_logger() {
+    let endpoint = EndpointId(DEMO_ENDPOINT.load(Ordering::Acquire));
+    let me = sched::current_id().expect("logger has no thread id");
+
+    loop {
+        let message = ipc::receive(me, endpoint).expect("receive failed");
+        if message.tag == 0 {
+            return;
+        }
+        println!(
+            "  [logger] tag {:#06x} word0 {:>3} from thread {}",
+            message.tag, message.words[0], message.sender
+        );
+    }
+}
+
+/// Sends one message from Ring 3 through a capability it was granted.
+fn ring3_ipc() {
+    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
+    let image = userspace::load_program(slot, userspace::ipc_program())
+        .expect("failed to map the user image");
+    let endpoint = DEMO_ENDPOINT.load(Ordering::Acquire);
+
+    // SAFETY: `load_program` mapped the entry page user-executable and the stack
+    // user-writable.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
 }
 
 /// Loads the demo program into its own user slot and drops to Ring 3. Never

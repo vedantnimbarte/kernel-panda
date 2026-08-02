@@ -235,6 +235,41 @@ pub fn yield_now() {
     schedule();
 }
 
+/// Park the current thread until something calls [`unblock`] on it.
+///
+/// The caller is responsible for having registered itself somewhere a waker can
+/// find it *before* calling this -- with interrupts disabled on a single core
+/// there is no window between the two, but that stops being true the moment
+/// there is a second CPU.
+pub fn block_current() {
+    with(|scheduler| {
+        let id = scheduler.current;
+        scheduler.thread_mut(id).state = State::Blocked;
+    });
+    schedule();
+}
+
+/// Return a blocked thread to the ready queue. Does nothing if it is not
+/// blocked, so a duplicate wake is harmless.
+pub fn unblock(id: ThreadId) {
+    with(|scheduler| {
+        let woken = match scheduler
+            .threads
+            .get_mut(id.0)
+            .and_then(|slot| slot.as_deref_mut())
+        {
+            Some(thread) if thread.state == State::Blocked => {
+                thread.state = State::Ready;
+                true
+            }
+            _ => false,
+        };
+        if woken {
+            scheduler.ready.push_back(id);
+        }
+    });
+}
+
 /// Top of the current thread's kernel stack, or 0 for the boot thread.
 pub fn current_kernel_stack_top() -> u64 {
     with(|scheduler| scheduler.thread(scheduler.current).kernel_stack_top).unwrap_or(0)
@@ -243,6 +278,17 @@ pub fn current_kernel_stack_top() -> u64 {
 /// Whether a thread still exists. False once it has finished and been reaped.
 pub fn is_alive(id: ThreadId) -> bool {
     with(|scheduler| scheduler.thread_opt(id).is_some()).unwrap_or(false)
+}
+
+/// Whether a thread is currently blocked. Diagnostic, and used by tests.
+pub fn is_blocked(id: ThreadId) -> bool {
+    with(|scheduler| {
+        matches!(
+            scheduler.thread_opt(id),
+            Some(thread) if thread.state == State::Blocked
+        )
+    })
+    .unwrap_or(false)
 }
 
 /// End the current thread. Its stack is freed by a later `schedule()`, once the
