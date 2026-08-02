@@ -4,11 +4,15 @@
 //!
 //! 1. Read the bootloader's memory map to learn what RAM exists.
 //! 2. Build the physical frame allocator over it.
+//! 3. Adopt the page tables, which need the frame allocator for intermediate
+//!    tables.
 
 pub mod frame;
+pub mod paging;
 
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use bootloader_api::BootInfo;
+use x86_64::VirtAddr;
 
 use crate::println;
 
@@ -34,9 +38,11 @@ pub fn init(boot_info: &mut BootInfo) {
 
     // SAFETY: the offset above is the bootloader's own answer to the mapping we
     // requested, so all physical memory really is mapped and writable there.
-    // Called exactly once, from the boot path.
+    // Both calls happen exactly once, here, in dependency order: the page-table
+    // mapper needs the frame allocator to build intermediate tables.
     unsafe {
         frame::init(&boot_info.memory_regions, physical_memory_offset);
+        paging::init(VirtAddr::new(physical_memory_offset));
     }
 }
 
