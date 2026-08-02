@@ -1,0 +1,5 @@
+# Only aliases live here. Anything build-related must NOT be set at this level:
+# cargo merges parent configs into child ones, so a `[build] target` or
+# `[unstable] build-std` here would leak down into kernel/ and vice-versa.
+[alias]
+xtask = "run --package xtask --release --"

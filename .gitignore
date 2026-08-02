@@ -1,0 +1,4 @@
+/target
+/kernel/target
+*.img
+*.fd

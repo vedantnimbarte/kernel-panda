@@ -1,0 +1,9 @@
+# Pinned to an exact nightly, not floating `nightly`: `build-std` depends on
+# unstable internals that break without warning, and reproducible builds are a
+# stated goal of this project. Bump deliberately, never incidentally.
+[toolchain]
+channel = "nightly-2026-08-01"
+components = ["rust-src", "llvm-tools", "clippy", "rustfmt"]
+# Needed by the `bootloader` crate, whose BIOS/UEFI stages are artifact
+# dependencies built for bare metal.
+targets = ["x86_64-unknown-none"]

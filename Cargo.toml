@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["xtask"]
+
+# The kernel is deliberately its own workspace. `[unstable] build-std` in a
+# .cargo/config.toml applies to the entire cargo invocation and cannot be scoped
+# per-target, so if the kernel shared this workspace cargo would try to compile
+# `std` from source for the Windows host and the build would collapse.
+exclude = ["kernel"]

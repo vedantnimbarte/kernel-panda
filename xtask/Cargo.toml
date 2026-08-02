@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Host-side only. The kernel's own three-crate dependency budget does not apply
+# here -- nothing in xtask ends up in the shipped image.
+bootloader = "0.11"
