@@ -92,6 +92,21 @@ fn a_long_lived_allocation_survives_churn_around_it() {
 
 #[test_case]
 fn freeing_everything_coalesces_the_heap_again() {
+    // Measured against a baseline rather than against an empty heap. The kernel
+    // holds permanent allocations of its own -- the scheduler's idle-thread stack
+    // and ready queue, for a start -- so "one free block spanning HEAP_SIZE" has
+    // not been true since threads arrived. The invariant that matters is that
+    // the heap returns to *exactly* the shape it was in: if the freed blocks had
+    // not merged, the region count would come back higher than it started.
+    let baseline = allocator::stats();
+    let baseline_regions = allocator::free_region_count();
+    let baseline_largest = allocator::largest_free_region();
+
+    assert!(
+        baseline_largest <= HEAP_SIZE,
+        "the largest free block cannot exceed the heap"
+    );
+
     {
         let mut blocks: Vec<Box<[u64; 8]>> = Vec::new();
         for n in 0..64u64 {
@@ -104,23 +119,27 @@ fn freeing_everything_coalesces_the_heap_again() {
         }
     }
 
-    let stats = allocator::stats();
+    let after = allocator::stats();
     assert_eq!(
-        stats.allocations, 0,
-        "{} allocations still live after everything was dropped",
-        stats.allocations
+        after.allocations, baseline.allocations,
+        "{} allocations live afterwards against a baseline of {}",
+        after.allocations, baseline.allocations
     );
-    assert_eq!(stats.allocated, 0, "byte accounting drifted");
+    assert_eq!(
+        after.allocated, baseline.allocated,
+        "byte accounting drifted"
+    );
 
     assert_eq!(
         allocator::free_region_count(),
-        1,
-        "the heap did not merge back into a single block -- coalescing is broken"
+        baseline_regions,
+        "the heap came back with a different number of free blocks than it \
+         started with -- the freed blocks did not merge"
     );
     assert_eq!(
         allocator::largest_free_region(),
-        HEAP_SIZE,
-        "the single free block is not the whole heap"
+        baseline_largest,
+        "the largest free block shrank, so a merge was missed"
     );
 }
 
