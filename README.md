@@ -320,8 +320,12 @@ which only means the hang would be intermittent.
 
 * No SMAP. The kernel legitimately reads and writes user buffers during
   syscalls, so enabling it means bracketing every such access with `stac`/`clac`.
-* No per-process quotas yet: Ring 3 can still create endpoints and buffers until
-  memory runs out.
+* Quotas are fixed constants, identical for every process. Real ones would be
+  per-process policy set by whoever spawned it.
+* The ACPI IOAPIC address is read but never used — nothing routes a device
+  interrupt yet, so console input is still polled.
+* Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
+  timing is exactly where this class of code breaks.
 * Intermediate page tables are reclaimed for a process's user region when it
   exits, but not for kernel mappings — an unmapped kernel range leaves its
   P3/P2/P1 standing.
