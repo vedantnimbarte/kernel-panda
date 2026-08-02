@@ -109,6 +109,42 @@ fn a_user_program_returns_its_frames() {
     );
 }
 
+static PEEK_TARGET: AtomicU64 = AtomicU64::new(0);
+
+fn peek_thread() {
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_program(owner, userspace::peek_program())
+        .expect("failed to map user image");
+    let target = PEEK_TARGET.load(Ordering::Acquire);
+    // SAFETY: as above.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, target) }
+}
+
+#[test_case]
+fn one_process_cannot_read_another_address_space() {
+    // The boot thread maps a buffer, which lands at an address inside the user
+    // region of *its* address space.
+    let buffer = gbm::create(sched::current_id().unwrap(), 64, 64).expect("create failed");
+    let address = gbm::map(sched::current_id().unwrap(), buffer).expect("map failed");
+
+    // SAFETY: just mapped present and writable.
+    unsafe { (address as *mut u64).write_volatile(0xFEED_FACE) };
+
+    PEEK_TARGET.store(address, Ordering::Release);
+    let before = panda_kernel::syscall::user_bytes_written();
+
+    // A separate process is handed that exact address. With one shared address
+    // space it would simply read it; with its own, there is nothing there.
+    run_to_completion("peek", peek_thread);
+
+    assert_eq!(
+        panda_kernel::syscall::user_bytes_written(),
+        before,
+        "a user process read an address mapped only in another address space -- \
+         processes are not isolated from each other"
+    );
+}
+
 static ENDPOINT_MADE: AtomicU64 = AtomicU64::new(0);
 static MAKER_ID: AtomicUsize = AtomicUsize::new(0);
 

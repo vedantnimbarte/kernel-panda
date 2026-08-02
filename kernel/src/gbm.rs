@@ -368,6 +368,12 @@ pub fn map(thread: ThreadId, buffer: BufferId) -> Result<u64, Error> {
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
+
+    // Into the recipient's own tables, which are not necessarily the ones loaded
+    // right now -- a compositor can be handed a surface while the client that
+    // owns it is the thread actually running.
+    let target = crate::sched::address_space_of(thread).unwrap_or_else(paging::kernel_space);
+
     for (index, frame) in frames.iter().enumerate() {
         let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(VirtAddr::new(
             address + index as u64 * PAGE_SIZE,
@@ -378,7 +384,8 @@ pub fn map(thread: ThreadId, buffer: BufferId) -> Result<u64, Error> {
         // they are the display controller's MMIO window, which the allocator
         // never hands out because it sits far above the highest usable RAM
         // address. Either way nothing else will map them behind our back.
-        unsafe { paging::map_to_frame(page, *frame, flags) }.map_err(|_| Error::OutOfMemory)?;
+        unsafe { paging::map_to_frame_in(&target, page, *frame, flags) }
+            .map_err(|_| Error::OutOfMemory)?;
     }
 
     Ok(address)
@@ -493,6 +500,10 @@ pub fn release_thread(thread: ThreadId) {
         (frames, unmap)
     });
 
+    // The exiting thread's own space is about to be destroyed wholesale, so its
+    // mappings need no individual teardown; what matters is other threads'
+    // mappings of buffers that are going away.
+    let target = crate::sched::address_space_of(thread).unwrap_or_else(paging::kernel_space);
     for (address, pages) in unmap {
         for index in 0..pages {
             let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(
@@ -500,7 +511,7 @@ pub fn release_thread(thread: ThreadId) {
             );
             // `unmap`, not `unmap_and_free`: scanout frames belong to the
             // display controller and must never reach the frame allocator.
-            let _ = paging::unmap(page);
+            let _ = paging::unmap_in(&target, page);
         }
     }
 

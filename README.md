@@ -237,6 +237,24 @@ the access needs. Checking only the base is the classic confused-deputy hole, so
 there are tests for a range that runs off the end and for a length that wraps the
 address space.
 
+**Each process has its own page tables.** A new address space is a clone of the
+kernel's level 4 table with one slot — the 512 GiB entry covering the whole user
+region — replaced by a private subtree. Kernel mappings are therefore shared *by
+pointer*, so a later kernel mapping is visible everywhere at once, and only the
+user region diverges. That holds while no kernel mapping needs a brand-new level
+4 entry after the first process exists; every kernel region has its slot
+populated during boot.
+
+The page-table mapper is rebuilt from CR3 on every call rather than cached. A
+cached mapper always describes the boot tables, so once processes have spaces of
+their own it answers questions about the wrong one — silently, and only for user
+addresses.
+
+`one_process_cannot_read_another_address_space` is the proof: a process handed an
+address that is mapped only in another space faults with `USER_MODE` and no
+`PROTECTION_VIOLATION`, meaning the page is not present rather than merely
+forbidden. The kernel-trespass test shows the opposite pair.
+
 **Authority narrows, never widens.** A grant is intersected with what the granter
 already holds, and requires the `GRANT` right to perform at all. Naming an
 endpoint conveys nothing on its own.
@@ -280,10 +298,9 @@ which only means the hang would be intermittent.
   syscalls, so enabling it means bracketing every such access with `stac`/`clac`.
 * No per-process quotas yet: Ring 3 can still create endpoints and buffers until
   memory runs out.
-* **Intermediate page tables are never reclaimed.** `unmap_and_free` releases the
-  leaf frame and leaves the P3/P2/P1 tables above it standing, so the first use
-  of any address range costs a few frames permanently. Freeing them means
-  walking up and checking each level for emptiness.
+* Intermediate page tables are reclaimed for a process's user region when it
+  exits, but not for kernel mappings — an unmapped kernel range leaves its
+  P3/P2/P1 standing.
 * `spin::Mutex` still has no priority awareness. The console now takes its locks
   with interrupts disabled, which is enough for a single core, but the primitive
   behind `sync.rs` will need replacing when the scheduler lands.
@@ -299,12 +316,6 @@ which only means the hang would be intermittent.
 * The scheduler is strict round-robin with no priorities. Threads can now block
   on IPC, but there is still no sleep and no wait-for-thread, so polling with
   `yield_now` is the only way to await anything else.
-* **There is one address space.** Ring 3 is kept out of kernel memory by page
-  permissions, which is a real privilege boundary — but user processes are not
-  isolated from *each other*, since they can name each other's pages. Until each
-  process gets its own page tables, IPC capabilities are the isolation boundary
-  rather than a second layer behind it. This is the most significant gap in the
-  system and should be closed before anything untrusted runs.
 * **User programs are hand-written assembly blobs** copied into a single page. A
   Rust function lives in kernel pages that are deliberately not user-accessible,
   so it cannot be executed from Ring 3; the honest fix is a separate userland

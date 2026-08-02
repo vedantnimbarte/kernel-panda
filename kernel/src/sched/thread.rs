@@ -1,4 +1,4 @@
-//! Thread control blocks.
+﻿//! Thread control blocks.
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -42,6 +42,12 @@ pub struct Thread {
 
     /// What the thread runs. Read once by the trampoline.
     pub entry: Option<fn()>,
+
+    /// This thread's own page tables, if it has any.
+    ///
+    /// `None` means it runs in the kernel's space, which is every thread that
+    /// has not loaded a user program.
+    pub address_space: Option<crate::memory::paging::AddressSpace>,
 
     /// Top of this thread's kernel stack, or 0 for the boot thread.
     ///
@@ -87,6 +93,7 @@ impl Thread {
             state: State::Ready,
             stack_pointer,
             entry: Some(entry),
+            address_space: None,
             kernel_stack_top: top,
             stack: Some(stack),
         }
@@ -104,6 +111,7 @@ impl Thread {
             state: State::Running,
             stack_pointer: 0,
             entry: None,
+            address_space: None,
             // The boot thread never drops to Ring 3, so no Ring 0 stack has to
             // be published for it.
             kernel_stack_top: 0,

@@ -37,6 +37,15 @@ const IDLE_THREAD: ThreadId = ThreadId(1);
 
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 
+/// What a context switch needs, decided under the scheduler lock and acted on
+/// after it is released.
+struct Switch {
+    save_to: *mut u64,
+    load_from: u64,
+    kernel_stack_top: u64,
+    space: Option<crate::memory::paging::AddressSpace>,
+}
+
 struct Scheduler {
     /// Indexed by `ThreadId`. A `None` slot is a thread that has finished and
     /// been reaped; ids are never reused, so a stale id reads as `None` rather
@@ -98,7 +107,7 @@ impl Scheduler {
     /// Decide who runs next, and return what the switch needs: where to save the
     /// outgoing stack pointer, the incoming one to load, and the incoming
     /// thread's Ring 0 stack for the TSS. `None` means stay where we are.
-    fn prepare_switch(&mut self) -> Option<(*mut u64, u64, u64)> {
+    fn prepare_switch(&mut self) -> Option<Switch> {
         let current = self.current;
 
         let next = match self.pop_runnable() {
@@ -136,11 +145,17 @@ impl Scheduler {
         incoming.state = State::Running;
         let load_from = incoming.stack_pointer;
         let kernel_stack_top = incoming.kernel_stack_top;
+        let space = incoming.address_space;
 
         self.current = next;
         self.slice_remaining = TIME_SLICE_TICKS;
 
-        Some((save_to, load_from, kernel_stack_top))
+        Some(Switch {
+            save_to,
+            load_from,
+            kernel_stack_top,
+            space,
+        })
     }
 }
 
@@ -209,9 +224,15 @@ pub fn schedule() {
             scheduler.prepare_switch()
         };
 
-        let Some((save_to, load_from, kernel_stack_top)) = switch else {
+        let Some(switch) = switch else {
             return;
         };
+        let Switch {
+            save_to,
+            load_from,
+            kernel_stack_top,
+            space,
+        } = switch;
 
         // Publish the incoming thread's Ring 0 stack before it can be
         // interrupted. If this thread ever runs in Ring 3, the very next
@@ -219,6 +240,14 @@ pub fn schedule() {
         if kernel_stack_top != 0 {
             crate::arch::x86_64::gdt::set_kernel_stack(x86_64::VirtAddr::new(kernel_stack_top));
         }
+
+        // Swap page tables before the stack switch. Safe at any point inside the
+        // kernel: every space carries the same kernel mappings, so the code
+        // executing here and the stack it is on are identical either side.
+        let target = space.unwrap_or_else(crate::memory::paging::kernel_space);
+        // SAFETY: `target` is either a space cloned from the kernel's -- and so
+        // containing every kernel mapping -- or the kernel's own.
+        unsafe { target.activate() };
 
         // SAFETY: `save_to` points into a `Box<Thread>`, whose address is stable
         // for as long as the box lives, and nothing can free it here: the only
@@ -268,6 +297,18 @@ pub fn unblock(id: ThreadId) {
             scheduler.ready.push_back(id);
         }
     });
+}
+
+/// Give a thread its own page tables, and activate them if it is running.
+pub fn set_address_space(id: ThreadId, space: crate::memory::paging::AddressSpace) {
+    with(|scheduler| {
+        scheduler.thread_mut(id).address_space = Some(space);
+    });
+}
+
+/// A thread's page tables, if it has its own.
+pub fn address_space_of(id: ThreadId) -> Option<crate::memory::paging::AddressSpace> {
+    with(|scheduler| scheduler.thread_opt(id).and_then(|thread| thread.address_space)).flatten()
 }
 
 /// Top of the current thread's kernel stack, or 0 for the boot thread.

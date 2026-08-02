@@ -121,6 +121,7 @@ pub fn release_slot(owner: ThreadId) {
         return;
     };
     let base = slot_base(slot);
+    let space = crate::sched::address_space_of(owner);
 
     // The fixed layout `load_program` established: one code page, one data page,
     // and the stack.
@@ -129,10 +130,22 @@ pub fn release_slot(owner: ThreadId) {
         pages.push(base + STACK_BOTTOM_OFFSET + index * PAGE_SIZE);
     }
 
+    // Unmap from the thread's own tables. Using the active ones would free
+    // whatever happened to live at those addresses in whichever space is loaded
+    // right now -- which, once processes have their own, is a different process's
+    // memory.
+    let target = space.unwrap_or_else(paging::kernel_space);
     for address in pages {
         let page = page_at(address);
         // Unmapped already if the program never got that far, which is fine.
-        let _ = paging::unmap_and_free(page);
+        let _ = paging::unmap_and_free_in(&target, page);
+    }
+
+    if let Some(space) = space {
+        // SAFETY: the thread is exiting and its space is not loaded -- the
+        // scheduler switched to the kernel's on the way here, and no other CPU
+        // exists yet to have it active.
+        unsafe { space.release() };
     }
 
     without_interrupts(|| {
@@ -172,6 +185,21 @@ pub fn load_program(owner: ThreadId, code: &[u8]) -> Result<UserImage, LoadError
     let slot = claim_slot(owner).ok_or(LoadError::NoFreeSlot)?;
     let base = slot_base(slot);
 
+    // Its own page tables, cloned from the kernel's so every kernel mapping is
+    // still reachable while the user region starts empty. This is what makes one
+    // process unable to name another's memory at all -- before it, they shared a
+    // single address space and only page permissions kept them out of the
+    // kernel, not out of each other.
+    let space = paging::AddressSpace::new_user().ok_or(LoadError::NoFreeSlot)?;
+    crate::sched::set_address_space(owner, space);
+
+    // Activate now: the code is copied in below through these very mappings, and
+    // the thread will not be rescheduled before it reaches Ring 3.
+    //
+    // SAFETY: cloned from the kernel space, so the code executing here and the
+    // stack under it are mapped identically.
+    unsafe { space.activate() };
+
     // Writable while the code is copied in; narrowed below.
     let user_rw = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
@@ -185,11 +213,12 @@ pub fn load_program(owner: ThreadId, code: &[u8]) -> Result<UserImage, LoadError
     let code_page = page_at(base + CODE_OFFSET);
     let data_page = page_at(base + DATA_OFFSET);
 
-    paging::map(code_page, user_rw).map_err(LoadError::Mapping)?;
-    paging::map(data_page, user_data).map_err(LoadError::Mapping)?;
+    paging::map_in(&space, code_page, user_rw).map_err(LoadError::Mapping)?;
+    paging::map_in(&space, data_page, user_data).map_err(LoadError::Mapping)?;
 
     for index in 0..STACK_PAGES {
-        paging::map(
+        paging::map_in(
+            &space,
             page_at(base + STACK_BOTTOM_OFFSET + index * PAGE_SIZE),
             user_data,
         )
@@ -207,7 +236,8 @@ pub fn load_program(owner: ThreadId, code: &[u8]) -> Result<UserImage, LoadError
         );
     }
 
-    // Drop WRITABLE now the contents are in place.
+    // Drop WRITABLE now the contents are in place. The space is active, so the
+    // global helper edits the right tables.
     let user_ro = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     let _ = paging::set_flags(code_page, user_ro);
 
@@ -837,7 +867,40 @@ global_asm!(
     options(att_syntax),
 );
 
+// Dereferences whatever address it is handed in R15.
+//
+// Pointed at memory mapped in a *different* process's address space, it must
+// fault. If it does not, it prints -- so the failure is loud rather than a test
+// that quietly passes because nothing happened.
+global_asm!(
+    ".section .rodata",
+    ".balign 16",
+    ".global USER_PEEK_START",
+    "USER_PEEK_START:",
+    "  movq (%r15), %rax",
+    // Only reached if the read succeeded.
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq 2f(%rip), %rsi",
+    "  movq $(3f - 2f), %rdx",
+    "  int $0x80",
+    "  movq $0, %rax",
+    "  movq $0, %rdi",
+    "  int $0x80",
+    "1:",
+    "  jmp 1b",
+    "2:",
+    "  .ascii \"  [ring 3] READ ANOTHER ADDRESS SPACE -- isolation broken\\n\"",
+    "3:",
+    ".global USER_PEEK_END",
+    "USER_PEEK_END:",
+    ".section .text",
+    options(att_syntax),
+);
+
 extern "C" {
+    static USER_PEEK_START: u8;
+    static USER_PEEK_END: u8;
     static USER_NXTEST_START: u8;
     static USER_NXTEST_END: u8;
     static USER_INPUT_START: u8;
@@ -871,6 +934,12 @@ pub fn demo_program() -> &'static [u8] {
     // SAFETY: the symbols bound a range emitted by one `global_asm!` block, in
     // this order, immutable for the life of the kernel. Same for the two below.
     unsafe { blob(&raw const USER_DEMO_START, &raw const USER_DEMO_END) }
+}
+
+/// Dereferences the address handed to it in R15.
+pub fn peek_program() -> &'static [u8] {
+    // SAFETY: as `demo_program`.
+    unsafe { blob(&raw const USER_PEEK_START, &raw const USER_PEEK_END) }
 }
 
 /// Tries to execute its own stack. Should be killed by the page-fault handler.
