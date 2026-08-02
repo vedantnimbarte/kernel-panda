@@ -42,6 +42,16 @@ pub fn bytes_per_pixel() -> u32 {
 /// memory by asking for an enormous buffer.
 const MAX_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Buffers one thread may own at once.
+pub const MAX_BUFFERS_PER_THREAD: usize = 16;
+
+/// Total bytes one thread may hold across all its buffers.
+///
+/// The per-allocation cap alone is not a quota: a process just asks sixteen
+/// times. Graphics memory is the easiest thing in the system to exhaust, because
+/// a single full-screen surface is already megabytes.
+pub const MAX_BYTES_PER_THREAD: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BufferId(pub u64);
 
@@ -139,6 +149,24 @@ pub fn create(owner: ThreadId, width: u32, height: u32) -> Result<BufferId, Erro
     if size > MAX_BUFFER_BYTES {
         return Err(Error::InvalidArgument);
     }
+
+    // Checked before a single frame is taken. Allocating first and refusing
+    // afterwards would let a process drive the allocator up and down at will
+    // even though every request is ultimately denied.
+    with(|registry| {
+        let (count, bytes) = registry
+            .buffers
+            .values()
+            .filter(|buffer| buffer.owner == owner)
+            .fold((0usize, 0u64), |(count, bytes), buffer| {
+                (count + 1, bytes + buffer.info.size)
+            });
+
+        if count >= MAX_BUFFERS_PER_THREAD || bytes.saturating_add(size) > MAX_BYTES_PER_THREAD {
+            return Err(Error::QuotaExceeded);
+        }
+        Ok(())
+    })?;
 
     let pages = size.div_ceil(PAGE_SIZE);
     let mut frames = Vec::new();

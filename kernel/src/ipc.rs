@@ -34,6 +34,17 @@ pub const MAX_MESSAGE_WORDS: usize = 4;
 /// allocate without limit on its behalf.
 pub const MAX_CAPACITY: usize = 256;
 
+/// Endpoints one thread may own.
+///
+/// Without a cap, a process loops on `create` until the kernel heap is gone and
+/// takes the whole system down with it -- denial of service from Ring 3 with four
+/// instructions.
+pub const MAX_ENDPOINTS_PER_THREAD: usize = 32;
+
+/// Distinct endpoints one thread may hold capabilities for. Bounds the growth of
+/// the capability table when a thread is on the receiving end of many grants.
+pub const MAX_CAPABILITIES_PER_THREAD: usize = 128;
+
 /// Shared with user space, so the layout is part of the ABI.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,12 +138,26 @@ impl Registry {
             .unwrap_or(Rights::NONE)
     }
 
-    fn add_rights(&mut self, thread: ThreadId, endpoint: u64, rights: Rights) {
+    fn add_rights(&mut self, thread: ThreadId, endpoint: u64, rights: Rights) -> Result<(), Error> {
         let list = self.capabilities.entry(thread.0).or_default();
         match list.iter_mut().find(|(id, _)| *id == endpoint) {
+            // Widening an existing capability costs no new storage.
             Some((_, existing)) => *existing = existing.union(rights),
-            None => list.push((endpoint, rights)),
+            None => {
+                if list.len() >= MAX_CAPABILITIES_PER_THREAD {
+                    return Err(Error::QuotaExceeded);
+                }
+                list.push((endpoint, rights));
+            }
         }
+        Ok(())
+    }
+
+    fn endpoints_owned_by(&self, thread: ThreadId) -> usize {
+        self.endpoints
+            .values()
+            .filter(|endpoint| endpoint.owner == thread)
+            .count()
     }
 }
 
@@ -156,6 +181,10 @@ pub fn create(owner: ThreadId, capacity: usize) -> Result<EndpointId, Error> {
     }
 
     with(|registry| {
+        if registry.endpoints_owned_by(owner) >= MAX_ENDPOINTS_PER_THREAD {
+            return Err(Error::QuotaExceeded);
+        }
+
         let id = registry.next_id;
         registry.next_id += 1;
 
@@ -173,7 +202,7 @@ pub fn create(owner: ThreadId, capacity: usize) -> Result<EndpointId, Error> {
             owner,
             id,
             Rights::SEND.union(Rights::RECEIVE).union(Rights::GRANT),
-        );
+        )?;
 
         Ok(EndpointId(id))
     })
@@ -205,8 +234,7 @@ pub fn grant(
             return Err(Error::NoCapability);
         }
 
-        registry.add_rights(target, endpoint.0, effective);
-        Ok(())
+        registry.add_rights(target, endpoint.0, effective)
     })
 }
 

@@ -44,6 +44,12 @@ pub enum Error {
     InvalidArgument = -6,
     /// No physical memory, or no room left in the caller's address space.
     OutOfMemory = -7,
+    /// The caller is already holding as much of this resource as it may.
+    ///
+    /// Distinct from `OutOfMemory` on purpose: one says the machine is full, the
+    /// other says this process has had its share. A caller that cannot tell them
+    /// apart cannot decide whether retrying later is worth anything.
+    QuotaExceeded = -8,
 }
 
 pub type SyscallResult = Result<i64, Error>;
