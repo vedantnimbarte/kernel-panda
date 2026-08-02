@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Kernel Panda" width="360">
+</p>
+
 # Kernel Panda
 
 A bare-metal microkernel written from scratch in `no_std` Rust, targeting
