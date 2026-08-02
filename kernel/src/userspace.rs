@@ -327,7 +327,169 @@ global_asm!(
     options(att_syntax),
 );
 
+// A line-editing shell. Reads a line from the serial port, echoes it, and
+// dispatches on it. `repe cmpsb` makes fixed-string comparison a few
+// instructions, which is what keeps a command table tractable in assembly.
+global_asm!(
+    ".section .rodata",
+    ".balign 16",
+    ".global USER_SHELL_START",
+    "USER_SHELL_START:",
+    // 128 bytes of line buffer at the top of the stack.
+    "  subq $128, %rsp",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_banner(%rip), %rsi",
+    "  movq $(.Lsh_banner_end - .Lsh_banner), %rdx",
+    "  int $0x80",
+    ".Lsh_prompt:",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_ps1(%rip), %rsi",
+    "  movq $(.Lsh_ps1_end - .Lsh_ps1), %rdx",
+    "  int $0x80",
+    "  xorq %r13, %r13", // line length
+    ".Lsh_read:",
+    "  movq $13, %rax", // READ
+    "  xorq %rdi, %rdi",
+    "  movq %rsp, %rsi",
+    "  addq %r13, %rsi",
+    "  movq $1, %rdx",
+    "  int $0x80",
+    "  cmpq $1, %rax",
+    "  jne .Lsh_read", // nothing arrived; ask again
+    // Echo, so the operator can see what they typed.
+    "  movq %rsp, %rsi",
+    "  addq %r13, %rsi",
+    "  movzbq (%rsi), %r14",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  movq $1, %rdx",
+    "  int $0x80",
+    "  cmpq $13, %r14", // CR
+    "  je .Lsh_line",
+    "  cmpq $10, %r14", // LF
+    "  je .Lsh_line",
+    "  incq %r13",
+    "  cmpq $100, %r13",
+    "  jl .Lsh_read",
+    ".Lsh_line:",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_nl(%rip), %rsi",
+    "  movq $1, %rdx",
+    "  int $0x80",
+    "  testq %r13, %r13",
+    "  jz .Lsh_prompt", // empty line
+    // help
+    "  cmpq $4, %r13",
+    "  jne .Lsh_try_version",
+    "  leaq .Lsh_cmd_help(%rip), %rsi",
+    "  movq %rsp, %rdi",
+    "  movq $4, %rcx",
+    "  cld",
+    "  repe cmpsb",
+    "  jne .Lsh_try_exit",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_help(%rip), %rsi",
+    "  movq $(.Lsh_help_end - .Lsh_help), %rdx",
+    "  int $0x80",
+    "  jmp .Lsh_prompt",
+    ".Lsh_try_exit:",
+    "  cmpq $4, %r13",
+    "  jne .Lsh_unknown",
+    "  leaq .Lsh_cmd_exit(%rip), %rsi",
+    "  movq %rsp, %rdi",
+    "  movq $4, %rcx",
+    "  cld",
+    "  repe cmpsb",
+    "  jne .Lsh_unknown",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_bye(%rip), %rsi",
+    "  movq $(.Lsh_bye_end - .Lsh_bye), %rdx",
+    "  int $0x80",
+    "  movq $0, %rax",
+    "  movq $0, %rdi",
+    "  int $0x80",
+    ".Lsh_try_version:",
+    "  cmpq $7, %r13",
+    "  jne .Lsh_try_hello",
+    "  leaq .Lsh_cmd_version(%rip), %rsi",
+    "  movq %rsp, %rdi",
+    "  movq $7, %rcx",
+    "  cld",
+    "  repe cmpsb",
+    "  jne .Lsh_unknown",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_version(%rip), %rsi",
+    "  movq $(.Lsh_version_end - .Lsh_version), %rdx",
+    "  int $0x80",
+    "  jmp .Lsh_prompt",
+    ".Lsh_try_hello:",
+    "  cmpq $5, %r13",
+    "  jne .Lsh_unknown",
+    "  leaq .Lsh_cmd_hello(%rip), %rsi",
+    "  movq %rsp, %rdi",
+    "  movq $5, %rcx",
+    "  cld",
+    "  repe cmpsb",
+    "  jne .Lsh_unknown",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_hello(%rip), %rsi",
+    "  movq $(.Lsh_hello_end - .Lsh_hello), %rdx",
+    "  int $0x80",
+    "  jmp .Lsh_prompt",
+    ".Lsh_unknown:",
+    "  movq $1, %rax",
+    "  movq $1, %rdi",
+    "  leaq .Lsh_huh(%rip), %rsi",
+    "  movq $(.Lsh_huh_end - .Lsh_huh), %rdx",
+    "  int $0x80",
+    "  jmp .Lsh_prompt",
+    ".Lsh_banner:",
+    "  .ascii \"panda shell -- type 'help'\\n\"",
+    ".Lsh_banner_end:",
+    ".Lsh_ps1:",
+    "  .ascii \"panda> \"",
+    ".Lsh_ps1_end:",
+    ".Lsh_nl:",
+    "  .ascii \"\\n\"",
+    ".Lsh_cmd_help:",
+    "  .ascii \"help\"",
+    ".Lsh_cmd_exit:",
+    "  .ascii \"exit\"",
+    ".Lsh_cmd_version:",
+    "  .ascii \"version\"",
+    ".Lsh_cmd_hello:",
+    "  .ascii \"hello\"",
+    ".Lsh_help:",
+    "  .ascii \"commands: help version hello exit\\n\"",
+    ".Lsh_help_end:",
+    ".Lsh_version:",
+    "  .ascii \"Kernel Panda, ring 3 shell\\n\"",
+    ".Lsh_version_end:",
+    ".Lsh_hello:",
+    "  .ascii \"hello from a user-space daemon\\n\"",
+    ".Lsh_hello_end:",
+    ".Lsh_huh:",
+    "  .ascii \"unknown command\\n\"",
+    ".Lsh_huh_end:",
+    ".Lsh_bye:",
+    "  .ascii \"shell exiting\\n\"",
+    ".Lsh_bye_end:",
+    ".global USER_SHELL_END",
+    "USER_SHELL_END:",
+    ".section .text",
+    options(att_syntax),
+);
+
 extern "C" {
+    static USER_SHELL_START: u8;
+    static USER_SHELL_END: u8;
     static USER_DEMO_START: u8;
     static USER_DEMO_END: u8;
     static USER_TRESPASS_START: u8;
@@ -351,6 +513,12 @@ pub fn demo_program() -> &'static [u8] {
     // SAFETY: the symbols bound a range emitted by one `global_asm!` block, in
     // this order, immutable for the life of the kernel. Same for the two below.
     unsafe { blob(&raw const USER_DEMO_START, &raw const USER_DEMO_END) }
+}
+
+/// A line-editing shell over the serial port.
+pub fn shell_program() -> &'static [u8] {
+    // SAFETY: as `demo_program`.
+    unsafe { blob(&raw const USER_SHELL_START, &raw const USER_SHELL_END) }
 }
 
 /// Attempts to read kernel memory. Should be killed by the page-fault handler.

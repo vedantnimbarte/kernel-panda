@@ -139,6 +139,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("  logger exited; endpoint drained to {}", ipc::queued(endpoint));
     println!();
 
+    println!("shell: a ring 3 daemon reading the serial port");
+    let shell = sched::spawn("shell", shell_thread).expect("scheduler not running");
+    for line in ["help", "version", "hello", "exit"] {
+        type_at_shell(shell, line);
+    }
+    while sched::is_alive(shell) {
+        sched::yield_now();
+    }
+    println!();
+
     pci::log_devices();
     if let Some(display) = pci::find_display() {
         println!(
@@ -216,6 +226,32 @@ fn ring3_ipc() {
     // SAFETY: `load_program` mapped the entry page user-executable and the stack
     // user-writable.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
+}
+
+fn shell_thread() {
+    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
+    let image = userspace::load_program(slot, userspace::shell_program())
+        .expect("failed to map the shell image");
+    // SAFETY: load_program mapped the entry user-executable and the stack
+    // user-writable.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+}
+
+/// Type a line at the shell as though it had arrived on the serial port.
+///
+/// Waits for the shell to be parked in `read` first, so the transcript comes out
+/// in order rather than racing the prompt.
+fn type_at_shell(shell: sched::ThreadId, line: &str) {
+    while sched::is_alive(shell) && !sched::is_blocked(shell) {
+        sched::yield_now();
+    }
+    if !sched::is_alive(shell) {
+        return;
+    }
+    for byte in line.bytes() {
+        console::input::inject(byte);
+    }
+    console::input::inject(b'\n');
 }
 
 /// Loads the demo program into its own user slot and drops to Ring 3. Never
