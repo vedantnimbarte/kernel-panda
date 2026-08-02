@@ -6,8 +6,10 @@
 #![no_std]
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
+use bootloader_api::BootInfo;
 
 pub mod arch;
+pub mod console;
 pub mod sync;
 
 /// Boot-time requests handed to the bootloader.
@@ -30,3 +32,20 @@ pub const BOOTLOADER_CONFIG: BootloaderConfig = {
 
     config
 };
+
+/// Bring up the subsystems every entry point needs before it can do anything
+/// observable. Call exactly once, first thing.
+///
+/// Takes and returns `boot_info` so that later stages -- which borrow the
+/// framebuffer and the memory map out of it -- can be added here without
+/// changing every caller.
+pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
+    // Serial first: everything after this point can report its own failures.
+    let serial_ok = console::init();
+
+    if !serial_ok {
+        crate::println!("warning: UART loopback self-test failed; serial output may be lost");
+    }
+
+    boot_info
+}
