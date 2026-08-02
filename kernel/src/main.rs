@@ -13,7 +13,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use panda_kernel::arch::x86_64::apic;
 use panda_kernel::{
-    arch::x86_64::halt_loop, console, memory, println, sched, time, BOOTLOADER_CONFIG,
+    arch::x86_64::halt_loop, console, memory, println, sched, syscall, time, userspace,
+    BOOTLOADER_CONFIG,
 };
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
@@ -82,6 +83,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     println!();
 
+    println!("ring 3: loading a user program and dropping privilege");
+    let user = sched::spawn("user-demo", ring3_demo).expect("scheduler not running");
+    while sched::is_alive(user) {
+        sched::yield_now();
+    }
+    println!(
+        "  user program exited after writing {} bytes through syscalls",
+        syscall::user_bytes_written()
+    );
+    println!();
+
     halt_loop()
 }
 
@@ -113,6 +125,18 @@ fn worker_b() {
         busy_wait_ticks(10);
     }
     WORKER_B_DONE.store(true, Ordering::Release);
+}
+
+/// Loads the demo program into its own user slot and drops to Ring 3. Never
+/// returns -- the program ends by calling `exit`.
+fn ring3_demo() {
+    let slot = sched::current_id().map_or(0, |id| id.0 as u64);
+    let image = userspace::load_program(slot, userspace::demo_program())
+        .expect("failed to map the user image");
+
+    // SAFETY: `load_program` mapped both the entry page and the stack as
+    // user-accessible, and the stack as writable.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
 }
 
 #[panic_handler]

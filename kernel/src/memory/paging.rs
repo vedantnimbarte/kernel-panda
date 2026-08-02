@@ -7,7 +7,9 @@
 //! and no temporary windows.
 
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::mapper::{MapToError, TranslateResult, UnmapError};
+use x86_64::structures::paging::mapper::{
+    FlagUpdateError, MapToError, TranslateResult, UnmapError,
+};
 use x86_64::structures::paging::{
     Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB, Translate,
 };
@@ -151,6 +153,33 @@ pub fn translate(address: VirtAddr) -> Option<PhysAddr> {
     with_mapper(|mapper| match mapper.translate(address) {
         TranslateResult::Mapped { frame, offset, .. } => Some(frame.start_address() + offset),
         _ => None,
+    })
+}
+
+/// The effective page-table flags for an address, or `None` if it is unmapped.
+///
+/// This is what makes it possible to validate a pointer handed in by user space:
+/// the kernel can ask whether a page is actually present, actually writable, and
+/// actually reachable from Ring 3 before it dereferences anything.
+pub fn flags(address: VirtAddr) -> Option<PageTableFlags> {
+    with_mapper(|mapper| match mapper.translate(address) {
+        TranslateResult::Mapped { flags, .. } => Some(flags),
+        _ => None,
+    })
+}
+
+/// Change the permissions on an existing mapping without moving it.
+///
+/// Used to drop `WRITABLE` from a user code page once its contents have been
+/// copied in, so a process cannot rewrite its own instructions.
+pub fn set_flags(page: Page<Size4KiB>, flags: PageTableFlags) -> Result<(), FlagUpdateError> {
+    with_mapper(|mapper| {
+        // SAFETY: this only narrows or widens permissions on a mapping that
+        // already exists; it cannot point the page at different memory. The
+        // caller is responsible for the permissions making sense.
+        let flush = unsafe { mapper.update_flags(page, flags) }?;
+        flush.flush();
+        Ok(())
     })
 }
 

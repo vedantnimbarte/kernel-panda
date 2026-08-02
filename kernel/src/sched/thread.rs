@@ -40,6 +40,14 @@ pub struct Thread {
     /// What the thread runs. Read once by the trampoline.
     pub entry: Option<fn()>,
 
+    /// Top of this thread's kernel stack, or 0 for the boot thread.
+    ///
+    /// Loaded into `TSS.privilege_stack_table[0]` whenever this thread is
+    /// scheduled, because that is the stack the CPU switches to if it takes an
+    /// interrupt while the thread is running in Ring 3. Pointing it at the wrong
+    /// thread's stack corrupts that thread silently.
+    pub kernel_stack_top: u64,
+
     /// The owned kernel stack. `None` for the boot thread, which runs on the
     /// stack the bootloader set up and does not own it.
     ///
@@ -76,6 +84,7 @@ impl Thread {
             state: State::Ready,
             stack_pointer,
             entry: Some(entry),
+            kernel_stack_top: top,
             stack: Some(stack),
         }
     }
@@ -92,6 +101,9 @@ impl Thread {
             state: State::Running,
             stack_pointer: 0,
             entry: None,
+            // The boot thread never drops to Ring 3, so no Ring 0 stack has to
+            // be published for it.
+            kernel_stack_top: 0,
             stack: None,
         }
     }

@@ -95,9 +95,10 @@ impl Scheduler {
         None
     }
 
-    /// Decide who runs next, and return the two stack-pointer slots the switch
-    /// needs. `None` means stay where we are.
-    fn prepare_switch(&mut self) -> Option<(*mut u64, u64)> {
+    /// Decide who runs next, and return what the switch needs: where to save the
+    /// outgoing stack pointer, the incoming one to load, and the incoming
+    /// thread's Ring 0 stack for the TSS. `None` means stay where we are.
+    fn prepare_switch(&mut self) -> Option<(*mut u64, u64, u64)> {
         let current = self.current;
 
         let next = match self.pop_runnable() {
@@ -134,11 +135,12 @@ impl Scheduler {
         let incoming = self.thread_mut(next);
         incoming.state = State::Running;
         let load_from = incoming.stack_pointer;
+        let kernel_stack_top = incoming.kernel_stack_top;
 
         self.current = next;
         self.slice_remaining = TIME_SLICE_TICKS;
 
-        Some((save_to, load_from))
+        Some((save_to, load_from, kernel_stack_top))
     }
 }
 
@@ -207,9 +209,16 @@ pub fn schedule() {
             scheduler.prepare_switch()
         };
 
-        let Some((save_to, load_from)) = switch else {
+        let Some((save_to, load_from, kernel_stack_top)) = switch else {
             return;
         };
+
+        // Publish the incoming thread's Ring 0 stack before it can be
+        // interrupted. If this thread ever runs in Ring 3, the very next
+        // interrupt reads this field to find a stack to land on.
+        if kernel_stack_top != 0 {
+            crate::arch::x86_64::gdt::set_kernel_stack(x86_64::VirtAddr::new(kernel_stack_top));
+        }
 
         // SAFETY: `save_to` points into a `Box<Thread>`, whose address is stable
         // for as long as the box lives, and nothing can free it here: the only
@@ -224,6 +233,16 @@ pub fn schedule() {
 /// Give up the rest of this thread's time slice voluntarily.
 pub fn yield_now() {
     schedule();
+}
+
+/// Top of the current thread's kernel stack, or 0 for the boot thread.
+pub fn current_kernel_stack_top() -> u64 {
+    with(|scheduler| scheduler.thread(scheduler.current).kernel_stack_top).unwrap_or(0)
+}
+
+/// Whether a thread still exists. False once it has finished and been reaped.
+pub fn is_alive(id: ThreadId) -> bool {
+    with(|scheduler| scheduler.thread_opt(id).is_some()).unwrap_or(false)
 }
 
 /// End the current thread. Its stack is freed by a later `schedule()`, once the

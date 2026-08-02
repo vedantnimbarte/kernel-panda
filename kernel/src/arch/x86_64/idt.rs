@@ -38,6 +38,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[apic::TIMER_VECTOR].set_handler_fn(timer_handler);
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
 
+    super::syscall::register(&mut idt);
+
     idt
 });
 
@@ -68,7 +70,33 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ) {
     // The error code is a segment selector index when the fault came from a
     // segment-related operation, and zero otherwise.
+    if terminate_if_from_user(&frame, "general protection fault") {
+        return;
+    }
     panic!("EXCEPTION: GENERAL PROTECTION FAULT (selector {error_code:#x})\n{frame:#?}");
+}
+
+/// Kill the current thread if a fault came from Ring 3, instead of panicking.
+///
+/// PRD 1.2 asks that a fault in unprivileged code never take the system down. A
+/// user thread that dereferences nonsense is a bug in that thread, and the
+/// kernel's correct response is to destroy it and carry on -- not to halt the
+/// machine.
+///
+/// Never returns when it returns `true`: the thread is gone.
+fn terminate_if_from_user(frame: &InterruptStackFrame, reason: &str) -> bool {
+    // The low two bits of the saved CS are the privilege level the faulting code
+    // was running at.
+    if frame.code_segment.0 & 3 != 3 {
+        return false;
+    }
+
+    println!(
+        "user thread '{}' killed: {reason} at {:#018x}",
+        crate::sched::current_name().unwrap_or("?"),
+        frame.instruction_pointer.as_u64()
+    );
+    crate::sched::exit_current()
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -79,6 +107,16 @@ extern "x86-interrupt" fn page_fault_handler(
     // the non-canonical-address error case: when a fault is caused by a garbage
     // pointer, the raw bits are precisely what we want to see.
     let faulting_address = Cr2::read_raw();
+
+    // A user thread reaching for memory it does not own is the boundary working,
+    // not a kernel failure. Kill the thread and keep the system up.
+    if error_code.contains(PageFaultErrorCode::USER_MODE) {
+        println!(
+            "user thread '{}' killed: page fault on {faulting_address:#018x} ({error_code:?})",
+            crate::sched::current_name().unwrap_or("?")
+        );
+        crate::sched::exit_current();
+    }
 
     panic!(
         "EXCEPTION: PAGE FAULT\n\

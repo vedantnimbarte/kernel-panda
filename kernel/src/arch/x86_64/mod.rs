@@ -5,6 +5,7 @@ pub mod gdt;
 pub mod idt;
 pub mod pic;
 pub mod qemu;
+pub mod syscall;
 
 use x86_64::instructions::{hlt, interrupts};
 

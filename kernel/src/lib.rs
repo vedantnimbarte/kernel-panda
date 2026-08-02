@@ -27,8 +27,10 @@ pub mod console;
 pub mod memory;
 pub mod sched;
 pub mod sync;
+pub mod syscall;
 pub mod testing;
 pub mod time;
+pub mod userspace;
 
 /// Boot-time requests handed to the bootloader.
 ///
