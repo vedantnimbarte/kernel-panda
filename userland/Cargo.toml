@@ -1,0 +1,49 @@
+[package]
+name = "panda-user"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Ring 3 programs for Kernel Panda"
+
+[lib]
+name = "panda_user"
+path = "src/lib.rs"
+test = false
+bench = false
+doctest = false
+
+# Every binary links at the same base address, which only works because each
+# process has its own page tables -- see userland/.cargo/config.toml.
+[[bin]]
+name = "shell"
+path = "src/bin/shell.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "compositor"
+path = "src/bin/compositor.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "input"
+path = "src/bin/input.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "s"
+panic = "abort"

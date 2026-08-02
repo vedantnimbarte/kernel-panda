@@ -1,4 +1,4 @@
-//! Resource lifecycle: what a thread gives back when it dies.
+﻿//! Resource lifecycle: what a thread gives back when it dies.
 //!
 //! Every case here corresponds to a defect that shipped. They are cheap to run
 //! and each one fails loudly against the code as it was.
@@ -45,11 +45,11 @@ fn spin_until(condition: impl Fn() -> bool) -> bool {
 
 fn demo_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::demo_program())
-        .expect("failed to map user image");
-    // SAFETY: load_program mapped the entry user-executable and the stack
-    // user-writable.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+    let image = userspace::load_probe(owner, userspace::probe::DEMO, 0)
+        .expect("failed to load the probe");
+    // SAFETY: load_probe mapped the entry user-executable, the stack
+    // user-writable, and filled in the parameter page.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 fn run_to_completion(name: &'static str, entry: fn()) {
@@ -113,11 +113,10 @@ static PEEK_TARGET: AtomicU64 = AtomicU64::new(0);
 
 fn peek_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::peek_program())
-        .expect("failed to map user image");
-    let target = PEEK_TARGET.load(Ordering::Acquire);
+    let image = userspace::load_probe(owner, userspace::probe::PEEK, PEEK_TARGET.load(Ordering::Acquire))
+        .expect("failed to load the probe");
     // SAFETY: as above.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, target) }
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 #[test_case]

@@ -1,0 +1,29 @@
+[build]
+target = "x86_64-unknown-none"
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+# Every binary links at 0x2000_0000_0000, the base of the user region.
+#
+# They can all share one address because each process now has its own page
+# tables -- two programs at the same virtual address never meet. Before that,
+# each binary would have needed a distinct base baked in at link time, or the
+# loader would have needed to apply relocations.
+#
+# `static` relocation model keeps the output free of dynamic relocations, so the
+# loader only has to map segments where the headers say.
+[target.x86_64-unknown-none]
+#
+# The large code model is required, not a preference. The default small model
+# assumes every address fits in a signed 32-bit displacement, and the user
+# region starts at 35 TiB -- every reference to a string literal fails to link
+# with "relocation R_X86_64_32S out of range". The alternative would be moving
+# user space into the low 2 GiB, which would put it in the same level 4 entry as
+# whatever the bootloader leaves mapped down there.
+rustflags = [
+    "-C", "link-arg=--image-base=0x200000000000",
+    "-C", "relocation-model=static",
+    "-C", "code-model=large",
+]

@@ -115,6 +115,10 @@ fn cmd_test(args: &[String]) -> Result<ExitCode, String> {
     // kernel, so that binary has to exist before we hand control over. When we
     // were launched through the `cargo xtask` alias it already does; this check
     // gives a clear error instead of a cryptic one when it doesn't.
+    // The kernel embeds the user binaries, so they must exist before any test
+    // kernel compiles.
+    build_userland()?;
+
     let runner = runner_binary_path();
     if !runner.exists() {
         return Err(format!(
@@ -171,7 +175,26 @@ fn cmd_runner(args: &[String]) -> Result<ExitCode, String> {
 // Building
 // ---------------------------------------------------------------------------
 
+/// Build the Ring 3 programs.
+///
+/// Must run before the kernel: the kernel embeds these binaries with
+/// `include_bytes!`, so they have to exist on disk when it compiles. Always
+/// release -- a debug user binary is several times larger for no benefit, and it
+/// is carried inside the kernel image.
+fn build_userland() -> Result<(), String> {
+    let mut cmd = cargo_in(workspace_root().join("userland"));
+    cmd.args(["build", "--release"]);
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to launch cargo for userland: {e}"))?;
+    if !status.success() {
+        return Err("userland build failed".into());
+    }
+    Ok(())
+}
+
 fn build_kernel(release: bool) -> Result<PathBuf, String> {
+    build_userland()?;
     let mut cmd = cargo_in_kernel();
     cmd.arg("build");
     if release {
@@ -203,8 +226,12 @@ fn build_kernel(release: bool) -> Result<PathBuf, String> {
 /// Running this from the workspace root would silently skip the kernel's
 /// build-std and target settings.
 fn cargo_in_kernel() -> Command {
+    cargo_in(kernel_dir())
+}
+
+fn cargo_in(directory: PathBuf) -> Command {
     let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")));
-    cmd.current_dir(kernel_dir());
+    cmd.current_dir(directory);
     // Don't leak the outer cargo's state into the inner one.
     cmd.env_remove("CARGO_MAKEFLAGS")
         .env_remove("CARGO_TARGET_DIR")

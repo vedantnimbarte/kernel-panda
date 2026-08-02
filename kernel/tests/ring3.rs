@@ -51,18 +51,20 @@ fn run_user_program(name: &'static str, entry: fn()) -> bool {
 
 fn demo_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::demo_program()).expect("failed to map user image");
-    // SAFETY: load_program mapped the entry user-executable and the stack
-    // user-writable.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+    let image = userspace::load_probe(owner, userspace::probe::DEMO, 0)
+        .expect("failed to load the probe");
+    // SAFETY: load_probe mapped the entry user-executable, the stack
+    // user-writable, and filled in the parameter page.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 fn trespass_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::trespass_program())
-        .expect("failed to map user image");
-    // SAFETY: as above.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+    let image = userspace::load_probe(owner, userspace::probe::TRESPASS, HEAP_START as u64)
+        .expect("failed to load the probe");
+    // SAFETY: load_probe mapped the entry user-executable, the stack
+    // user-writable, and filled in the parameter page.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 #[test_case]

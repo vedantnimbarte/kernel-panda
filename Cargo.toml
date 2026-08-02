@@ -6,4 +6,4 @@ members = ["xtask"]
 # .cargo/config.toml applies to the entire cargo invocation and cannot be scoped
 # per-target, so if the kernel shared this workspace cargo would try to compile
 # `std` from source for the Windows host and the build would collapse.
-exclude = ["kernel"]
+exclude = ["kernel", "userland"]

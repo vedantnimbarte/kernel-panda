@@ -2,3 +2,4 @@
 /kernel/target
 *.img
 *.fd
+/userland/target

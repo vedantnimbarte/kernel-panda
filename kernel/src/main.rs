@@ -292,13 +292,13 @@ fn ipc_logger() {
 /// Sends one message from Ring 3 through a capability it was granted.
 fn ring3_ipc() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::ipc_program())
-        .expect("failed to map the user image");
     let endpoint = DEMO_ENDPOINT.load(Ordering::Acquire);
+    let image = userspace::load_probe(owner, userspace::probe::IPC, endpoint)
+        .expect("failed to load the probe");
 
-    // SAFETY: `load_program` mapped the entry page user-executable and the stack
-    // user-writable.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
+    // SAFETY: `load_probe` mapped the entry user-executable and the stack
+    // user-writable, and filled in the parameter page.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 static DISPLAY_ENDPOINT: AtomicU64 = AtomicU64::new(0);
@@ -306,7 +306,7 @@ static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
 
 fn compositor_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::compositor_program())
+    let image = userspace::load_elf(owner, userspace::COMPOSITOR_ELF)
         .expect("failed to map the compositor");
     let endpoint = DISPLAY_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: load_program mapped the entry user-executable and the stack
@@ -316,7 +316,7 @@ fn compositor_thread() {
 
 fn input_daemon_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::input_program())
+    let image = userspace::load_elf(owner, userspace::INPUT_ELF)
         .expect("failed to map the input daemon");
     let endpoint = DISPLAY_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: as above.
@@ -325,7 +325,7 @@ fn input_daemon_thread() {
 
 fn client_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::client_program())
+    let image = userspace::load_elf(owner, userspace::CLIENT_ELF)
         .expect("failed to map the client");
 
     let params = *CLIENT_PARAMS.lock();
@@ -333,13 +333,13 @@ fn client_thread() {
     // program, which is not running yet.
     unsafe { userspace::write_parameters(image.data, &params) };
     // SAFETY: as above.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 fn shell_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::shell_program())
-        .expect("failed to map the shell image");
+    let image = userspace::load_elf(owner, userspace::SHELL_ELF)
+        .expect("failed to load the shell");
     // SAFETY: load_program mapped the entry user-executable and the stack
     // user-writable.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
@@ -366,12 +366,12 @@ fn type_at_shell(shell: sched::ThreadId, line: &str) {
 /// returns -- the program ends by calling `exit`.
 fn ring3_demo() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::demo_program())
-        .expect("failed to map the user image");
+    let image = userspace::load_probe(owner, userspace::probe::DEMO, 0)
+        .expect("failed to load the probe");
 
-    // SAFETY: `load_program` mapped both the entry page and the stack as
-    // user-accessible, and the stack as writable.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+    // SAFETY: `load_probe` mapped the entry user-executable and the stack
+    // user-writable, and filled in the parameter page.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 #[panic_handler]

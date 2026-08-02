@@ -1,17 +1,16 @@
-//! User-space address regions, program loading, and the drop into Ring 3.
+﻿//! User-space address regions, program loading, and the drop into Ring 3.
 //!
-//! ## The isolation this does and does not provide
+//! ## Isolation
 //!
-//! Every thread shares one address space; there is no per-process CR3 yet.
-//! Protection is by page permission: kernel pages are mapped without
-//! `USER_ACCESSIBLE`, so Ring 3 cannot read or write them, and the attempt
-//! faults. That is a genuine privilege boundary and it is what Milestone 3 asks
-//! for -- but it is *not* isolation between user processes, which can still
-//! reach each other's pages. Separate address spaces are the next step, and
-//! until then IPC capabilities are what keeps processes apart.
+//! Two boundaries, not one. Kernel pages are mapped without `USER_ACCESSIBLE`,
+//! so Ring 3 faults trying to touch them; and each process has its own page
+//! tables, so one process cannot name another's memory at all.
 //!
-//! Each user thread gets its own slot within the region so concurrent processes
-//! do not collide in the shared space.
+//! Threads still take a slot from a fixed table. With separate address spaces
+//! that no longer partitions the address range -- every ELF program links at the
+//! same base -- but it still bounds how many user processes can exist at once,
+//! and kernel threads that map graphics buffers share one space and so do need
+//! distinct regions.
 
 use core::arch::{asm, global_asm};
 
@@ -62,6 +61,7 @@ pub enum LoadError {
     /// The program does not fit in one page.
     TooLarge,
     Mapping(MapError),
+    Elf(crate::elf::ElfError),
 }
 
 /// Which thread occupies each slot.
@@ -120,27 +120,12 @@ pub fn release_slot(owner: ThreadId) {
     let Some(slot) = slot_of(owner) else {
         return;
     };
-    let base = slot_base(slot);
     let space = crate::sched::address_space_of(owner);
 
-    // The fixed layout `load_program` established: one code page, one data page,
-    // and the stack.
-    let mut pages = alloc::vec![base + CODE_OFFSET, base + DATA_OFFSET];
-    for index in 0..STACK_PAGES {
-        pages.push(base + STACK_BOTTOM_OFFSET + index * PAGE_SIZE);
-    }
-
-    // Unmap from the thread's own tables. Using the active ones would free
-    // whatever happened to live at those addresses in whichever space is loaded
-    // right now -- which, once processes have their own, is a different process's
-    // memory.
-    let target = space.unwrap_or_else(paging::kernel_space);
-    for address in pages {
-        let page = page_at(address);
-        // Unmapped already if the program never got that far, which is fine.
-        let _ = paging::unmap_and_free_in(&target, page);
-    }
-
+    // No page-by-page unmapping. Releasing the space walks its user subtree and
+    // frees every table and data page in it, which is both simpler and correct
+    // for ELF images -- their segments land wherever the program headers say,
+    // not at a layout this function could predict.
     if let Some(space) = space {
         // SAFETY: the thread is exiting and its space is not loaded -- the
         // scheduler switched to the kernel's on the way here, and no other CPU
@@ -167,6 +152,87 @@ pub struct UserImage {
 
 fn slot_base(slot: u64) -> u64 {
     USER_BASE + slot * SLOT_SIZE
+}
+
+// The userland binaries, built by `cargo xtask` before the kernel and embedded
+// here. `include_bytes!` makes them a compile-time dependency, so editing a
+// user program rebuilds the kernel that carries it.
+//
+// A bare `cargo build` in kernel/ fails until userland has been built once;
+// `cargo xtask build` and `cargo xtask test` always do it first.
+pub const SHELL_ELF: &[u8] =
+    include_bytes!("../../userland/target/x86_64-unknown-none/release/shell");
+pub const COMPOSITOR_ELF: &[u8] =
+    include_bytes!("../../userland/target/x86_64-unknown-none/release/compositor");
+pub const INPUT_ELF: &[u8] =
+    include_bytes!("../../userland/target/x86_64-unknown-none/release/input");
+pub const CLIENT_ELF: &[u8] =
+    include_bytes!("../../userland/target/x86_64-unknown-none/release/client");
+/// Test programs, selected by the `mode` word of their parameter page.
+pub const PROBE_ELF: &[u8] =
+    include_bytes!("../../userland/target/x86_64-unknown-none/release/probe");
+
+/// Probe modes. Must match `userland/src/bin/probe.rs`.
+pub mod probe {
+    pub const DEMO: u64 = 0;
+    pub const TRESPASS: u64 = 1;
+    pub const IPC: u64 = 2;
+    pub const PEEK: u64 = 3;
+}
+
+/// Load the probe program in `mode`, with an optional address or endpoint.
+///
+/// Returns the image; the caller enters Ring 3 with `image.data` as the
+/// argument.
+pub fn load_probe(owner: ThreadId, mode: u64, argument: u64) -> Result<UserImage, LoadError> {
+    let image = load_elf(owner, PROBE_ELF)?;
+    // SAFETY: `image.data` is the writable parameter page just mapped for this
+    // program, which is not running yet.
+    unsafe { write_parameters(image.data, &[mode, argument, argument]) };
+    Ok(image)
+}
+
+/// Load an ELF program and give the thread a stack for it.
+///
+/// Unlike `load_program`, the image may span many pages and carries its own
+/// section permissions, so text ends up read-only and executable while data and
+/// stack are writable and not.
+pub fn load_elf(owner: ThreadId, image: &[u8]) -> Result<UserImage, LoadError> {
+    let slot = claim_slot(owner).ok_or(LoadError::NoFreeSlot)?;
+    let _ = slot;
+
+    let space = paging::AddressSpace::new_user().ok_or(LoadError::NoFreeSlot)?;
+    crate::sched::set_address_space(owner, space);
+    // SAFETY: cloned from the kernel space, so the code running here and the
+    // stack under it are mapped identically. Activated before the loader copies
+    // segments in through these very mappings.
+    unsafe { space.activate() };
+
+    let loaded = crate::elf::load(&space, image, USER_BASE, USER_BASE + SLOT_SIZE)
+        .map_err(LoadError::Elf)?;
+
+    // Stack goes above the image, page aligned, with a gap so an overrun lands
+    // in unmapped space rather than in the program's own data.
+    let stack_bottom = loaded.end.as_u64() + PAGE_SIZE;
+    let user_data = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+
+    for index in 0..STACK_PAGES {
+        paging::map_in(&space, page_at(stack_bottom + index * PAGE_SIZE), user_data)
+            .map_err(LoadError::Mapping)?;
+    }
+
+    // One writable page above the stack for start-up parameters.
+    let data = stack_bottom + STACK_PAGES * PAGE_SIZE;
+    paging::map_in(&space, page_at(data), user_data).map_err(LoadError::Mapping)?;
+
+    Ok(UserImage {
+        entry: loaded.entry,
+        stack_top: VirtAddr::new(stack_bottom + STACK_PAGES * PAGE_SIZE),
+        data: VirtAddr::new(data),
+    })
 }
 
 /// Map a slot and copy `code` into its first page.
@@ -350,501 +416,15 @@ pub unsafe fn enter_ring3(entry: VirtAddr, stack_top: VirtAddr, argument: u64) -
 // A tiny position-independent Ring 3 program, assembled into the kernel image
 // and copied into a user page at load time.
 //
-// It has to be hand-written machine code rather than a Rust function: a Rust
-// `fn` lives in the kernel's own pages, which are deliberately not
-// user-accessible, so Ring 3 could not execute it. Everything here is
-// RIP-relative so it runs correctly wherever it is copied to.
-// AT&T syntax throughout. Intel syntax cannot tell a difference-of-labels
-// immediate from a memory operand, so `mov rdx, 3f - 2f` fails to assemble;
-// AT&T's `$(3f - 2f)` is unambiguous.
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_DEMO_START",
-    "USER_DEMO_START:",
-    // write(1, message, len)
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq 2f(%rip), %rsi",
-    "  movq $(3f - 2f), %rdx",
-    "  int $0x80",
-    // yield()
-    "  movq $2, %rax",
-    "  int $0x80",
-    // write(1, message_after_yield, len)
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq 4f(%rip), %rsi",
-    "  movq $(5f - 4f), %rdx",
-    "  int $0x80",
-    // exit(0)
-    "  movq $0, %rax",
-    "  movq $0, %rdi",
-    "  int $0x80",
-    // Unreachable: exit does not return. Present so a bug lands somewhere
-    // harmless instead of running off the end of the page.
-    "1:",
-    "  jmp 1b",
-    "2:",
-    "  .ascii \"  [ring 3] hello from user space\\n\"",
-    "3:",
-    "4:",
-    "  .ascii \"  [ring 3] still running after a yield\\n\"",
-    "5:",
-    ".global USER_DEMO_END",
-    "USER_DEMO_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
-// A program that reaches into the kernel's heap. It must fault: the heap is
-// mapped without USER_ACCESSIBLE, so Ring 3 has no business reading it. Used to
-// prove the privilege boundary actually holds rather than merely existing.
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_TRESPASS_START",
-    "USER_TRESPASS_START:",
-    "  movabsq $0x444444440000, %rax", // memory::heap::HEAP_START
-    "  movq (%rax), %rbx",             // faults here
-    // Only reached if the boundary failed.
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq 2f(%rip), %rsi",
-    "  movq $(3f - 2f), %rdx",
-    "  int $0x80",
-    "1:",
-    "  jmp 1b",
-    "2:",
-    "  .ascii \"  [ring 3] READ KERNEL MEMORY -- boundary broken\\n\"",
-    "3:",
-    ".global USER_TRESPASS_END",
-    "USER_TRESPASS_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
-// A program that sends one IPC message and exits with the result.
-//
-// The endpoint id arrives in R15 -- see `enter_ring3`. The message is built on
-// the stack, which is the only writable memory the program is handed.
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_IPC_START",
-    "USER_IPC_START:",
-    "  subq $64, %rsp",
-    "  movq $0xCAFE, 0(%rsp)",  // tag
-    "  movq $0xBEEF, 8(%rsp)",  // words[0]
-    "  movq $0, 16(%rsp)",      // words[1]
-    "  movq $0, 24(%rsp)",      // words[2]
-    "  movq $0, 32(%rsp)",      // words[3]
-    // sender: set to a lie, so the test can prove the kernel overwrites it.
-    "  movq $999, 40(%rsp)",
-    "  movq $5, %rax",          // IPC_SEND
-    "  movq %r15, %rdi",        // endpoint from the kernel
-    "  movq %rsp, %rsi",        // &message
-    "  int $0x80",
-    // exit(send_result), so the outcome is visible even if nothing is received.
-    "  movq %rax, %rdi",
-    "  movq $0, %rax",
-    "  int $0x80",
-    "1:",
-    "  jmp 1b",
-    ".global USER_IPC_END",
-    "USER_IPC_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
-// A line-editing shell. Reads a line from the serial port, echoes it, and
-// dispatches on it. `repe cmpsb` makes fixed-string comparison a few
-// instructions, which is what keeps a command table tractable in assembly.
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_SHELL_START",
-    "USER_SHELL_START:",
-    // 128 bytes of line buffer at the top of the stack.
-    "  subq $128, %rsp",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_banner(%rip), %rsi",
-    "  movq $(.Lsh_banner_end - .Lsh_banner), %rdx",
-    "  int $0x80",
-    ".Lsh_prompt:",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_ps1(%rip), %rsi",
-    "  movq $(.Lsh_ps1_end - .Lsh_ps1), %rdx",
-    "  int $0x80",
-    "  xorq %r13, %r13", // line length
-    ".Lsh_read:",
-    "  movq $13, %rax", // READ
-    "  xorq %rdi, %rdi",
-    "  movq %rsp, %rsi",
-    "  addq %r13, %rsi",
-    "  movq $1, %rdx",
-    "  int $0x80",
-    "  cmpq $1, %rax",
-    "  jne .Lsh_read", // nothing arrived; ask again
-    // Echo, so the operator can see what they typed.
-    "  movq %rsp, %rsi",
-    "  addq %r13, %rsi",
-    "  movzbq (%rsi), %r14",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  movq $1, %rdx",
-    "  int $0x80",
-    "  cmpq $13, %r14", // CR
-    "  je .Lsh_line",
-    "  cmpq $10, %r14", // LF
-    "  je .Lsh_line",
-    "  incq %r13",
-    "  cmpq $100, %r13",
-    "  jl .Lsh_read",
-    ".Lsh_line:",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_nl(%rip), %rsi",
-    "  movq $1, %rdx",
-    "  int $0x80",
-    "  testq %r13, %r13",
-    "  jz .Lsh_prompt", // empty line
-    // help
-    "  cmpq $4, %r13",
-    "  jne .Lsh_try_version",
-    "  leaq .Lsh_cmd_help(%rip), %rsi",
-    "  movq %rsp, %rdi",
-    "  movq $4, %rcx",
-    "  cld",
-    "  repe cmpsb",
-    "  jne .Lsh_try_exit",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_help(%rip), %rsi",
-    "  movq $(.Lsh_help_end - .Lsh_help), %rdx",
-    "  int $0x80",
-    "  jmp .Lsh_prompt",
-    ".Lsh_try_exit:",
-    "  cmpq $4, %r13",
-    "  jne .Lsh_unknown",
-    "  leaq .Lsh_cmd_exit(%rip), %rsi",
-    "  movq %rsp, %rdi",
-    "  movq $4, %rcx",
-    "  cld",
-    "  repe cmpsb",
-    "  jne .Lsh_unknown",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_bye(%rip), %rsi",
-    "  movq $(.Lsh_bye_end - .Lsh_bye), %rdx",
-    "  int $0x80",
-    "  movq $0, %rax",
-    "  movq $0, %rdi",
-    "  int $0x80",
-    ".Lsh_try_version:",
-    "  cmpq $7, %r13",
-    "  jne .Lsh_try_hello",
-    "  leaq .Lsh_cmd_version(%rip), %rsi",
-    "  movq %rsp, %rdi",
-    "  movq $7, %rcx",
-    "  cld",
-    "  repe cmpsb",
-    "  jne .Lsh_unknown",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_version(%rip), %rsi",
-    "  movq $(.Lsh_version_end - .Lsh_version), %rdx",
-    "  int $0x80",
-    "  jmp .Lsh_prompt",
-    ".Lsh_try_hello:",
-    "  cmpq $5, %r13",
-    "  jne .Lsh_unknown",
-    "  leaq .Lsh_cmd_hello(%rip), %rsi",
-    "  movq %rsp, %rdi",
-    "  movq $5, %rcx",
-    "  cld",
-    "  repe cmpsb",
-    "  jne .Lsh_unknown",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_hello(%rip), %rsi",
-    "  movq $(.Lsh_hello_end - .Lsh_hello), %rdx",
-    "  int $0x80",
-    "  jmp .Lsh_prompt",
-    ".Lsh_unknown:",
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq .Lsh_huh(%rip), %rsi",
-    "  movq $(.Lsh_huh_end - .Lsh_huh), %rdx",
-    "  int $0x80",
-    "  jmp .Lsh_prompt",
-    ".Lsh_banner:",
-    "  .ascii \"panda shell -- type 'help'\\n\"",
-    ".Lsh_banner_end:",
-    ".Lsh_ps1:",
-    "  .ascii \"panda> \"",
-    ".Lsh_ps1_end:",
-    ".Lsh_nl:",
-    "  .ascii \"\\n\"",
-    ".Lsh_cmd_help:",
-    "  .ascii \"help\"",
-    ".Lsh_cmd_exit:",
-    "  .ascii \"exit\"",
-    ".Lsh_cmd_version:",
-    "  .ascii \"version\"",
-    ".Lsh_cmd_hello:",
-    "  .ascii \"hello\"",
-    ".Lsh_help:",
-    "  .ascii \"commands: help version hello exit\\n\"",
-    ".Lsh_help_end:",
-    ".Lsh_version:",
-    "  .ascii \"Kernel Panda, ring 3 shell\\n\"",
-    ".Lsh_version_end:",
-    ".Lsh_hello:",
-    "  .ascii \"hello from a user-space daemon\\n\"",
-    ".Lsh_hello_end:",
-    ".Lsh_huh:",
-    "  .ascii \"unknown command\\n\"",
-    ".Lsh_huh_end:",
-    ".Lsh_bye:",
-    "  .ascii \"shell exiting\\n\"",
-    ".Lsh_bye_end:",
-    ".global USER_SHELL_END",
-    "USER_SHELL_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
 // The input daemon. Reads raw bytes from the console and forwards the ones it
 // approves of to a single endpoint, handed to it in R15.
 //
-// It is the sanitiser the PRD asks for: control characters are dropped rather
-// than passed on, so a downstream compositor never sees a byte it did not ask
-// for. It is also the only thing holding a read capability on the console,
-// which is what stops any other process from watching the keyboard.
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_INPUT_START",
-    "USER_INPUT_START:",
-    "  subq $128, %rsp",
-    ".Lin_loop:",
-    "  movq $13, %rax", // READ
-    "  xorq %rdi, %rdi",
-    "  movq %rsp, %rsi",
-    "  movq $1, %rdx",
-    "  int $0x80",
-    "  cmpq $1, %rax",
-    "  jne .Lin_loop",
-    "  movzbq (%rsp), %rbx",
-    // Escape ends the session.
-    "  cmpq $0x1b, %rbx",
-    "  je .Lin_quit",
-    // Printable ASCII passes.
-    "  cmpq $0x20, %rbx",
-    "  jb .Lin_control",
-    "  cmpq $0x7e, %rbx",
-    "  ja .Lin_loop", // above printable: drop
-    "  jmp .Lin_send",
-    ".Lin_control:",
-    // Of the control codes, only newline and carriage return mean anything.
-    "  cmpq $0x0a, %rbx",
-    "  je .Lin_send",
-    "  cmpq $0x0d, %rbx",
-    "  je .Lin_send",
-    "  jmp .Lin_loop", // everything else is dropped
-    ".Lin_send:",
-    "  movq $1, 16(%rsp)", // tag 1: key event
-    "  movq %rbx, 24(%rsp)",
-    "  movq $0, 32(%rsp)",
-    "  movq $0, 40(%rsp)",
-    "  movq $0, 48(%rsp)",
-    "  movq $0, 56(%rsp)",
-    "  movq $5, %rax", // IPC_SEND
-    "  movq %r15, %rdi",
-    "  leaq 16(%rsp), %rsi",
-    "  int $0x80",
-    "  jmp .Lin_loop",
-    ".Lin_quit:",
-    // Tag 0 tells the consumer to shut down too.
-    "  movq $0, 16(%rsp)",
-    "  movq $0, 24(%rsp)",
-    "  movq $0, 32(%rsp)",
-    "  movq $0, 40(%rsp)",
-    "  movq $0, 48(%rsp)",
-    "  movq $0, 56(%rsp)",
-    "  movq $5, %rax",
-    "  movq %r15, %rdi",
-    "  leaq 16(%rsp), %rsi",
-    "  int $0x80",
-    "  movq $0, %rax",
-    "  movq $0, %rdi",
-    "  int $0x80",
-    ".global USER_INPUT_END",
-    "USER_INPUT_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
 // The compositor. Maps the scanout buffer, then blits client buffers into it as
 // their handles arrive over IPC.
 //
-// R15 carries its endpoint. Stack layout, all offsets from RSP:
-//     0   scanout BufferInfo (24 bytes)
-//    32   incoming Message (48 bytes)
-//    96   client BufferInfo (24 bytes)
-//   128   x, 136 y, 144 row, 152 client mapping
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_COMPOSITOR_START",
-    "USER_COMPOSITOR_START:",
-    "  subq $256, %rsp",
-    "  movq $12, %rax", // BUF_SCANOUT
-    "  int $0x80",
-    "  movq %rax, %r12", // scanout id
-    "  movq $9, %rax",   // BUF_MAP
-    "  movq %r12, %rdi",
-    "  int $0x80",
-    "  movq %rax, %r13", // scanout base
-    "  movq $11, %rax",  // BUF_INFO
-    "  movq %r12, %rdi",
-    "  movq %rsp, %rsi",
-    "  int $0x80",
-    "  movl 8(%rsp), %r14d", // scanout stride
-    ".Lco_loop:",
-    "  movq $6, %rax", // IPC_RECV, parks until something arrives
-    "  movq %r15, %rdi",
-    "  leaq 32(%rsp), %rsi",
-    "  int $0x80",
-    "  movq 32(%rsp), %rbx", // tag
-    "  testq %rbx, %rbx",
-    "  jz .Lco_exit", // tag 0: shut down
-    "  cmpq $2, %rbx",
-    "  jne .Lco_loop", // only "present" is understood
-    // words[0] buffer, words[1] x, words[2] y
-    "  movq $9, %rax", // BUF_MAP
-    "  movq 40(%rsp), %rdi",
-    "  int $0x80",
-    "  movq %rax, 152(%rsp)",
-    "  movq $11, %rax", // BUF_INFO
-    "  movq 40(%rsp), %rdi",
-    "  leaq 96(%rsp), %rsi",
-    "  int $0x80",
-    "  movq 48(%rsp), %rax",
-    "  movq %rax, 128(%rsp)", // x
-    "  movq 56(%rsp), %rax",
-    "  movq %rax, 136(%rsp)", // y
-    "  movq $0, 144(%rsp)",   // row
-    ".Lco_row:",
-    "  movq 144(%rsp), %rbx",
-    "  movl 100(%rsp), %eax", // client height
-    "  cmpq %rax, %rbx",
-    "  jae .Lco_loop",
-    // destination = scanout + (y + row) * scanout_stride + x * 4
-    "  movq 136(%rsp), %rax",
-    "  addq %rbx, %rax",
-    "  imulq %r14, %rax",
-    "  addq %r13, %rax",
-    "  movq 128(%rsp), %rsi",
-    "  movl 108(%rsp), %ecx", // bytes per pixel, from the client's own info
-    "  imulq %rcx, %rsi",
-    "  addq %rsi, %rax",
-    "  movq %rax, %rdi",
-    // source = client + row * client_stride
-    "  movl 104(%rsp), %eax",
-    "  imulq %rbx, %rax",
-    "  addq 152(%rsp), %rax",
-    "  movq %rax, %rsi",
-    // One row. The client's stride is exactly width * bpp, so it is the row
-    // length in bytes as well as the pitch.
-    "  movl 104(%rsp), %ecx",
-    "  cld",
-    "  rep movsb",
-    "  incq %rbx",
-    "  movq %rbx, 144(%rsp)",
-    "  jmp .Lco_row",
-    ".Lco_exit:",
-    "  movq $0, %rax",
-    "  movq $0, %rdi",
-    "  int $0x80",
-    ".global USER_COMPOSITOR_END",
-    "USER_COMPOSITOR_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
 // A graphics client. Allocates a buffer, fills it with one colour, shares it
 // with the compositor and asks for it to be shown.
 //
-// Its parameters come from its own data page rather than a register, because
-// there are more of them than `iretq` can carry. The page sits one page above
-// the code, and the code knows where it is because it is position-independent:
-//     0 colour, 8 x, 16 y, 24 endpoint, 32 width, 40 height, 48 compositor tid
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_CLIENT_START",
-    "USER_CLIENT_START:",
-    "  subq $128, %rsp",
-    "  leaq USER_CLIENT_START(%rip), %r12",
-    "  addq $0x1000, %r12", // the data page
-    "  movq $8, %rax",      // BUF_CREATE
-    "  movq 32(%r12), %rdi",
-    "  movq 40(%r12), %rsi",
-    "  int $0x80",
-    "  movq %rax, %r13", // buffer id
-    "  movq $9, %rax",   // BUF_MAP
-    "  movq %r13, %rdi",
-    "  int $0x80",
-    "  movq %rax, %r14", // buffer base
-    // Fill, one pixel at a time. `rep stosl` would be faster but assumes four
-    // bytes per pixel, and this display uses three.
-    "  movq 32(%r12), %rcx",
-    "  imulq 40(%r12), %rcx", // pixel count
-    "  movq 56(%r12), %rbx",  // bytes per pixel
-    "  movq %r14, %rdi",
-    ".Lcl_fill:",
-    "  testq %rcx, %rcx",
-    "  jz .Lcl_filled",
-    "  movq 0(%r12), %rax", // colour, reloaded because the shifts destroy it
-    "  movb %al, 0(%rdi)",
-    "  shrq $8, %rax",
-    "  movb %al, 1(%rdi)",
-    "  shrq $8, %rax",
-    "  movb %al, 2(%rdi)",
-    "  addq %rbx, %rdi",
-    "  decq %rcx",
-    "  jmp .Lcl_fill",
-    ".Lcl_filled:",
-    "  movq $10, %rax", // BUF_SHARE with the compositor
-    "  movq %r13, %rdi",
-    "  movq 48(%r12), %rsi",
-    "  int $0x80",
-    // present(buffer, x, y)
-    "  movq $2, 64(%rsp)",
-    "  movq %r13, 72(%rsp)",
-    "  movq 8(%r12), %rax",
-    "  movq %rax, 80(%rsp)",
-    "  movq 16(%r12), %rax",
-    "  movq %rax, 88(%rsp)",
-    "  movq $0, 96(%rsp)",
-    "  movq $0, 104(%rsp)",
-    "  movq $5, %rax", // IPC_SEND
-    "  movq 24(%r12), %rdi",
-    "  leaq 64(%rsp), %rsi",
-    "  int $0x80",
-    "  movq $0, %rax",
-    "  movq $0, %rdi",
-    "  int $0x80",
-    ".global USER_CLIENT_END",
-    "USER_CLIENT_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
 // Writes an instruction onto its own stack and jumps to it.
 //
 // With W^X enforced this faults immediately and the thread is killed. Without
@@ -867,56 +447,9 @@ global_asm!(
     options(att_syntax),
 );
 
-// Dereferences whatever address it is handed in R15.
-//
-// Pointed at memory mapped in a *different* process's address space, it must
-// fault. If it does not, it prints -- so the failure is loud rather than a test
-// that quietly passes because nothing happened.
-global_asm!(
-    ".section .rodata",
-    ".balign 16",
-    ".global USER_PEEK_START",
-    "USER_PEEK_START:",
-    "  movq (%r15), %rax",
-    // Only reached if the read succeeded.
-    "  movq $1, %rax",
-    "  movq $1, %rdi",
-    "  leaq 2f(%rip), %rsi",
-    "  movq $(3f - 2f), %rdx",
-    "  int $0x80",
-    "  movq $0, %rax",
-    "  movq $0, %rdi",
-    "  int $0x80",
-    "1:",
-    "  jmp 1b",
-    "2:",
-    "  .ascii \"  [ring 3] READ ANOTHER ADDRESS SPACE -- isolation broken\\n\"",
-    "3:",
-    ".global USER_PEEK_END",
-    "USER_PEEK_END:",
-    ".section .text",
-    options(att_syntax),
-);
-
 extern "C" {
-    static USER_PEEK_START: u8;
-    static USER_PEEK_END: u8;
     static USER_NXTEST_START: u8;
     static USER_NXTEST_END: u8;
-    static USER_INPUT_START: u8;
-    static USER_INPUT_END: u8;
-    static USER_COMPOSITOR_START: u8;
-    static USER_COMPOSITOR_END: u8;
-    static USER_CLIENT_START: u8;
-    static USER_CLIENT_END: u8;
-    static USER_SHELL_START: u8;
-    static USER_SHELL_END: u8;
-    static USER_DEMO_START: u8;
-    static USER_DEMO_END: u8;
-    static USER_TRESPASS_START: u8;
-    static USER_TRESPASS_END: u8;
-    static USER_IPC_START: u8;
-    static USER_IPC_END: u8;
 }
 
 /// # Safety
@@ -929,41 +462,15 @@ unsafe fn blob(start: *const u8, end: *const u8) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(start, length) }
 }
 
-/// Writes to the console, yields, writes again, exits.
-pub fn demo_program() -> &'static [u8] {
-    // SAFETY: the symbols bound a range emitted by one `global_asm!` block, in
-    // this order, immutable for the life of the kernel. Same for the two below.
-    unsafe { blob(&raw const USER_DEMO_START, &raw const USER_DEMO_END) }
-}
-
-/// Dereferences the address handed to it in R15.
-pub fn peek_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
-    unsafe { blob(&raw const USER_PEEK_START, &raw const USER_PEEK_END) }
-}
-
 /// Tries to execute its own stack. Should be killed by the page-fault handler.
+///
+/// The last program still written in assembly, and the only one that has to be:
+/// it plants two bytes of machine code on its own stack and jumps to them,
+/// which is not something Rust will express.
 pub fn stack_execution_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
+    // SAFETY: the symbols bound a range emitted by one `global_asm!` block, in
+    // this order, immutable for the life of the kernel.
     unsafe { blob(&raw const USER_NXTEST_START, &raw const USER_NXTEST_END) }
-}
-
-/// Reads the console and forwards sanitised key events to an endpoint.
-pub fn input_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
-    unsafe { blob(&raw const USER_INPUT_START, &raw const USER_INPUT_END) }
-}
-
-/// Maps the scanout buffer and blits client buffers into it.
-pub fn compositor_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
-    unsafe { blob(&raw const USER_COMPOSITOR_START, &raw const USER_COMPOSITOR_END) }
-}
-
-/// Allocates a buffer, fills it, and asks the compositor to show it.
-pub fn client_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
-    unsafe { blob(&raw const USER_CLIENT_START, &raw const USER_CLIENT_END) }
 }
 
 /// Write a program's start-up parameters into its data page.
@@ -981,21 +488,3 @@ pub unsafe fn write_parameters(data: VirtAddr, values: &[u64]) {
     }
 }
 
-/// A line-editing shell over the serial port.
-pub fn shell_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
-    unsafe { blob(&raw const USER_SHELL_START, &raw const USER_SHELL_END) }
-}
-
-/// Attempts to read kernel memory. Should be killed by the page-fault handler.
-pub fn trespass_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
-    unsafe { blob(&raw const USER_TRESPASS_START, &raw const USER_TRESPASS_END) }
-}
-
-/// Sends one IPC message to the endpoint handed to it in R15, then exits with
-/// the syscall's return value.
-pub fn ipc_program() -> &'static [u8] {
-    // SAFETY: as `demo_program`.
-    unsafe { blob(&raw const USER_IPC_START, &raw const USER_IPC_END) }
-}

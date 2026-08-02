@@ -74,7 +74,7 @@ static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
 
 fn compositor_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::compositor_program())
+    let image = userspace::load_elf(owner, userspace::COMPOSITOR_ELF)
         .expect("failed to map the compositor");
     let endpoint = COMPOSITOR_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: load_program mapped the entry user-executable and the stack
@@ -84,7 +84,7 @@ fn compositor_thread() {
 
 fn client_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::client_program())
+    let image = userspace::load_elf(owner, userspace::CLIENT_ELF)
         .expect("failed to map the client");
 
     let params = *CLIENT_PARAMS.lock();
@@ -93,12 +93,12 @@ fn client_thread() {
     unsafe { userspace::write_parameters(image.data, &params) };
 
     // SAFETY: as in `compositor_thread`.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 fn input_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::input_program())
+    let image = userspace::load_elf(owner, userspace::INPUT_ELF)
         .expect("failed to map the input daemon");
     let endpoint = COMPOSITOR_ENDPOINT.load(Ordering::Acquire);
     // SAFETY: as above.

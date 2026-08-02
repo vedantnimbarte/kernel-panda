@@ -343,12 +343,12 @@ static USER_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
 fn ring3_sender() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::ipc_program())
-        .expect("failed to map user image");
     let endpoint = USER_ENDPOINT.load(Ordering::Acquire);
-    // SAFETY: load_program mapped the entry user-executable and the stack
-    // user-writable.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
+    let image = userspace::load_probe(owner, userspace::probe::IPC, endpoint)
+        .expect("failed to load the probe");
+    // SAFETY: load_probe mapped the entry user-executable, the stack
+    // user-writable, and filled in the parameter page.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
 #[test_case]

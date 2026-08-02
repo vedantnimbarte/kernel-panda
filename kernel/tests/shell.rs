@@ -48,8 +48,7 @@ static SHELL_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn shell_thread() {
     let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_program(owner, userspace::shell_program())
-        .expect("failed to map the shell image");
+    let image = userspace::load_elf(owner, userspace::SHELL_ELF).expect("failed to load the shell");
     // SAFETY: load_program mapped the entry user-executable and the stack
     // user-writable.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }

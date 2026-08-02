@@ -172,35 +172,40 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) {
     KERNEL_SPACE.call_once(AddressSpace::active);
 }
 
-/// Free a page table and every table beneath it, but not the data pages the
-/// bottom level points at.
+/// Free a page table, every table beneath it, and every data page they map.
 ///
-/// `level` is 3 for a P3, 2 for a P2, 1 for a P1. The recursion stops before
-/// dereferencing level 1's entries, because those are data frames belonging to
-/// whoever mapped them -- freeing them here would be a double free.
+/// `level` is 3 for a P3, 2 for a P2, 1 for a P1. Level 1 entries point at data
+/// frames, and those are freed too -- which is only correct because by the time
+/// a space is destroyed, anything shared has already withdrawn its mappings.
+/// `gbm::release_thread` runs before `userspace::release_slot` for exactly this
+/// reason: a buffer another process still holds must be unmapped from here
+/// first, or its frames would go back to the allocator while still in use.
 ///
 /// # Safety
 ///
 /// `frame` must be a live page table at `level`, reachable only from the space
-/// being destroyed.
+/// being destroyed, and every frame under it must be owned solely by it.
 unsafe fn free_table_tree(frame: PhysFrame<Size4KiB>, level: u8, offset: VirtAddr) {
-    if level > 1 {
-        // SAFETY: a live page table, reachable through the physical window.
-        let table =
-            unsafe { &*((offset + frame.start_address().as_u64()).as_ptr::<PageTable>()) };
+    // SAFETY: a live page table, reachable through the physical window.
+    let table = unsafe { &*((offset + frame.start_address().as_u64()).as_ptr::<PageTable>()) };
 
-        for entry in table.iter() {
-            let flags = entry.flags();
-            // A huge page's entry points at data, not at another table.
-            if !flags.contains(PageTableFlags::PRESENT)
-                || flags.contains(PageTableFlags::HUGE_PAGE)
-            {
-                continue;
-            }
-            if let Ok(child) = entry.frame() {
-                // SAFETY: reached only through this subtree.
-                unsafe { free_table_tree(child, level - 1, offset) };
-            }
+    for entry in table.iter() {
+        let flags = entry.flags();
+        // A huge page's entry points at data, not at another table. Nothing here
+        // maps huge pages, so skipping is the conservative choice.
+        if !flags.contains(PageTableFlags::PRESENT) || flags.contains(PageTableFlags::HUGE_PAGE) {
+            continue;
+        }
+        let Ok(child) = entry.frame() else {
+            continue;
+        };
+
+        if level > 1 {
+            // SAFETY: reached only through this subtree.
+            unsafe { free_table_tree(child, level - 1, offset) };
+        } else {
+            // A data page belonging to this process alone.
+            crate::memory::frame::with(|allocator| allocator.deallocate(child));
         }
     }
 
@@ -434,6 +439,21 @@ pub fn unmap_and_free_in(space: &AddressSpace, page: Page<Size4KiB>) -> Result<(
     let released = unmap_in(space, page)?;
     frame::with(|allocator| allocator.deallocate(released));
     Ok(())
+}
+
+/// Change permissions on an existing mapping inside `space`.
+pub fn set_flags_in(
+    space: &AddressSpace,
+    page: Page<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<(), FlagUpdateError> {
+    with_space(space, |mapper| {
+        // SAFETY: only narrows or widens permissions on a mapping that already
+        // exists; it cannot point the page at different memory.
+        let flush = unsafe { mapper.update_flags(page, flags) }?;
+        flush.flush();
+        Ok(())
+    })
 }
 
 /// Page flags for an address within `space`.

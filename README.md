@@ -114,6 +114,9 @@ either way, so everything here behaves identically under `--uefi`.
 ```
 kernel-panda/
 ├── xtask/           host-side build driver: images, QEMU, test runner
+├── userland/        Ring 3 programs in Rust (its own cargo workspace)
+│   ├── src/lib.rs   syscall wrappers, entry macro, panic handler
+│   └── src/bin/     shell, compositor, input daemon, client, test probe
 └── kernel/          the kernel itself (its own cargo workspace)
     ├── src/
     │   ├── console/   16550 UART, framebuffer text console, 8x8 font
@@ -316,11 +319,9 @@ which only means the hang would be intermittent.
 * The scheduler is strict round-robin with no priorities. Threads can now block
   on IPC, but there is still no sleep and no wait-for-thread, so polling with
   `yield_now` is the only way to await anything else.
-* **User programs are hand-written assembly blobs** copied into a single page. A
-  Rust function lives in kernel pages that are deliberately not user-accessible,
-  so it cannot be executed from Ring 3; the honest fix is a separate userland
-  crate and an ELF loader, and that is the single highest-value thing left to
-  build. Everything in user space is constrained by its absence.
+* One user program is still hand-written assembly: the W^X test, which plants
+  two bytes of machine code on its own stack and jumps to them. That is not
+  something Rust will express, and it is the right tool for that one job.
 * The compositor has no damage tracking, no double buffering and no z-order. It
   blits each surface once, as it arrives.
 * PCI uses the port-based config mechanism, so extended config space above
