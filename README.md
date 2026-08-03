@@ -645,4 +645,5 @@ which only means the hang would be intermittent.
 - [x] **M3 — Input daemon.** A Ring 3 process that owns console input, drops
       control codes, and forwards the rest over IPC.
 - [x] **M4 — Sovereign compositor.** A Ring 3 display server that maps the
-      scanout buffer and blits client surfaces into it.
+      scanout buffer, keeps a surface table ordered by depth, composes off
+      screen, and copies out only what changed.
