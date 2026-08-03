@@ -5,17 +5,28 @@
 # Kernel Panda
 
 A bare-metal microkernel written from scratch in `no_std` Rust, targeting
-`x86_64-unknown-none`. Implements Phases 1 and 2 of
-[the project specification](docs/prd.md): a kernel that boots, catches its own
-faults, and manages physical and virtual memory.
+`x86_64-unknown-none`.
 
-**Status:** all 17 milestones of the PRD roadmap are implemented — from a
-freestanding binary through a preemptive scheduler, Ring 3 user space,
-capability-mediated IPC, PCIe enumeration, and a display server that composites
-client buffers onto the screen from Ring 3 — plus a hardening pass covering
-per-process address spaces, W^X, resource quotas and multiprocessing.
-**108 test cases across 17 boot-and-assert test kernels, all passing on four
-cores under QEMU.**
+It boots on bare metal or under QEMU, brings up every processor, and runs
+preemptively scheduled threads in their own address spaces. Drivers and the
+display server live in Ring 3 and talk through capability-mediated IPC. It has
+persistent storage: an AHCI driver, GPT partitioning, and a copy-on-write
+filesystem that survives a power cut.
+
+| | |
+|---|---|
+| Memory | Bitmap frame allocator, four-level paging, per-process address spaces, kernel heap |
+| Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas |
+| Scheduling | Preemptive, three priorities, per-CPU run queues with work stealing, sleep and join |
+| Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
+| User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls |
+| IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities |
+| Devices | Local APIC and I/O APIC, PCIe with ECAM, AHCI storage, framebuffer, 16550 serial |
+| Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
+| Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order and damage tracking |
+
+**Testing:** 160+ cases across 21 boot-and-assert test kernels, run on four cores
+under QEMU with SMEP and SMAP enabled.
 
 ```
 Kernel Panda v0.1.0
@@ -123,13 +134,18 @@ kernel-panda/
     ├── src/
     │   ├── console/   16550 UART, framebuffer text console, 8x8 font
     │   ├── arch/x86_64/   GDT + TSS, IDT, Local APIC + timer, 8259 masking
-    │   ├── memory/    memory map, bitmap frame allocator, page tables, heap region
+    │   ├── memory/    memory map, frame allocator, page tables, heap, kernel stacks
     │   ├── allocator/ bump and linked-list `GlobalAlloc` implementations
-    │   ├── sched/  threads, context switch, round-robin scheduler
+    │   ├── sched/     threads, context switch, priorities, per-CPU run queues
+    │   ├── block/     block layer, AHCI driver, GPT and MBR partitioning
+    │   ├── fs/        copy-on-write filesystem and its formatter
+    │   ├── smp.rs     starting the other processors, per-CPU identity
+    │   ├── acpi.rs    MADT and MCFG: processors, I/O APICs, the PCIe window
+    │   ├── quota.rs   per-process resource limits
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
     │   ├── syscall.rs    the entire Ring 3 surface
     │   ├── ipc.rs        endpoints, capabilities, blocking receive
-    │   ├── pci.rs        bus enumeration and BAR decoding
+    │   ├── pci.rs        bus enumeration, BAR decoding, ECAM
     │   └── gbm.rs        shared graphics buffers and the scanout
     └── tests/       one standalone boot-and-assert kernel per file
 ```
@@ -147,14 +163,18 @@ xtask for bare metal.
 
 ## Dependency policy
 
-Everything that ships inside the kernel image has to earn its place against the
-auditability requirement in PRD §1.2. Three crates do:
+Everything that ships inside the kernel image has to earn its place. This is a
+kernel meant to be read and audited, and a dependency is code nobody here has
+read. Two crates earn it.
 
 | Crate | Why |
 | --- | --- |
 | `bootloader_api` | Required by the chosen boot path. |
 | `x86_64` | IDT/GDT/page-table structures and privileged instructions. Pure Rust; reimplementing is weeks of work for no safety gain. |
-| `spin` | Spinlocks, wrapped behind `kernel/src/sync.rs` so it can be swapped for an interrupt-aware in-house primitive in Phase 3 without touching call sites. |
+
+`spin` was the third until the in-house ticket lock replaced it. Wrapping it
+behind `kernel/src/sync.rs` from the start is what made that swap a change to one
+file rather than to every call site.
 
 Written in-house rather than pulled in: the 16550 UART driver, the framebuffer
 console and its font, the physical frame allocator, and both heap allocators.
@@ -166,8 +186,9 @@ goal is the point.
 ## Design notes
 
 **Bitmap frame allocator, not a bump.** A microkernel returns physical memory
-every time a Ring 3 process exits, so an allocate-only design would be thrown
-away in Phase 3. The bitmap is sized from the highest *usable* address rather
+every time a Ring 3 process exits, so an allocate-only design would have had to
+be thrown away as soon as user space existed. The bitmap is sized from the
+highest *usable* address rather
 than the highest address in the memory map — firmware puts MMIO windows near the
 top of the address space (QEMU's sits at `0xfd_0000_0000`), and covering up to
 there would mean a 32 MiB bitmap carved out of 246 MiB of real RAM. Device memory
@@ -190,7 +211,7 @@ outcomes otherwise look identical from outside.
 `Box::new` faults under `--features bump-allocator`, the fault is in the page
 mapping, not the allocator. Both pass the full suite.
 
-**Local APIC, not the 8259 PIC.** The PRD rules out legacy hardware support, and
+**Local APIC, not the 8259 PIC.** Legacy hardware support is out of scope, and
 per-CPU delivery is a prerequisite for SMP later, so PIC-based delivery would be
 throwaway work. The PIC is still remapped clear of the exception vectors and then
 fully masked — masking alone is not enough, because a spurious IRQ 7 can be
@@ -227,7 +248,7 @@ to find one. The gate costs more cycles and buys a great deal less that can go
 quietly wrong. The ABI does not depend on the mechanism, so it can be swapped
 later.
 
-**A user fault kills the thread, not the kernel.** PRD 1.2 asks that a fault in
+**A user fault kills the thread, not the kernel.** A fault in
 unprivileged code never take the system down, so the page-fault and GP handlers
 check the saved CS and, if the fault came from Ring 3, destroy that thread and
 carry on. `ring3.rs` proves it by running a program that dereferences the kernel
@@ -271,6 +292,45 @@ processor. It sets the state and leaves the enqueue to the handshake.
 
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
+
+**The filesystem never overwrites live data.** The obvious design writes a
+file's blocks, then updates the pointer to them. A power cut between the two
+leaves a directory naming a block that holds something else, and nothing on the
+disk records that it happened — so the next mount reads corruption and believes
+it.
+
+Instead, every block a change touches is written to *free* space, and the path
+from it up to the root is rewritten the same way. The last step is a single
+sector: the superblock naming the new root. Until that sector lands the old tree
+is complete and the disk mounts exactly as it was; after it lands the new tree
+is live. There is no in-between a reader can observe.
+
+Two superblocks alternate, and the higher generation wins. Both carry a
+checksum, so a superblock torn mid-write fails it and loses to its sibling
+rather than being believed. That is the entire crash-recovery story: no journal,
+no replay, and therefore no replay bugs. The guarantee is exactly one commit
+deep — once a second commit lands, the blocks of the version before it are free
+and may be reused.
+
+Blocks a transaction stops referring to are released only *after* its commit has
+landed. Releasing them earlier would let that same transaction allocate one and
+write over a block the old tree still needs, which is the one way copy-on-write
+can still corrupt itself.
+
+The first version of this claimed copy-on-write and updated directory blocks and
+inodes in place; only file data actually had it. `a_crash_before_the_commit_
+leaves_the_previous_state` is what caught that, and it is why the machinery is
+now in one place rather than repeated per operation.
+
+**The disk driver is in the kernel, and that contradicts the Ring 3 rule.** A
+disk controller is a DMA engine: it writes wherever its command tables point,
+and those are physical addresses the device does not check against anyone's page
+tables. A Ring 3 driver handed that controller can write to any physical page in
+the machine by asking the hardware to do it. So a Ring 3 disk driver without an
+IOMMU is not isolated — it merely looks isolated, which is worse than an honest
+kernel driver because it invites trust it has not earned. Making it real needs
+VT-d with a per-device domain. The layer above it — partitions, filesystem,
+policy — has no such excuse and is meant to move out.
 
 **Resource limits are per process, and they only ever narrow.** They were four
 constants identical for every thread, which bounds the damage one process can do
@@ -615,18 +675,7 @@ kernel deadlocks the first time a handler prints: it spins on a lock held by the
 code it interrupted, which cannot run again to release it. The window is small,
 which only means the hang would be intermittent.
 
-## Deviations from the PRD
-
-* **No VGA text buffer** (§4 Phase 1 M3). UEFI hands off in graphics mode and
-  `0xB8000` does not exist; the BIOS path is no different, since the bootloader
-  sets a graphics mode either way. On-screen text is rasterised into the linear
-  framebuffer instead.
-* **`bootloader` 0.11.x only** (§3.1). 0.9.x is BIOS-only and needs the
-  deprecated `bootimage` tool.
-* **The memory map is read via `bootloader_api`** (§4 Phase 2 M1), not from UEFI
-  directly — boot services are already exited by the time the kernel runs.
-
-## Hardening left for later
+## Known limits
 
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
   timing is exactly where this class of code breaks.
@@ -654,29 +703,18 @@ which only means the hang would be intermittent.
   never unmaps. A workload touching every bus ends up with the whole window
   mapped, which is what the eager version did to begin with.
 
-## Phase 3 progress
+## Not built yet
 
-- [x] **M1 — Hardware interrupts.** Local APIC, calibrated periodic timer at
-      100 Hz, tick counter and uptime, interrupt-safe console.
-- [x] **M2 — Preemptive thread scheduler.** Kernel threads with their own
-      stacks, round-robin over a 10 ms quantum, timer-driven preemption,
-      `yield_now`, and reaping of finished threads.
-- [x] **M3 — Ring 0 → Ring 3.** User code and data segments, a per-thread Ring 0
-      stack in the TSS, an `int 0x80` syscall gate, user page mapping with
-      validated pointers, and user faults that kill only the faulting thread.
-- [x] **M4 — IPC.** Bounded endpoint queues, unforgeable sender identity,
-      capabilities with `SEND`/`RECEIVE`/`GRANT`, and a blocking receive that
-      parks the thread rather than spinning.
-- [x] **M5 — First user-space daemon.** A line-editing shell over the serial
-      port, running in Ring 3 and parking in the kernel between keystrokes.
+The gaps that matter, so nobody has to discover them by trying:
 
-## Phase 4 progress
-
-- [x] **M1 — PCIe enumeration.** Full bus sweep, class decoding, BAR sizing.
-- [x] **M2 — Generic buffer management.** Shared graphics buffers with
-      capability-checked handles, plus a scanout buffer wrapping display memory.
-- [x] **M3 — Input daemon.** A Ring 3 process that owns console input, drops
-      control codes, and forwards the rest over IPC.
-- [x] **M4 — Sovereign compositor.** A Ring 3 display server that maps the
-      scanout buffer, keeps a surface table ordered by depth, composes off
-      screen, and copies out only what changed.
+* **Networking.** No NIC driver, no stack.
+* **Users and permissions.** Every Ring 3 process is equally unprivileged and
+  equally anonymous. Capabilities bound what a process can reach; nothing binds
+  *who* it is.
+* **A libc or a toolchain for third-party software.** Programs are built in this
+  repository's `userland` workspace against its own syscall wrappers.
+* **Crash reporting.** A kernel panic halts. There is no dump, and no log that
+  survives the reboot.
+* **An IOMMU.** Without one, a Ring 3 driver handed a DMA-capable device is not
+  isolated from the rest of physical memory, which is why the disk driver is in
+  the kernel.

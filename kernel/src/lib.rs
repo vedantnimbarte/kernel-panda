@@ -27,6 +27,7 @@ pub mod block;
 pub mod arch;
 pub mod console;
 pub mod elf;
+pub mod fs;
 pub mod gbm;
 pub mod ipc;
 pub mod memory;

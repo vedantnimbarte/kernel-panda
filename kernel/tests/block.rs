@@ -16,7 +16,7 @@ use alloc::vec;
 use core::panic::PanicInfo;
 
 use bootloader_api::{entry_point, BootInfo};
-use panda_kernel::block::{self, BlockError, SECTOR_SIZE};
+use panda_kernel::block::{self, BlockDevice, BlockError, SECTOR_SIZE};
 use panda_kernel::{arch::x86_64::halt_loop, serial_println, testing, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
@@ -248,6 +248,148 @@ fn a_partial_sector_is_refused() {
         disk.read(SCRATCH_LBA, &mut []),
         Err(BlockError::Unaligned),
         "an empty request was accepted"
+    );
+}
+
+// --- partition tables --------------------------------------------------------
+
+/// A type GUID for partitions this kernel formats. Arbitrary but distinctive,
+/// so a disk can be recognised as ours rather than guessed at.
+const PANDA_TYPE: [u8; 16] = *b"PandaFileSystem\0";
+
+#[test_case]
+fn a_blank_disk_has_no_partition_table() {
+    use panda_kernel::block::partition;
+
+    let disk = scratch();
+    // Wipe the first sector so this does not depend on what an earlier case
+    // left behind -- the tests share one disk and run in an order nobody here
+    // controls.
+    disk.write(0, &vec![0u8; SECTOR_SIZE]).expect("write failed");
+
+    let partitions = partition::read(&*disk).expect("reading the table failed");
+    assert!(
+        partitions.is_empty(),
+        "a disk with no signature reported {} partition(s); a table was \
+         invented out of zeroes",
+        partitions.len()
+    );
+}
+
+#[test_case]
+fn a_gpt_written_reads_back() {
+    use panda_kernel::block::partition;
+
+    let disk = scratch();
+    let written =
+        partition::write_single_partition_gpt(&*disk, PANDA_TYPE).expect("could not write a GPT");
+
+    let partitions = partition::read(&*disk).expect("reading the table failed");
+    assert_eq!(partitions.len(), 1, "expected exactly one partition");
+
+    let read = partitions[0];
+    assert_eq!(read.start, written.start, "the partition moved");
+    assert_eq!(read.sectors, written.sectors, "the partition changed size");
+    assert_eq!(read.scheme, partition::Scheme::Gpt, "not read back as GPT");
+
+    // The partition must sit inside the disk and clear of the structures that
+    // describe it -- a filesystem given sector 0 would write over the GPT.
+    assert!(read.start >= 2, "the partition overlaps the GPT header");
+    assert!(
+        read.end() <= disk.sector_count(),
+        "the partition runs off the end of the disk"
+    );
+}
+
+#[test_case]
+fn a_corrupt_gpt_header_is_refused() {
+    use panda_kernel::block::partition;
+
+    let disk = scratch();
+    partition::write_single_partition_gpt(&*disk, PANDA_TYPE).expect("could not write a GPT");
+
+    // Flip a byte in the header. The checksum exists precisely so this is
+    // caught: acting on a damaged table means writing a filesystem wherever the
+    // garbage points, which on a disk holding real data is unrecoverable.
+    let mut header = vec![0u8; SECTOR_SIZE];
+    disk.read(1, &mut header).expect("read failed");
+    header[40] ^= 0xFF;
+    disk.write(1, &header).expect("write failed");
+
+    let partitions = partition::read(&*disk).expect("reading the table failed");
+    assert!(
+        partitions.is_empty(),
+        "a GPT header failing its checksum was still acted on, reporting {} \
+         partition(s)",
+        partitions.len()
+    );
+
+    // Put it back, so later cases are not affected by the order they run in.
+    partition::write_single_partition_gpt(&*disk, PANDA_TYPE).expect("could not rewrite the GPT");
+}
+
+#[test_case]
+fn a_protective_mbr_is_not_treated_as_a_partition() {
+    use panda_kernel::block::partition;
+
+    let disk = scratch();
+    partition::write_single_partition_gpt(&*disk, PANDA_TYPE).expect("could not write a GPT");
+
+    // Break the GPT signature so the reader falls back to the MBR. What it
+    // finds there is the protective entry, which claims the whole disk. Handing
+    // that out as a real partition is how a GPT disk gets overwritten.
+    let mut header = vec![0u8; SECTOR_SIZE];
+    disk.read(1, &mut header).expect("read failed");
+    header[0..8].copy_from_slice(b"XXXXXXXX");
+    disk.write(1, &header).expect("write failed");
+
+    let partitions = partition::read(&*disk).expect("reading the table failed");
+    assert!(
+        partitions.is_empty(),
+        "the protective MBR entry was reported as a usable partition covering \
+         the whole disk"
+    );
+
+    partition::write_single_partition_gpt(&*disk, PANDA_TYPE).expect("could not rewrite the GPT");
+}
+
+#[test_case]
+fn a_partition_cannot_reach_outside_itself() {
+    use panda_kernel::block::partition::{self, PartitionDevice};
+
+    let disk = scratch();
+    let entry =
+        partition::write_single_partition_gpt(&*disk, PANDA_TYPE).expect("could not write a GPT");
+    let view = PartitionDevice::new(disk.clone(), &entry).expect("could not open the partition");
+
+    assert_eq!(view.sector_count(), entry.sectors);
+
+    // Sector zero of the partition is not sector zero of the disk. A filesystem
+    // that believes otherwise writes its superblock over the partition table.
+    let stamp = vec![0xE1u8; SECTOR_SIZE];
+    view.write(0, &stamp).expect("write failed");
+
+    let mut disk_sector_zero = vec![0u8; SECTOR_SIZE];
+    disk.read(0, &mut disk_sector_zero).expect("read failed");
+    assert_ne!(
+        disk_sector_zero, stamp,
+        "writing to the partition's first sector reached the disk's first \
+         sector, which holds the partition table"
+    );
+
+    let mut through_disk = vec![0u8; SECTOR_SIZE];
+    disk.read(entry.start, &mut through_disk).expect("read failed");
+    assert_eq!(
+        through_disk, stamp,
+        "the write did not land at the partition's start"
+    );
+
+    // And it must refuse to run off the end rather than reaching whatever
+    // follows the partition.
+    assert_eq!(
+        view.read(view.sector_count(), &mut vec![0u8; SECTOR_SIZE]),
+        Err(BlockError::OutOfRange),
+        "a read past the end of the partition reached the rest of the disk"
     );
 }
 

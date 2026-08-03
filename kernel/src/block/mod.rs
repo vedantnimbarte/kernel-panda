@@ -29,6 +29,7 @@
 //! is meant to move out.
 
 pub mod ahci;
+pub mod partition;
 
 use alloc::vec::Vec;
 
