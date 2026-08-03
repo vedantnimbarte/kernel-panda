@@ -32,7 +32,7 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use crate::acpi::EcamRegion;
 use crate::memory::paging;
-use crate::sync::without_interrupts;
+use crate::sync::{without_interrupts, Mutex};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -59,9 +59,7 @@ pub enum EcamError {
     Mapping,
 }
 
-/// Buses actually covered by the mapped window.
-///
-/// May be narrower than what the firmware described -- see [`init_ecam`].
+/// Buses the firmware described.
 pub fn ecam_bus_range() -> Option<(u8, u8)> {
     if !ecam_available() {
         return None;
@@ -72,7 +70,19 @@ pub fn ecam_bus_range() -> Option<(u8, u8)> {
     ))
 }
 
-/// Map the memory-mapped configuration window.
+/// Physical base of the described window, or zero.
+static ECAM_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+
+/// Which buses have had their megabyte of configuration space mapped.
+///
+/// Firmware routinely describes all 256 buses whether or not anything is on
+/// them -- QEMU's q35 does. Mapping that eagerly is 256 MiB of window and 65,536
+/// page-table entries established at boot for buses that will never answer, so
+/// each bus is mapped the first time something reaches for it instead. A machine
+/// with devices on three buses pays for three.
+static MAPPED_BUSES: Mutex<[bool; 256]> = Mutex::new([false; 256]);
+
+/// Note the window and make the first bus reachable.
 ///
 /// # Safety
 ///
@@ -83,57 +93,86 @@ pub unsafe fn init_ecam(region: EcamRegion) -> Result<(), EcamError> {
         return Ok(());
     }
 
-    // Firmware routinely describes all 256 buses whether or not anything is on
-    // them -- QEMU's q35 does. That is 256 MiB of window and 65,536 mappings to
-    // establish at boot, for buses that will never answer.
-    //
-    // So the range is clamped rather than refused. Buses above the cap fall
-    // back to the port mechanism, which still reaches their low 256 bytes; only
-    // extended configuration space is lost, and only for a device sitting
-    // further out than any machine this runs on puts one.
-    const MAX_BUSES: u16 = 64;
-    let described = (region.end_bus as u16) - (region.start_bus as u16) + 1;
-    let end_bus = if described > MAX_BUSES {
-        region.start_bus + (MAX_BUSES as u8) - 1
-    } else {
-        region.end_bus
-    };
-    let region = EcamRegion { end_bus, ..region };
-
-    // Uncached: configuration space is device registers, and a cached read can
-    // answer from a line fetched before the device changed.
-    let flags = PageTableFlags::PRESENT
-        | PageTableFlags::WRITABLE
-        | PageTableFlags::NO_CACHE
-        | PageTableFlags::WRITE_THROUGH
-        | PageTableFlags::NO_EXECUTE;
-
-    let pages = region.length() / 4096;
-    for index in 0..pages {
-        let virtual_address = VirtAddr::new(ECAM_VIRT_BASE + index * 4096);
-        let physical = PhysAddr::new(region.base + index * 4096);
-        let page = Page::<Size4KiB>::containing_address(virtual_address);
-        let frame = PhysFrame::<Size4KiB>::containing_address(physical);
-
-        // SAFETY: the range is device memory the firmware named, and this
-        // virtual range belongs to nothing else.
-        if unsafe { paging::map_to_frame(page, frame, flags) }.is_err() {
-            // Unwind, or a partial window is worse than none: reads would
-            // succeed for low buses and fault for high ones.
-            for done in 0..index {
-                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
-                    ECAM_VIRT_BASE + done * 4096,
-                ));
-                let _ = paging::unmap(page);
-            }
-            return Err(EcamError::Mapping);
-        }
-    }
-
+    ECAM_PHYSICAL.store(region.base, Ordering::Relaxed);
     ECAM_START_BUS.store(region.start_bus, Ordering::Relaxed);
     ECAM_END_BUS.store(region.end_bus, Ordering::Relaxed);
     ECAM_VIRT.store(ECAM_VIRT_BASE, Ordering::Release);
-    Ok(())
+
+    // Bus zero eagerly, because something is always on it and the first read
+    // would otherwise map it anyway.
+    ensure_bus_mapped(region.start_bus).inspect_err(|_| {
+        ECAM_VIRT.store(0, Ordering::Release);
+    })
+}
+
+/// Map one bus's megabyte of configuration space if it is not mapped already.
+///
+/// 256 pages: one per (device, function) pair, since each function gets 4 KiB
+/// and a bus holds 32 devices of 8 functions.
+fn ensure_bus_mapped(bus: u8) -> Result<(), EcamError> {
+    let base = ECAM_PHYSICAL.load(Ordering::Relaxed);
+    if base == 0 {
+        return Err(EcamError::NotDescribed);
+    }
+
+    let start = ECAM_START_BUS.load(Ordering::Relaxed);
+    let end = ECAM_END_BUS.load(Ordering::Relaxed);
+    if bus < start || bus > end {
+        return Err(EcamError::NotDescribed);
+    }
+
+    // Held across the mapping, so two processors reaching for the same bus at
+    // once cannot both decide it is unmapped and race to map it -- the second
+    // would fail with AlreadyMapped and report a window that is in fact fine.
+    crate::sync::without_interrupts(|| {
+        let mut mapped = MAPPED_BUSES.lock();
+        if mapped[bus as usize] {
+            return Ok(());
+        }
+
+        // Uncached: configuration space is device registers, and a cached read
+        // can answer from a line fetched before the device changed.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::WRITE_THROUGH
+            | PageTableFlags::NO_EXECUTE;
+
+        let offset = ((bus - start) as u64) << 20;
+        for page_index in 0..256u64 {
+            let virtual_address = VirtAddr::new(ECAM_VIRT_BASE + offset + page_index * 4096);
+            let physical = PhysAddr::new(base + offset + page_index * 4096);
+            let page = Page::<Size4KiB>::containing_address(virtual_address);
+            let frame = PhysFrame::<Size4KiB>::containing_address(physical);
+
+            // SAFETY: device memory the firmware named, at a virtual range
+            // belonging to nothing else.
+            if unsafe { paging::map_to_frame(page, frame, flags) }.is_err() {
+                // Unwind: a half-mapped bus would read correctly for some
+                // devices and fault for others.
+                for done in 0..page_index {
+                    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                        ECAM_VIRT_BASE + offset + done * 4096,
+                    ));
+                    let _ = paging::unmap(page);
+                }
+                return Err(EcamError::Mapping);
+            }
+        }
+
+        mapped[bus as usize] = true;
+        Ok(())
+    })
+}
+
+fn bus_is_mapped(bus: u8) -> bool {
+    crate::sync::without_interrupts(|| MAPPED_BUSES.lock()[bus as usize])
+}
+
+/// Buses whose configuration space is currently mapped. Diagnostic, and used by
+/// tests.
+pub fn mapped_bus_count() -> usize {
+    crate::sync::without_interrupts(|| MAPPED_BUSES.lock().iter().filter(|m| **m).count())
 }
 
 /// Whether configuration space is reachable by memory rather than by ports.
@@ -151,7 +190,17 @@ pub fn config_limit() -> u16 {
 }
 
 /// Virtual address of a function's configuration space, if ECAM covers it.
-fn ecam_address(address: Address, offset: u16) -> Option<u64> {
+///
+/// `map_if_needed` decides whether reaching an unmapped bus is worth mapping it.
+/// It is false for offsets the ports can also reach, and that is what keeps
+/// enumeration cheap: a full sweep touches all 256 buses at offset zero, so
+/// mapping on every access would map the entire window during the first scan
+/// and lazy mapping would have bought nothing. Above 0xFF there is no
+/// alternative, so the bus is mapped.
+///
+/// A failure is not fatal -- the caller falls back to the port mechanism, which
+/// reaches the low 256 bytes of any bus.
+fn ecam_address(address: Address, offset: u16, map_if_needed: bool) -> Option<u64> {
     let base = ECAM_VIRT.load(Ordering::Acquire);
     if base == 0 || offset >= EXTENDED_CONFIG_LIMIT {
         return None;
@@ -160,6 +209,12 @@ fn ecam_address(address: Address, offset: u16) -> Option<u64> {
     let start = ECAM_START_BUS.load(Ordering::Relaxed);
     let end = ECAM_END_BUS.load(Ordering::Relaxed);
     if address.bus < start || address.bus > end {
+        return None;
+    }
+
+    if map_if_needed {
+        ensure_bus_mapped(address.bus).ok()?;
+    } else if !bus_is_mapped(address.bus) {
         return None;
     }
 
@@ -270,7 +325,9 @@ pub fn read_config(address: Address, offset: u8) -> u32 {
 /// extended capability list terminates rather than looping on a value it
 /// invented.
 pub fn read_config_extended(address: Address, offset: u16) -> u32 {
-    if let Some(virtual_address) = ecam_address(address, offset) {
+    // Above 0xFF only ECAM will do, so the bus is mapped if it is not already.
+    let map_if_needed = offset >= LEGACY_CONFIG_LIMIT;
+    if let Some(virtual_address) = ecam_address(address, offset, map_if_needed) {
         // SAFETY: the address is inside the window mapped by `init_ecam`, and
         // is dword aligned by construction. Volatile because the device, not
         // the compiler, decides what a read means.
@@ -302,7 +359,7 @@ pub fn read_config_extended(address: Address, offset: u16) -> u32 {
 /// Writing configuration space reprograms hardware. The caller must know what
 /// the register does; a careless write can remap or disable a device.
 pub unsafe fn write_config(address: Address, offset: u8, value: u32) {
-    if let Some(virtual_address) = ecam_address(address, offset as u16) {
+    if let Some(virtual_address) = ecam_address(address, offset as u16, false) {
         // SAFETY: forwarded from this function's contract; the address is
         // inside the mapped window and dword aligned.
         unsafe { core::ptr::write_volatile(virtual_address as *mut u32, value) };
@@ -316,6 +373,18 @@ pub unsafe fn write_config(address: Address, offset: u8, value: u32) {
             Port::<u32>::new(CONFIG_DATA).write(value);
         }
     })
+}
+
+/// Read a register through ECAM specifically, mapping the bus if need be.
+///
+/// `None` when there is no window, or the bus is outside it, or it could not be
+/// mapped. Only useful for checking the two views agree; everything else should
+/// go through [`read_config`].
+pub fn read_config_ecam(address: Address, offset: u16) -> Option<u32> {
+    let virtual_address = ecam_address(address, offset, true)?;
+    // SAFETY: inside the window mapped by `ensure_bus_mapped`, dword aligned by
+    // construction, and volatile because the device decides what a read means.
+    Some(unsafe { core::ptr::read_volatile(virtual_address as *const u32) })
 }
 
 /// Read a register through the port mechanism specifically.
@@ -461,8 +530,14 @@ pub fn both_mechanisms_agree() -> Option<bool> {
     for device in enumerate() {
         // The identity register: vendor and device id, the one register whose
         // value is certain to be stable between two reads.
+        //
+        // `read_config_ecam` rather than `read_config`, which would fall back to
+        // the ports for a low offset on an unmapped bus and compare them with
+        // themselves.
         let through_ports = read_config_legacy(device.address, 0x00);
-        let through_memory = read_config_extended(device.address, 0x00);
+        let Some(through_memory) = read_config_ecam(device.address, 0x00) else {
+            continue;
+        };
         if through_ports != through_memory {
             return Some(false);
         }

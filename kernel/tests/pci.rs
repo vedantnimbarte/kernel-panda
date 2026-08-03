@@ -84,6 +84,38 @@ fn extended_configuration_space_is_reachable() {
         devices.len()
     );
 
+    // Buses are mapped on first use, so the whole 256-bus window the firmware
+    // describes is reachable without 65,536 page-table entries established at
+    // boot for buses that will never answer.
+    let (first, last) = pci::ecam_bus_range().expect("ECAM is available but reports no range");
+    let described = (last as usize) - (first as usize) + 1;
+    let mapped = pci::mapped_bus_count();
+    panda_kernel::serial_println!("  ({mapped} of {described} described buses mapped)");
+    assert!(
+        mapped <= described,
+        "more buses are mapped than the firmware described"
+    );
+    assert!(mapped > 0, "no bus was mapped despite ECAM being available");
+
+    assert!(
+        mapped < described,
+        "every one of the {described} described buses is mapped; enumeration is \
+         mapping the whole window and the laziness buys nothing"
+    );
+
+    // The highest described bus must still be reachable -- that is what the old
+    // fixed cap could not do. Nothing is expected to answer there; what matters
+    // is that the read lands on real mapped memory rather than faulting.
+    let far = pci::Address::new(last, 0, 0);
+    assert!(
+        pci::read_config_ecam(far, 0x00).is_some(),
+        "the highest described bus ({last}) is out of reach"
+    );
+    assert!(
+        pci::mapped_bus_count() > mapped,
+        "reaching the highest bus mapped nothing"
+    );
+
     for device in &devices {
         for capability in pci::extended_capabilities(device.address) {
             assert!(

@@ -30,10 +30,14 @@ use crate::acpi::IoApic;
 use crate::memory::paging;
 use crate::sync::Mutex;
 
-/// Where the first I/O APIC's registers are mapped.
+/// Where I/O APIC registers are mapped, one page apiece.
 ///
 /// Clear of the heap, the kernel stacks, the Local APIC window and user space.
 const IOAPIC_VIRT_BASE: u64 = 0x0000_7000_0000_0000;
+
+/// Chips this kernel will map. A machine with more than a handful is a machine
+/// with more sockets than this scheduler is built for.
+pub const MAX_IO_APICS: usize = 4;
 
 const REG_SELECT: u64 = 0x00;
 const REG_WINDOW: u64 = 0x10;
@@ -54,8 +58,12 @@ const FLAG_POLARITY_ACTIVE_LOW: u16 = 0b11;
 /// Bits 2-3: 3 means level triggered. 0 conforms, which for ISA means edge.
 const FLAG_TRIGGER_LEVEL: u16 = 0b11 << 2;
 
-/// Virtual address of the mapped registers, or zero before [`init`].
-static REGISTERS: AtomicU64 = AtomicU64::new(0);
+/// Virtual address of each mapped chip's registers, or zero for an unused slot.
+static REGISTERS: [AtomicU64; MAX_IO_APICS] = [const { AtomicU64::new(0) }; MAX_IO_APICS];
+
+/// Physical base of each mapped chip, so a repeat `init` recognises one it has
+/// already seen rather than consuming another slot.
+static PHYSICAL: [AtomicU64; MAX_IO_APICS] = [const { AtomicU64::new(0) }; MAX_IO_APICS];
 
 /// Serialises the two-step select-then-access sequence.
 ///
@@ -73,20 +81,30 @@ pub enum IoApicError {
     Mapping,
     /// The requested pin is beyond what the chip has.
     NoSuchPin,
+    /// More I/O APICs than this kernel will map.
+    TooMany,
 }
 
-/// Map the first I/O APIC's registers.
+/// Map one I/O APIC's registers, returning the slot it occupies.
+///
+/// Idempotent per chip: mapping one already mapped returns its existing slot
+/// rather than consuming another.
 ///
 /// # Safety
 ///
-/// `io_apic` must be an entry the firmware reported. Call once, from the boot
+/// `io_apic` must be an entry the firmware reported. Call from the boot
 /// processor, after paging is up.
-pub unsafe fn init(io_apic: IoApic) -> Result<(), IoApicError> {
-    if REGISTERS.load(Ordering::Acquire) != 0 {
-        return Ok(());
+pub unsafe fn init(io_apic: IoApic) -> Result<usize, IoApicError> {
+    if let Some(slot) = slot_of(io_apic) {
+        return Ok(slot);
     }
 
-    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(IOAPIC_VIRT_BASE));
+    let slot = (0..MAX_IO_APICS)
+        .find(|&index| REGISTERS[index].load(Ordering::Acquire) == 0)
+        .ok_or(IoApicError::TooMany)?;
+
+    let virtual_base = IOAPIC_VIRT_BASE + slot as u64 * 4096;
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virtual_base));
     let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(io_apic.address));
 
     // Uncached, and not executable. A cached mapping of a register window lets
@@ -104,12 +122,33 @@ pub unsafe fn init(io_apic: IoApic) -> Result<(), IoApicError> {
 
     // Offset within the page, so an I/O APIC not on a page boundary still works.
     let offset = io_apic.address & 0xFFF;
-    REGISTERS.store(IOAPIC_VIRT_BASE + offset, Ordering::Release);
-    Ok(())
+    PHYSICAL[slot].store(io_apic.address, Ordering::Relaxed);
+    REGISTERS[slot].store(virtual_base + offset, Ordering::Release);
+    Ok(slot)
+}
+
+/// The slot a chip already occupies, if it has been mapped.
+fn slot_of(io_apic: IoApic) -> Option<usize> {
+    (0..MAX_IO_APICS).find(|&index| {
+        REGISTERS[index].load(Ordering::Acquire) != 0
+            && PHYSICAL[index].load(Ordering::Relaxed) == io_apic.address
+    })
 }
 
 pub fn is_initialised() -> bool {
-    REGISTERS.load(Ordering::Acquire) != 0
+    REGISTERS[0].load(Ordering::Acquire) != 0
+}
+
+/// How many input pins a mapped chip has.
+///
+/// Only the chip knows: the MADT gives each one a starting global interrupt and
+/// no length, so without asking, a machine with two I/O APICs has no way to tell
+/// which owns a given interrupt.
+pub fn inputs_of(io_apic: IoApic) -> Option<u8> {
+    let slot = slot_of(io_apic)?;
+    let version = read_register(slot, REG_VERSION);
+    // Bits 23..16 hold the highest input, so the count is one more.
+    Some((((version >> 16) & 0xFF) as u8).saturating_add(1))
 }
 
 /// Whether serial input is arriving by interrupt rather than by polling.
@@ -133,9 +172,11 @@ pub fn serial_is_routed() -> bool {
 /// that was consumed long ago.
 pub fn route_serial(topology: &crate::acpi::Topology, apic_id: u8) -> Result<(), IoApicError> {
     let (gsi, flags) = topology.resolve_irq(crate::console::uart::COM1_IRQ);
-    let (_, pin) = topology.pin_for_gsi(gsi).ok_or(IoApicError::NoSuchPin)?;
+    let (chip, pin) = topology
+        .pin_for_gsi(gsi, inputs_of)
+        .ok_or(IoApicError::NoSuchPin)?;
 
-    route(pin, crate::arch::x86_64::apic::SERIAL_VECTOR, apic_id, flags)?;
+    route(chip, pin, crate::arch::x86_64::apic::SERIAL_VECTOR, apic_id, flags)?;
     crate::console::uart::enable_receive_interrupt();
     SERIAL_ROUTED.store(true, Ordering::Release);
 
@@ -146,25 +187,33 @@ pub fn route_serial(topology: &crate::acpi::Topology, apic_id: u8) -> Result<(),
     Ok(())
 }
 
-/// How many input pins this chip has.
+/// How many input pins the first chip has. Diagnostic, and used by tests.
 pub fn pin_count() -> u8 {
-    if !is_initialised() {
+    pin_count_of_slot(0)
+}
+
+fn pin_count_of_slot(slot: usize) -> u8 {
+    if slot >= MAX_IO_APICS || REGISTERS[slot].load(Ordering::Acquire) == 0 {
         return 0;
     }
-    let version = read_register(REG_VERSION);
+    let version = read_register(slot, REG_VERSION);
     // Bits 23..16 hold the highest input, so the count is one more.
     (((version >> 16) & 0xFF) as u8).saturating_add(1)
 }
 
-/// Route a pin to `vector` on `apic_id`, and unmask it.
+/// Route a pin on `chip` to `vector` on `apic_id`, and unmask it.
 ///
 /// `flags` is the MPS INTI word from the ACPI override, or zero for the ISA
 /// defaults of edge-triggered and active high.
-pub fn route(pin: u8, vector: u8, apic_id: u8, flags: u16) -> Result<(), IoApicError> {
-    if !is_initialised() {
-        return Err(IoApicError::NotPresent);
-    }
-    if pin >= pin_count() {
+pub fn route(
+    chip: IoApic,
+    pin: u8,
+    vector: u8,
+    apic_id: u8,
+    flags: u16,
+) -> Result<(), IoApicError> {
+    let slot = slot_of(chip).ok_or(IoApicError::NotPresent)?;
+    if pin >= pin_count_of_slot(slot) {
         return Err(IoApicError::NoSuchPin);
     }
 
@@ -180,11 +229,11 @@ pub fn route(pin: u8, vector: u8, apic_id: u8, flags: u16) -> Result<(), IoApicE
         entry |= ENTRY_LEVEL_TRIGGERED;
     }
 
-    write_entry(pin, entry);
+    write_entry(slot, pin, entry);
     Ok(())
 }
 
-/// Stop delivering a pin without forgetting how it was routed.
+/// Stop delivering a pin on the first chip without forgetting how it was routed.
 pub fn mask(pin: u8) -> Result<(), IoApicError> {
     if !is_initialised() {
         return Err(IoApicError::NotPresent);
@@ -193,28 +242,29 @@ pub fn mask(pin: u8) -> Result<(), IoApicError> {
     let _guard = ACCESS.lock();
     // SAFETY: initialised, so the window is mapped.
     unsafe {
-        let low = read_locked(index);
-        write_locked(index, low | ENTRY_MASKED as u32);
+        let low = read_locked(0, index);
+        write_locked(0, index, low | ENTRY_MASKED as u32);
     }
     Ok(())
 }
 
-/// Whether a pin is currently masked. Diagnostic, and used by tests.
+/// Whether a pin on the first chip is currently masked. Diagnostic, and used by
+/// tests.
 pub fn is_masked(pin: u8) -> Option<bool> {
     if !is_initialised() || pin >= pin_count() {
         return None;
     }
     let index = REDIRECTION_BASE + pin as u32 * 2;
-    Some(read_register(index) as u64 & ENTRY_MASKED != 0)
+    Some(read_register(0, index) as u64 & ENTRY_MASKED != 0)
 }
 
-/// The vector a pin currently delivers. Diagnostic, and used by tests.
+/// The vector a pin on the first chip delivers. Diagnostic, and used by tests.
 pub fn vector_of(pin: u8) -> Option<u8> {
     if !is_initialised() || pin >= pin_count() {
         return None;
     }
     let index = REDIRECTION_BASE + pin as u32 * 2;
-    Some((read_register(index) & 0xFF) as u8)
+    Some((read_register(0, index) & 0xFF) as u8)
 }
 
 /// Write both halves of a redirection entry.
@@ -223,28 +273,28 @@ pub fn vector_of(pin: u8) -> Option<u8> {
 /// the entry is never briefly live with a destination that has not been set --
 /// which on a machine with more than one processor is an interrupt delivered to
 /// whoever happens to be APIC id zero.
-fn write_entry(pin: u8, entry: u64) {
+fn write_entry(slot: usize, pin: u8, entry: u64) {
     let index = REDIRECTION_BASE + pin as u32 * 2;
     let _guard = ACCESS.lock();
-    // SAFETY: callers check `is_initialised`, so the window is mapped, and the
-    // lock makes the select-then-access pair atomic.
+    // SAFETY: the caller resolved `slot` from a mapped chip, and the lock makes
+    // the select-then-access pair atomic.
     unsafe {
-        write_locked(index + 1, (entry >> 32) as u32);
-        write_locked(index, entry as u32);
+        write_locked(slot, index + 1, (entry >> 32) as u32);
+        write_locked(slot, index, entry as u32);
     }
 }
 
-fn read_register(index: u32) -> u32 {
+fn read_register(slot: usize, index: u32) -> u32 {
     let _guard = ACCESS.lock();
     // SAFETY: as above.
-    unsafe { read_locked(index) }
+    unsafe { read_locked(slot, index) }
 }
 
 /// # Safety
 ///
-/// The register window must be mapped and `ACCESS` held.
-unsafe fn read_locked(index: u32) -> u32 {
-    let base = REGISTERS.load(Ordering::Acquire);
+/// `slot` must name a mapped chip, and `ACCESS` must be held.
+unsafe fn read_locked(slot: usize, index: u32) -> u32 {
+    let base = REGISTERS[slot].load(Ordering::Acquire);
     // SAFETY: forwarded from this function's contract. Both accesses are
     // volatile because the device, not the compiler, decides what they mean.
     unsafe {
@@ -256,8 +306,8 @@ unsafe fn read_locked(index: u32) -> u32 {
 /// # Safety
 ///
 /// As [`read_locked`].
-unsafe fn write_locked(index: u32, value: u32) {
-    let base = REGISTERS.load(Ordering::Acquire);
+unsafe fn write_locked(slot: usize, index: u32, value: u32) {
+    let base = REGISTERS[slot].load(Ordering::Acquire);
     // SAFETY: forwarded from this function's contract.
     unsafe {
         core::ptr::write_volatile((base + REG_SELECT) as *mut u32, index);

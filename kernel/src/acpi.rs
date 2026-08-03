@@ -83,19 +83,29 @@ impl Topology {
     }
 
     /// The I/O APIC owning a global interrupt, and the pin within it.
-    pub fn pin_for_gsi(&self, gsi: u32) -> Option<(IoApic, u8)> {
-        // No redirection-entry count is read from the chip here, so ownership is
-        // decided by base address alone: the last I/O APIC whose base is at or
-        // below the interrupt. With one I/O APIC -- every machine this runs on
-        // so far -- that is exact.
-        let owner = self
-            .io_apics
-            .iter()
-            .filter(|io_apic| io_apic.gsi_base <= gsi)
-            .max_by_key(|io_apic| io_apic.gsi_base)?;
-        u8::try_from(gsi - owner.gsi_base)
-            .ok()
-            .map(|pin| (*owner, pin))
+    ///
+    /// `inputs_of` is asked how many pins a chip has, which only the chip itself
+    /// knows -- the MADT gives each one a starting interrupt and no length.
+    /// Choosing by base address alone is exact with a single I/O APIC and wrong
+    /// the moment there are two: an interrupt past the end of the first chip's
+    /// pins would be attributed to it rather than to the next, and the
+    /// redirection entry would be written to a register that does not exist.
+    pub fn pin_for_gsi(
+        &self,
+        gsi: u32,
+        mut inputs_of: impl FnMut(IoApic) -> Option<u8>,
+    ) -> Option<(IoApic, u8)> {
+        for io_apic in &self.io_apics {
+            if gsi < io_apic.gsi_base {
+                continue;
+            }
+            let offset = gsi - io_apic.gsi_base;
+            let inputs = inputs_of(*io_apic)? as u32;
+            if offset < inputs {
+                return u8::try_from(offset).ok().map(|pin| (*io_apic, pin));
+            }
+        }
+        None
     }
 }
 

@@ -152,15 +152,30 @@ fn route_device_interrupts() {
     let Some(topology) = smp::topology() else {
         return;
     };
-    let Some(io_apic) = topology.io_apics.first().copied() else {
+    if topology.io_apics.is_empty() {
         crate::println!("warning: the firmware reported no I/O APIC; console input stays polled");
         return;
-    };
+    }
 
-    // SAFETY: the address came from the firmware's own MADT, and this runs once
-    // during boot with paging up.
-    if let Err(error) = unsafe { arch::x86_64::ioapic::init(io_apic) } {
-        crate::println!("warning: could not map the I/O APIC: {error:?}");
+    // Every chip, not just the first. Which one owns a given interrupt is
+    // decided by asking each how many inputs it has, and a chip that was never
+    // mapped cannot answer -- so on a machine with two, routing anything on the
+    // second would fail for want of a question nobody could ask.
+    let mut mapped = 0;
+    for io_apic in &topology.io_apics {
+        // SAFETY: the address came from the firmware's own MADT, and this runs
+        // once during boot with paging up.
+        match unsafe { arch::x86_64::ioapic::init(*io_apic) } {
+            Ok(_) => mapped += 1,
+            Err(error) => {
+                crate::println!(
+                    "warning: could not map the I/O APIC at {:#x}: {error:?}",
+                    io_apic.address
+                );
+            }
+        }
+    }
+    if mapped == 0 {
         return;
     }
 
@@ -198,17 +213,12 @@ fn map_pci_config(rsdp: u64) {
     // SAFETY: the region came from the firmware's own MCFG table, and this runs
     // once during boot with paging up.
     match unsafe { pci::init_ecam(region) } {
-        Ok(()) => {
-            // The mapped range, not the described one: firmware routinely
-            // claims all 256 buses and the window is clamped.
-            let (first, last) = pci::ecam_bus_range().unwrap_or((0, 0));
-            crate::println!(
-                "pci: extended config at {:#x}, buses {first}-{last} of {}-{}",
-                region.base,
-                region.start_bus,
-                region.end_bus
-            );
-        }
+        Ok(()) => crate::println!(
+            "pci: extended config at {:#x}, buses {}-{} (mapped on first use)",
+            region.base,
+            region.start_bus,
+            region.end_bus
+        ),
         Err(error) => {
             crate::println!("warning: could not map PCI extended config: {error:?}");
         }

@@ -90,7 +90,7 @@ fn write_pixel(x: usize, y: usize, colour: (u8, u8, u8)) {
 
 static COMPOSITOR_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static COMPOSITOR_TID: AtomicU64 = AtomicU64::new(0);
-static CLIENT_PARAMS: sync::Mutex<[u64; 9]> = sync::Mutex::new([0; 9]);
+static CLIENT_PARAMS: sync::Mutex<[u64; 10]> = sync::Mutex::new([0; 10]);
 
 fn compositor_thread() {
     let owner = sched::current_id().expect("no current thread");
@@ -162,6 +162,20 @@ fn present_at_depth(
     y: u64,
     z: u64,
 ) {
+    present_full(endpoint, compositor, colour, x, y, z, 0);
+}
+
+/// As `present_at_depth`, and if `move_to_x` is non-zero the client presents the
+/// same buffer again there.
+fn present_full(
+    endpoint: EndpointId,
+    compositor: ThreadId,
+    colour: u64,
+    x: u64,
+    y: u64,
+    z: u64,
+    move_to_x: u64,
+) {
     let depth = gbm::bytes_per_pixel() as u64;
     *CLIENT_PARAMS.lock() = [
         colour,
@@ -173,6 +187,7 @@ fn present_at_depth(
         compositor.0 as u64,
         depth,
         z,
+        move_to_x,
     ];
 
     let client = sync::without_interrupts(|| {
@@ -241,6 +256,43 @@ fn a_surface_lands_where_it_was_asked_to() {
         pixel_at(610, 545),
         (0x00, 0xFF, 0x00),
         "the blit ran past the bottom edge of the surface"
+    );
+}
+
+#[test_case]
+fn a_surface_that_moves_far_does_not_repaint_everything_between() {
+    let (endpoint, compositor) = start_compositor();
+
+    // A moving surface is the case where damage genuinely spans two distant
+    // regions: the hole it left and the place it went. Accumulating that into
+    // one bounding box means recomposing the whole span between them, which
+    // for a surface crossing the screen is the screen.
+    let from_x = 100;
+    let to_x = 700;
+
+    // A sentinel written straight into the screen, midway between the two
+    // positions and nowhere near either surface. It survives a region list and
+    // is cleared by a bounding box.
+    let sentinel = (0x5A, 0x6B, 0x7C);
+    write_pixel(400, 710, sentinel);
+    assert_eq!(pixel_at(400, 710), sentinel, "the sentinel did not take");
+
+    present_full(endpoint, compositor, 0x0000FF, from_x, 700, 0, to_x);
+
+    assert!(
+        spin_until(|| pixel_at(to_x as usize + 10, 710) == (0xFF, 0x00, 0x00)),
+        "the surface never arrived at its second position"
+    );
+    assert!(
+        spin_until(|| pixel_at(from_x as usize + 10, 710) != (0xFF, 0x00, 0x00)),
+        "the surface is still drawn where it used to be"
+    );
+
+    assert_eq!(
+        pixel_at(400, 710),
+        sentinel,
+        "a pixel midway between a surface's old and new positions was \
+         repainted; damage is one bounding box rather than a region list"
     );
 }
 

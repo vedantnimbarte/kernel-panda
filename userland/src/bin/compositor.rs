@@ -8,9 +8,10 @@
 //! * **Z-order.** Surfaces are kept in a table and composed back to front, so
 //!   what ends up on top is decided by the surface's depth rather than by which
 //!   client happened to send its message last.
-//! * **Damage.** Only the region that actually changed is recomposed and
-//!   copied out. A client updating a corner of the screen should not cost a
-//!   full-screen redraw, and at 1024x768x3 a full redraw is over two megabytes.
+//! * **Damage.** Only the regions that actually changed are recomposed and
+//!   copied out, tracked as a list rather than one bounding box. A client
+//!   updating a corner of the screen should not cost a full-screen redraw, and
+//!   at 1024x768x3 a full redraw is over two megabytes.
 //! * **Double buffering.** Composition happens in an off-screen buffer and
 //!   reaches the display in a single copy. Drawing surfaces straight into the
 //!   scanout means the display controller can read the screen halfway through
@@ -81,10 +82,7 @@ impl Rect {
         self.right <= self.left || self.bottom <= self.top
     }
 
-    /// The smallest rectangle containing both. Damage is accumulated this way
-    /// rather than as a list of regions: one rectangle is cheap to intersect
-    /// against and cannot grow without bound, and the cost of over-reporting is
-    /// redrawing a few pixels that did not need it.
+    /// The smallest rectangle containing both.
     fn union(self, other: Rect) -> Rect {
         if self.is_empty() {
             return other;
@@ -106,6 +104,129 @@ impl Rect {
             top: max(self.top, other.top),
             right: min(self.right, other.right),
             bottom: min(self.bottom, other.bottom),
+        }
+    }
+
+    fn overlaps(self, other: Rect) -> bool {
+        !self.intersect(other).is_empty()
+    }
+
+    fn area(self) -> u64 {
+        if self.is_empty() {
+            0
+        } else {
+            (self.right - self.left) * (self.bottom - self.top)
+        }
+    }
+}
+
+/// Damaged regions, kept apart rather than merged into one bounding box.
+///
+/// A single accumulated rectangle is simple and wrong in a specific way: a
+/// surface that moves across the screen damages where it was and where it went,
+/// and one rectangle covering both means recomposing everything in between. For
+/// a surface crossing the screen that is the screen.
+///
+/// A fixed array rather than a list, because there is no allocator here. When it
+/// is full, the two regions whose merged box wastes the least are combined --
+/// so it degrades toward the single-rectangle behaviour under pressure rather
+/// than failing.
+const MAX_DAMAGE: usize = 8;
+
+struct Damage {
+    regions: [Rect; MAX_DAMAGE],
+    count: usize,
+}
+
+impl Damage {
+    const fn new() -> Self {
+        Self {
+            regions: [Rect::EMPTY; MAX_DAMAGE],
+            count: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.count = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn add(&mut self, area: Rect) {
+        if area.is_empty() {
+            return;
+        }
+
+        // Merge into anything it already touches. Two overlapping regions would
+        // composite the shared part twice -- correct, but paid for twice.
+        for index in 0..self.count {
+            if self.regions[index].overlaps(area) {
+                self.regions[index] = self.regions[index].union(area);
+                self.coalesce(index);
+                return;
+            }
+        }
+
+        if self.count < MAX_DAMAGE {
+            self.regions[self.count] = area;
+            self.count += 1;
+            return;
+        }
+
+        // Full. Merge whichever pairing wastes the least -- the merged box
+        // minus the two areas it replaces -- so what gets joined is whatever
+        // was already close together.
+        let mut best = (0usize, 1usize);
+        let mut best_waste = u64::MAX;
+        for a in 0..self.count {
+            for b in (a + 1)..self.count {
+                let merged = self.regions[a].union(self.regions[b]);
+                let waste = merged
+                    .area()
+                    .saturating_sub(self.regions[a].area() + self.regions[b].area());
+                if waste < best_waste {
+                    best_waste = waste;
+                    best = (a, b);
+                }
+            }
+        }
+
+        let (a, b) = best;
+        self.regions[a] = self.regions[a].union(self.regions[b]);
+        self.regions[b] = self.regions[self.count - 1];
+        self.count -= 1;
+        self.regions[self.count] = area;
+        self.count += 1;
+    }
+
+    /// Absorb any other region the one at `index` now overlaps.
+    ///
+    /// Growing a region can make it touch a neighbour it did not before.
+    fn coalesce(&mut self, index: usize) {
+        let mut index = index;
+        let mut other = 0;
+        while other < self.count {
+            if other == index || !self.regions[index].overlaps(self.regions[other]) {
+                other += 1;
+                continue;
+            }
+
+            self.regions[index] = self.regions[index].union(self.regions[other]);
+
+            // Swap-remove `other`. If the region being grown was the one moved
+            // down to fill the gap, it now lives at `other` -- following the
+            // stale index would grow whatever landed there instead.
+            let last = self.count - 1;
+            self.regions[other] = self.regions[last];
+            self.count -= 1;
+            if index == last {
+                index = other;
+            }
+
+            // Start again: the union may now reach something already passed.
+            other = 0;
         }
     }
 }
@@ -132,7 +253,7 @@ struct Compositor {
     back_base: u64,
     screen: user::BufferInfo,
     surfaces: [Surface; MAX_SURFACES],
-    damage: Rect,
+    damage: Damage,
 }
 
 impl Compositor {
@@ -176,35 +297,49 @@ impl Compositor {
 
         let previous = self.surfaces[index];
         if previous.buffer != 0 {
-            self.damage = self.damage.union(bounds_of(&previous));
+            self.damage.add(bounds_of(&previous));
         }
-        self.damage = self.damage.union(bounds_of(&surface));
+        self.damage.add(bounds_of(&surface));
         self.surfaces[index] = surface;
     }
 
-    /// Recompose the damaged region and put it on the screen.
+    /// Recompose every damaged region and put them on the screen.
     fn compose(&mut self) {
-        let damage = self.damage.intersect(self.screen_rect());
-        self.damage = Rect::EMPTY;
-        if damage.is_empty() {
+        if self.damage.is_empty() {
             return;
         }
 
-        // Clear the damaged region first, so a surface that shrank or moved
-        // does not leave its old pixels behind.
-        self.clear(damage);
-
-        // Back to front. Composing in z order is the whole point: the surface
-        // nearest the viewer must be drawn last whatever order the messages
-        // arrived in.
+        let screen = self.screen_rect();
         let mut order = [0usize; MAX_SURFACES];
         let count = self.sorted_by_depth(&mut order);
-        for &index in order.iter().take(count) {
-            let surface = self.surfaces[index];
-            self.blit(&surface, damage);
-        }
 
-        self.flush(damage);
+        // Taken before composing: the regions are independent of each other, and
+        // iterating them while `self` is borrowed for the blits is what the
+        // borrow checker would otherwise object to.
+        let regions = self.damage.regions;
+        let region_count = self.damage.count;
+        self.damage.clear();
+
+        for region in regions.iter().take(region_count) {
+            let area = region.intersect(screen);
+            if area.is_empty() {
+                continue;
+            }
+
+            // Clear first, so a surface that shrank or moved does not leave its
+            // old pixels behind.
+            self.clear(area);
+
+            // Back to front. Composing in z order is the whole point: the
+            // surface nearest the viewer must be drawn last whatever order the
+            // messages arrived in.
+            for &index in order.iter().take(count) {
+                let surface = self.surfaces[index];
+                self.blit(&surface, area);
+            }
+
+            self.flush(area);
+        }
     }
 
     /// Indices of the live surfaces, lowest z first.
@@ -339,7 +474,7 @@ extern "C" fn main(endpoint: u64) {
         back_base: back_base as u64,
         screen,
         surfaces: [Surface::EMPTY; MAX_SURFACES],
-        damage: Rect::EMPTY,
+        damage: Damage::new(),
     };
 
     loop {

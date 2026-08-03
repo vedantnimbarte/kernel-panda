@@ -27,6 +27,12 @@ struct Parameters {
     /// Depth. Higher is nearer the viewer; the compositor composes back to
     /// front, so this and not arrival order decides what ends up on top.
     z: u64,
+    /// If non-zero, present the same buffer a second time at this x.
+    ///
+    /// A surface that moves is the case where damage genuinely spans two
+    /// distant regions -- the hole it left and the place it went. Every other
+    /// case damages one area at a time.
+    move_to_x: u64,
 }
 
 const TAG_PRESENT: u64 = 2;
@@ -61,6 +67,22 @@ extern "C" fn main(parameters: u64) {
         sender: 0,
     };
     user::ipc_send(parameters.endpoint, &message);
+
+    if parameters.move_to_x != 0 {
+        // Let the first frame land before asking for the second, so the
+        // compositor sees a surface that moved rather than one that arrived
+        // twice in the same batch.
+        for _ in 0..64 {
+            user::yield_now();
+        }
+
+        let moved = user::Message {
+            tag: TAG_PRESENT,
+            words: [buffer, parameters.move_to_x, parameters.y, parameters.z],
+            sender: 0,
+        };
+        user::ipc_send(parameters.endpoint, &moved);
+    }
 }
 
 /// Paint the buffer one flat colour.

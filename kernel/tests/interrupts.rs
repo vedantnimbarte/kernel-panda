@@ -149,7 +149,7 @@ fn serial_input_is_routed_through_the_io_apic() {
     let topology = panda_kernel::smp::topology().expect("ACPI reported nothing");
     let (gsi, _) = topology.resolve_irq(panda_kernel::console::uart::COM1_IRQ);
     let (_, pin) = topology
-        .pin_for_gsi(gsi)
+        .pin_for_gsi(gsi, ioapic::inputs_of)
         .expect("no I/O APIC owns the serial interrupt");
 
     assert!(
@@ -171,6 +171,54 @@ fn serial_input_is_routed_through_the_io_apic() {
 }
 
 #[test_case]
+fn pin_ownership_asks_the_chip_how_many_inputs_it_has() {
+    use panda_kernel::acpi::IoApic;
+    use panda_kernel::arch::x86_64::ioapic;
+
+    if !ioapic::is_initialised() {
+        return;
+    }
+
+    let topology = panda_kernel::smp::topology().expect("ACPI reported nothing");
+    let first = *topology.io_apics.first().expect("no I/O APIC reported");
+    let inputs = ioapic::inputs_of(first).expect("the chip did not report its inputs") as u32;
+    assert!(inputs > 0, "the chip reports no input pins");
+
+    // An interrupt past the end of this chip's pins belongs to no chip on a
+    // single-I/O-APIC machine. Deciding ownership by base address alone -- the
+    // obvious shortcut, since the MADT gives a starting interrupt and no length
+    // -- would attribute it to this one anyway, and the redirection entry would
+    // be written to a register that does not exist.
+    let past_the_end = first.gsi_base + inputs;
+    assert!(
+        topology.pin_for_gsi(past_the_end, ioapic::inputs_of).is_none(),
+        "interrupt {past_the_end} was attributed to a chip whose last input is \
+         {}; ownership is not consulting the chip",
+        first.gsi_base + inputs - 1
+    );
+
+    // The last pin it really does have must still resolve.
+    assert_eq!(
+        topology
+            .pin_for_gsi(first.gsi_base + inputs - 1, ioapic::inputs_of)
+            .map(|(_, pin)| pin as u32),
+        Some(inputs - 1),
+        "the chip's own last pin did not resolve to it"
+    );
+
+    // A chip the firmware never reported has nothing to say.
+    let imaginary = IoApic {
+        address: 0xDEAD_0000,
+        gsi_base: 0,
+    };
+    assert_eq!(
+        ioapic::inputs_of(imaginary),
+        None,
+        "an unmapped chip reported an input count"
+    );
+}
+
+#[test_case]
 fn an_unrouted_pin_stays_masked() {
     use panda_kernel::arch::x86_64::ioapic;
 
@@ -185,12 +233,12 @@ fn an_unrouted_pin_stays_masked() {
     let pins = ioapic::pin_count();
     assert!(pins > 0, "the I/O APIC reports no input pins");
 
-    let (gsi, _) = panda_kernel::smp::topology()
-        .expect("ACPI reported nothing")
-        .resolve_irq(panda_kernel::console::uart::COM1_IRQ);
+    let topology = panda_kernel::smp::topology().expect("ACPI reported nothing");
+    let (gsi, _) = topology.resolve_irq(panda_kernel::console::uart::COM1_IRQ);
+    let routed = topology.pin_for_gsi(gsi, ioapic::inputs_of).map(|(_, pin)| pin);
 
     for pin in 0..pins {
-        if pin as u32 == gsi {
+        if Some(pin) == routed {
             continue;
         }
         assert_eq!(
