@@ -272,13 +272,40 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**Run queues are per-CPU, and an idle core steals rather than idling.** A thread
+goes back on the queue of the processor that last ran it, so it tends to return
+to a core whose caches still know about it. Left there, that would be four
+independent schedulers with wildly different amounts of work — a core that
+emptied its own queue would run its idle thread next to another core's backlog —
+so a core with nothing of its own takes from the busiest queue instead.
+
+**The timer tick does not take the scheduler lock.** It runs on every core on
+every tick and asks two questions, both of which are almost always answered "no":
+has this slice expired, and is a sleeper due. Both now live in atomics outside
+the lock, so four cores no longer queue on one spinlock a hundred times a second
+for the privilege of subtracting one. The slice is advisory — the authoritative
+reset happens under the lock at the switch — so a lost race costs at most one
+early or late preemption, which round-robin cannot distinguish from a normal one.
+
+Reaping used to walk the entire thread table on every context switch, looking for
+the rare thread that had died. An exiting thread now records itself, so the walk
+is proportional to the number of threads that actually finished.
+
 **Three priorities, and a guard against the obvious consequence.** Strict
 priority starves: a `High` thread that never blocks means nothing below it runs
-again. Every eighth switch is therefore taken from the *lowest* occupied queue
-instead. It is not fair-share and does not pretend to be — it is the minimum that
-keeps "low priority" from meaning "never". Three levels rather than thirty-two,
-because scheduling policy belongs in Ring 3; what the kernel owes is enough
-separation for an input daemon to preempt a compute loop.
+again. Every eighth switch is therefore taken from somewhere other than the top.
+Three levels rather than thirty-two, because scheduling policy belongs in Ring 3;
+what the kernel owes is enough separation for an input daemon to preempt a
+compute loop.
+
+The first version of that guard served the *lowest* occupied queue, which reads
+as reasonable and quietly skips the middle: with `High` and `Low` both busy,
+every guarded turn went to `Low` and a `Normal` thread never ran again. The boot
+thread is `Normal`, so the kernel hung outright the moment anything saturated the
+other two levels — it woke from a sleep and was simply never picked. The guard
+alternates between `Low` and `Normal` instead, which bounds any level's wait at
+two guard intervals. `the_middle_priority_is_not_squeezed_out` saturates the
+outer two deliberately and requires an ordinary thread to still get in.
 
 The priority test spawns six threads at each level rather than one. With four
 cores and one thread of each, both simply get a core and the choice never
@@ -434,9 +461,11 @@ which only means the hang would be intermittent.
   timing is exactly where this class of code breaks.
 * `spin::Mutex` still has no priority awareness and no fairness — a contended
   lock is won by whichever core asks at the right moment.
-* The scheduler is one shared ready queue behind one lock. Correct, but every
-  core contends for it on every switch; per-CPU queues with work stealing would
-  scale further.
+* The thread table is still one lock. The timer tick no longer takes it and the
+  run queues are per-CPU, but a context *switch* does. Removing that means each
+  thread being owned by exactly one processor's queue, with migration
+  transferring ownership under both locks in index order — a real ownership model
+  rather than a data-structure change.
 * TLB shootdown flushes the whole TLB rather than one page, and does not wait for
   the other cores to acknowledge. Sufficient here because shootdowns only follow
   an unmap the sender has already completed, but a finer implementation would

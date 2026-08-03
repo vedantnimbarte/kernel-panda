@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::memory::frame;
-use panda_kernel::{allocator, arch::x86_64::halt_loop, sched, smp, testing, BOOTLOADER_CONFIG};
+use panda_kernel::{allocator, arch::x86_64::halt_loop, sched, smp, testing, time, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -59,6 +59,27 @@ fn every_processor_the_firmware_reported_came_up() {
         "{online} of {reported} processors started; an application processor \
          did not make it through the trampoline"
     );
+}
+
+#[test_case]
+fn the_timer_tick_does_not_take_the_scheduler_lock() {
+    // Not a direct observation -- there is no way to ask a spinlock how often it
+    // was taken. What can be checked is the consequence: with the decrement
+    // outside the lock, a core can take thousands of ticks' worth of scheduler
+    // work while the boot thread holds nothing, and the clock keeps moving.
+    // Before, every core queued on one lock a hundred times a second.
+    let start = time::ticks();
+    assert!(
+        spin_until(|| time::ticks() >= start + 5),
+        "the clock stopped while several cores were running"
+    );
+
+    for cpu in 0..smp::online_count() {
+        assert!(
+            time::cpu_ticks(cpu) > 0,
+            "processor {cpu} has taken no timer interrupts at all"
+        );
+    }
 }
 
 #[test_case]
@@ -100,6 +121,49 @@ fn work_reaches_more_than_one_processor() {
         spin_until(|| CPU_MASK.load(Ordering::Relaxed).count_ones() >= 2),
         "every thread ran on one processor; the ready queue is not being drained \
          by the others, so the extra cores are idle by accident"
+    );
+}
+
+static STEAL_DONE: AtomicUsize = AtomicUsize::new(0);
+static STEAL_CPUS: AtomicU64 = AtomicU64::new(0);
+
+fn short_burst() {
+    for _ in 0..200_000 {
+        STEAL_CPUS.fetch_or(1 << smp::cpu_index(), Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+    STEAL_DONE.fetch_add(1, Ordering::AcqRel);
+}
+
+#[test_case]
+fn an_idle_processor_steals_from_a_busy_one() {
+    if smp::online_count() < 2 {
+        return;
+    }
+
+    // Every one of these is filed on the queue of the core that spawns them --
+    // this one. Per-CPU queues without stealing would leave the other cores
+    // running their idle threads next to the whole backlog, and the batch would
+    // take as long as running it all here.
+    const BATCH: usize = 12;
+    STEAL_DONE.store(0, Ordering::Release);
+    STEAL_CPUS.store(0, Ordering::Release);
+
+    for _ in 0..BATCH {
+        sched::spawn("steal-me", short_burst).expect("spawn failed");
+    }
+
+    assert!(
+        spin_until(|| STEAL_DONE.load(Ordering::Acquire) >= BATCH),
+        "only {} of {BATCH} threads finished",
+        STEAL_DONE.load(Ordering::Acquire)
+    );
+
+    let cpus = STEAL_CPUS.load(Ordering::Acquire).count_ones();
+    assert!(
+        cpus >= 2,
+        "a batch of {BATCH} threads spawned on one core ran on {cpus} core(s); \
+         nothing is stealing, so the other processors sat idle next to the queue"
     );
 }
 

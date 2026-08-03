@@ -14,6 +14,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::ipc::{self, Rights};
@@ -168,10 +169,25 @@ fn quota_is_distinct_from_out_of_memory() {
     );
 }
 
+static CAP_TARGET_RELEASE: AtomicBool = AtomicBool::new(false);
+
+/// Stays alive until the test is finished with it.
+///
+/// A thread that simply returned would be reaped -- on another core, quite
+/// possibly before the grant loop is even over -- and `release_thread` takes its
+/// capabilities with it. The assertion would then be reading an empty table and
+/// blaming the grants for it.
+fn cap_target() {
+    while !CAP_TARGET_RELEASE.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
+}
+
 #[test_case]
 fn capabilities_per_thread_are_capped() {
     let endpoint = ipc::create(me(), 4).expect("create failed");
-    let target = sched::spawn("cap-target", || {}).expect("spawn failed");
+    CAP_TARGET_RELEASE.store(false, Ordering::Release);
+    let target = sched::spawn("cap-target", cap_target).expect("spawn failed");
 
     // Re-granting the same endpoint must not consume a new slot each time, or
     // the cap would be trivially reachable by a cooperating pair.
@@ -179,8 +195,12 @@ fn capabilities_per_thread_are_capped() {
         ipc::grant(me(), target, endpoint, Rights::SEND).expect("re-grant failed");
     }
 
+    let held = ipc::rights_of(target, endpoint);
+    CAP_TARGET_RELEASE.store(true, Ordering::Release);
+    sched::join(target);
+
     assert!(
-        ipc::rights_of(target, endpoint).contains(Rights::SEND),
+        held.contains(Rights::SEND),
         "the repeated grants lost the capability"
     );
 }

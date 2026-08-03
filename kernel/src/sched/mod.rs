@@ -12,9 +12,22 @@
 //!
 //! ## What is per-CPU and what is shared
 //!
-//! One ready queue, one lock, one thread table. Which thread is *running* is
-//! per-CPU, as is its remaining slice and its idle thread -- two processors
-//! cannot share an idle thread any more than they can share a stack.
+//! One lock and one thread table. Everything about *where* a thread runs is
+//! per-CPU: its ready queues, which thread is current, the remaining slice, the
+//! idle thread -- two processors cannot share an idle thread any more than they
+//! can share a stack.
+//!
+//! A thread goes back on the queue of the processor that last ran it, so it
+//! tends to return to a core whose caches still know about it. A core with
+//! nothing of its own to run steals from the busiest queue rather than idling
+//! next to a backlog, which is what keeps the split from turning into four
+//! independent schedulers with wildly different amounts of work.
+//!
+//! The timer handler is deliberately kept out of the lock. It runs on every core
+//! on every tick, and in the common case all it does is decrement a per-CPU
+//! atomic and compare a deadline -- it only takes the lock when a slice actually
+//! expires or a sleeper is actually due. Before that, every core queued on the
+//! same lock a hundred times a second for the privilege of subtracting one.
 //!
 //! The lock is released before the context switch, because holding a spinlock
 //! across one leaves it held by a thread that is no longer running. On a single
@@ -30,6 +43,7 @@ pub mod thread;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::smp::{cpu_index, MAX_CPUS};
 use crate::sync::{without_interrupts, IrqMutex};
@@ -51,6 +65,25 @@ const BOOT_THREAD: ThreadId = ThreadId(0);
 /// would let a tick land on the CPU already holding it.
 static SCHEDULER: IrqMutex<Option<Scheduler>> = IrqMutex::new(None);
 
+/// Ticks left in each processor's slice.
+///
+/// Outside the lock on purpose. Every core reaches the timer handler on every
+/// tick, and this is all the handler needs to know in the overwhelming majority
+/// of them; taking the scheduler lock to subtract one put four cores in a queue
+/// a hundred times a second for no reason. It is advisory -- the authoritative
+/// reset happens under the lock at the switch -- so a lost race costs at most one
+/// early or late preemption, which round-robin cannot tell from a normal one.
+static SLICE: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(TIME_SLICE_TICKS) }; MAX_CPUS];
+
+/// The earliest deadline any sleeper is waiting for, or `u64::MAX` when none.
+///
+/// Also outside the lock, and for the same reason: this is the other question
+/// the timer handler asks every core every tick. Only ever moved *earlier*
+/// without the lock (by a thread adding a sleeper), so a stale read is a read
+/// that is too late by a tick at worst, never one that misses a wake-up
+/// permanently.
+static NEXT_WAKE: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// What a context switch needs, decided under the lock and acted on after it is
 /// released.
 struct Switch {
@@ -65,41 +98,46 @@ struct Scheduler {
     /// been reaped; ids are never reused, so a stale id reads as `None` rather
     /// than silently addressing someone else.
     threads: Vec<Option<Box<Thread>>>,
-    /// Runnable threads, oldest first, one queue per priority. Idle threads are
+    /// Runnable threads, oldest first: one set of priority queues per processor.
+    ///
+    /// A thread is filed on the queue of the core that last ran it, so it tends
+    /// to come back to caches that still know about it. Idle threads are
     /// deliberately never in here -- they are each CPU's fallback, not
     /// participants.
-    ready: [VecDeque<ThreadId>; Priority::COUNT],
+    ready: [[VecDeque<ThreadId>; Priority::COUNT]; MAX_CPUS],
 
-    /// Switches served from the highest occupied queue since the last time the
-    /// lowest one got a turn.
+    /// Switches served strictly by priority since the last time a lower queue
+    /// was given a turn, per processor.
     ///
     /// Strict priority starves: a `High` thread that never blocks means nothing
     /// below it ever runs again. Every `STARVATION_GUARD` switches, the choice
-    /// deliberately comes from the *lowest* occupied queue instead. It is not a
-    /// fair-share scheduler and does not pretend to be -- it is the minimum that
-    /// keeps "low priority" from meaning "never".
-    priority_streak: u32,
+    /// deliberately comes from somewhere other than the top.
+    priority_streak: [u32; MAX_CPUS],
+
+    /// Which of the lower queues gets the next turn, per processor.
+    ///
+    /// Alternates rather than always picking the lowest. "Lowest occupied"
+    /// looks like the obvious answer and quietly skips the middle: with `High`
+    /// and `Low` both busy, every guarded turn went to `Low` and a `Normal`
+    /// thread never ran again. Alternating means each of the two is tried first
+    /// every other turn, so no level waits longer than `2 * STARVATION_GUARD`
+    /// switches.
+    ///
+    /// It is not a fair-share scheduler and does not pretend to be -- it is the
+    /// minimum that keeps a priority from meaning "never".
+    boost_level: [usize; MAX_CPUS],
 
     /// Sleeping threads and the tick each is due to wake on.
     ///
-    /// Unsorted, because it is scanned only when `next_wake` says something is
+    /// Unsorted, because it is scanned only when `NEXT_WAKE` says something is
     /// due, and it is short. A timer wheel would be the answer at a thousand
     /// sleepers; at a handful it would be machinery for its own sake.
     sleepers: Vec<(ThreadId, u64)>,
-
-    /// The earliest deadline in `sleepers`, or `u64::MAX` when none.
-    ///
-    /// This is the whole point of the design: the timer handler runs on every
-    /// core on every tick, and all it does in the common case is compare two
-    /// integers.
-    next_wake: u64,
 
     /// Which thread each processor is running.
     current: [Option<ThreadId>; MAX_CPUS],
     /// Each processor's fallback when nothing else is runnable.
     idle: [Option<ThreadId>; MAX_CPUS],
-    /// Ticks left in the current slice, per processor.
-    slice: [u32; MAX_CPUS],
     /// The thread this CPU most recently switched away from, cleared by the
     /// incoming context once the switch has actually completed.
     ///
@@ -125,6 +163,15 @@ struct Scheduler {
     /// Unboxing into the vector would move it.
     #[allow(clippy::vec_box)]
     graveyard: Vec<Box<Thread>>,
+
+    /// Threads that have set themselves `Finished` and are waiting to be freed.
+    ///
+    /// `reap` used to scan the whole thread table looking for them, on every
+    /// context switch, with the lock held. That is an O(threads) walk on the
+    /// hottest path in the kernel to find, almost always, nothing. Exits are
+    /// rare, so the exiting thread records itself here and reaping becomes
+    /// proportional to the number of threads that actually died.
+    finished: Vec<ThreadId>,
 }
 
 impl Scheduler {
@@ -154,15 +201,29 @@ impl Scheduler {
     /// live processor. Checking only this CPU's `current` was correct while
     /// there was only one CPU.
     fn reap(&mut self) {
-        for slot in self.threads.iter_mut() {
-            let finished = matches!(
-                slot.as_deref(),
+        if self.finished.is_empty() {
+            return;
+        }
+
+        let candidates = core::mem::take(&mut self.finished);
+        for id in candidates {
+            let ready_to_free = matches!(
+                self.thread_opt(id),
                 Some(t) if t.state == State::Finished && !t.on_cpu
             );
-            if finished {
-                if let Some(thread) = slot.take() {
-                    self.graveyard.push(thread);
+
+            if !ready_to_free {
+                // Still being switched away from. Put it back and look again
+                // next time; the CPU leaving its stack is a handful of
+                // instructions away.
+                if matches!(self.thread_opt(id), Some(t) if t.state == State::Finished) {
+                    self.finished.push(id);
                 }
+                continue;
+            }
+
+            if let Some(thread) = self.threads[id.0].take() {
+                self.graveyard.push(thread);
             }
         }
     }
@@ -174,34 +235,29 @@ impl Scheduler {
         core::mem::take(&mut self.graveyard)
     }
 
-    /// Put a runnable thread on the queue its priority names.
-    fn enqueue(&mut self, id: ThreadId) {
+    /// Put a runnable thread on `cpu`'s queue for its priority.
+    fn enqueue_on(&mut self, cpu: usize, id: ThreadId) {
         let level = self.thread(id).priority.index();
-        self.ready[level].push_back(id);
+        self.ready[cpu.min(MAX_CPUS - 1)][level].push_back(id);
     }
 
-    /// Take the next genuinely runnable thread, discarding entries for threads
-    /// that have since finished or been reaped.
+    /// Whether a queued id still names something worth running.
     ///
-    /// A queued thread that is still `on_cpu` is dropped rather than returned.
-    /// The invariant is that this cannot happen -- nothing enqueues a thread a
-    /// processor is standing on -- but if it ever did, running it would put two
-    /// CPUs on one stack. Dropping the entry is safe because `flush_pending`
-    /// enqueues the thread again when the switch away from it completes.
-    fn pop_runnable(&mut self) -> Option<ThreadId> {
-        // Normally highest first; every so often lowest first, so that a busy
-        // high-priority thread cannot lock everything below it out forever.
-        let starving = self.priority_streak >= STARVATION_GUARD;
-        let order: [usize; Priority::COUNT] = if starving { [0, 1, 2] } else { [2, 1, 0] };
+    /// A queued thread that is still `on_cpu` fails this and is discarded rather
+    /// than returned. The invariant is that this cannot happen -- nothing
+    /// enqueues a thread a processor is standing on -- but if it ever did,
+    /// running it would put two CPUs on one stack. Discarding is safe because
+    /// `flush_pending` enqueues the thread again when the switch completes.
+    fn is_runnable(&self, id: ThreadId) -> bool {
+        matches!(self.thread_opt(id), Some(t) if t.state == State::Ready && !t.on_cpu)
+    }
 
+    /// Take the next runnable thread from one processor's queues, trying the
+    /// priority levels in `order`.
+    fn pop_from(&mut self, cpu: usize, order: [usize; Priority::COUNT]) -> Option<ThreadId> {
         for level in order {
-            while let Some(id) = self.ready[level].pop_front() {
-                if matches!(self.thread_opt(id), Some(t) if t.state == State::Ready && !t.on_cpu) {
-                    self.priority_streak = if starving {
-                        0
-                    } else {
-                        self.priority_streak.saturating_add(1)
-                    };
+            while let Some(id) = self.ready[cpu][level].pop_front() {
+                if self.is_runnable(id) {
                     return Some(id);
                 }
             }
@@ -209,12 +265,70 @@ impl Scheduler {
         None
     }
 
+    /// Runnable threads waiting on one processor's queues.
+    ///
+    /// Counts entries, not verified threads: an id belonging to a thread that
+    /// has since finished inflates it slightly, and the only cost of that is
+    /// picking a marginally wrong victim to steal from.
+    fn queued_on(&self, cpu: usize) -> usize {
+        self.ready[cpu].iter().map(|queue| queue.len()).sum()
+    }
+
+    /// Take the next genuinely runnable thread for `cpu`: its own queues first,
+    /// then the busiest other processor's.
+    ///
+    /// Stealing is what keeps per-CPU queues from becoming four independent
+    /// schedulers. Without it a core that happens to have emptied its own queue
+    /// runs its idle thread next to another core's backlog, and the split makes
+    /// throughput worse rather than better.
+    fn pop_runnable(&mut self, cpu: usize) -> Option<ThreadId> {
+        let boosting = self.priority_streak[cpu] >= STARVATION_GUARD;
+
+        // Normally highest first. On a guarded turn the boosted level goes
+        // first, with the rest behind it so the CPU is never left idle because
+        // one queue happened to be empty.
+        let order: [usize; Priority::COUNT] = match (boosting, self.boost_level[cpu]) {
+            (false, _) => [2, 1, 0],
+            (true, 0) => [0, 1, 2],
+            (true, _) => [1, 0, 2],
+        };
+
+        let found = self.pop_from(cpu, order).or_else(|| {
+            // Steal from whoever has the most, so one busy core is drained
+            // rather than a queue of one being passed around.
+            let victim = (0..MAX_CPUS)
+                .filter(|&other| other != cpu)
+                .max_by_key(|&other| self.queued_on(other))
+                .filter(|&other| self.queued_on(other) > 0)?;
+            self.pop_from(victim, order)
+        })?;
+
+        if boosting {
+            self.priority_streak[cpu] = 0;
+            // Alternate, so `Low` and `Normal` take it in turns. Always picking
+            // the lowest occupied queue is what let the middle one starve.
+            self.boost_level[cpu] ^= 1;
+        } else {
+            self.priority_streak[cpu] = self.priority_streak[cpu].saturating_add(1);
+        }
+        Some(found)
+    }
+
     /// Make a blocked thread runnable again.
     ///
     /// Shared by every wake path -- IPC, a lapsed sleep, a thread being joined
     /// finishing -- because the `on_cpu` rule is easy to get right once and easy
     /// to forget everywhere else.
+    ///
+    /// The woken thread is filed on the queue of whichever processor is doing
+    /// the waking. That is usually the one it will talk to next, and a wrong
+    /// guess costs nothing: a core with an empty queue steals.
     fn wake(&mut self, id: ThreadId) {
+        let cpu = cpu_index();
+        self.wake_onto(cpu, id);
+    }
+
+    fn wake_onto(&mut self, cpu: usize, id: ThreadId) {
         let Some(thread) = self.threads.get_mut(id.0).and_then(|slot| slot.as_deref_mut()) else {
             return;
         };
@@ -231,12 +345,12 @@ impl Scheduler {
         // jump or a fault on a null rsp. `flush_pending` queues it once the
         // switch is genuinely done.
         if !thread.on_cpu {
-            self.enqueue(id);
+            self.enqueue_on(cpu, id);
         }
     }
 
-    /// Wake every sleeper whose deadline has passed, and recompute the next one.
-    fn wake_due_sleepers(&mut self, now: u64) {
+    /// Wake every sleeper whose deadline has passed, and republish the next one.
+    fn wake_due_sleepers(&mut self, cpu: usize, now: u64) {
         let mut due = Vec::new();
         let mut earliest = u64::MAX;
 
@@ -250,9 +364,14 @@ impl Scheduler {
             }
         });
 
-        self.next_wake = earliest;
+        // Only ever moved later from in here, and only with the lock held, so a
+        // sleeper added concurrently cannot have its earlier deadline erased --
+        // `sleep_ticks` publishes the minimum, and it took the lock to get on
+        // the list in the first place.
+        NEXT_WAKE.store(earliest, Ordering::Release);
+
         for id in due {
-            self.wake(id);
+            self.wake_onto(cpu, id);
         }
     }
 
@@ -272,8 +391,10 @@ impl Scheduler {
         thread.on_cpu = false;
         let state = thread.state;
 
+        // Back onto this processor's own queue: it just ran here, so this is the
+        // core whose caches still hold its working set.
         if state == State::Ready && !self.idle.contains(&Some(id)) {
-            self.enqueue(id);
+            self.enqueue_on(cpu, id);
         }
     }
 
@@ -281,13 +402,13 @@ impl Scheduler {
         let current = self.current[cpu]?;
         let idle = self.idle[cpu]?;
 
-        let next = match self.pop_runnable() {
+        let next = match self.pop_runnable(cpu) {
             Some(id) => id,
             None => {
                 // Nobody else wants the CPU. Keep running rather than bouncing
                 // to idle and straight back.
                 if current != idle && self.thread(current).state == State::Running {
-                    self.slice[cpu] = TIME_SLICE_TICKS;
+                    renew_slice(cpu);
                     return None;
                 }
                 idle
@@ -295,7 +416,7 @@ impl Scheduler {
         };
 
         if next == current {
-            self.slice[cpu] = TIME_SLICE_TICKS;
+            renew_slice(cpu);
             return None;
         }
 
@@ -324,7 +445,7 @@ impl Scheduler {
         let space = incoming.address_space;
 
         self.current[cpu] = Some(next);
-        self.slice[cpu] = TIME_SLICE_TICKS;
+        renew_slice(cpu);
 
         Some(Switch {
             save_to,
@@ -332,6 +453,13 @@ impl Scheduler {
             kernel_stack_top,
             space,
         })
+    }
+}
+
+/// Give a processor a fresh quantum.
+fn renew_slice(cpu: usize) {
+    if let Some(slice) = SLICE.get(cpu) {
+        slice.store(TIME_SLICE_TICKS, Ordering::Relaxed);
     }
 }
 
@@ -363,15 +491,15 @@ pub fn init() {
 
         let mut scheduler = Scheduler {
             threads: alloc::vec![Some(boot), Some(idle)],
-            ready: [const { VecDeque::new() }; Priority::COUNT],
-            priority_streak: 0,
+            ready: [const { [const { VecDeque::new() }; Priority::COUNT] }; MAX_CPUS],
+            priority_streak: [0; MAX_CPUS],
+            boost_level: [0; MAX_CPUS],
             sleepers: Vec::new(),
-            next_wake: u64::MAX,
             current: [None; MAX_CPUS],
             idle: [None; MAX_CPUS],
-            slice: [TIME_SLICE_TICKS; MAX_CPUS],
             pending: [None; MAX_CPUS],
             graveyard: Vec::new(),
+            finished: Vec::new(),
         };
         scheduler.current[0] = Some(BOOT_THREAD);
         scheduler.idle[0] = Some(ThreadId(1));
@@ -395,7 +523,7 @@ pub fn adopt_secondary_cpu() {
         scheduler.threads.push(Some(idle));
         scheduler.idle[cpu] = Some(id);
         scheduler.current[cpu] = Some(id);
-        scheduler.slice[cpu] = TIME_SLICE_TICKS;
+        renew_slice(cpu);
     });
 }
 
@@ -416,7 +544,10 @@ pub fn spawn_with_priority(
         let thread = Box::new(Thread::new(id, name, entry, priority, trampoline));
 
         scheduler.threads.push(Some(thread));
-        scheduler.enqueue(id);
+        // On the spawner's queue. A new thread has no cache footprint anywhere
+        // yet, and the core that made it is as good a guess as any -- an idle
+        // core will steal it within a switch if this one is busy.
+        scheduler.enqueue_on(cpu_index(), id);
         id
     })
 }
@@ -542,7 +673,11 @@ pub fn sleep_ticks(ticks: u64) {
         let deadline = crate::time::ticks().saturating_add(ticks);
         scheduler.thread_mut(id).state = State::Blocked;
         scheduler.sleepers.push((id, deadline));
-        scheduler.next_wake = scheduler.next_wake.min(deadline);
+
+        // Published under the lock, so it cannot race with the recomputation in
+        // `wake_due_sleepers`. Only ever moved earlier here: an existing sooner
+        // deadline must not be pushed back.
+        NEXT_WAKE.fetch_min(deadline, Ordering::AcqRel);
         true
     })
     .unwrap_or(false);
@@ -618,6 +753,10 @@ pub fn exit_current() -> ! {
 
     with(|scheduler| {
         scheduler.thread_mut(id).state = State::Finished;
+        // Recorded rather than searched for. `reap` runs on every switch, and
+        // scanning the whole thread table each time to find the rare thread
+        // that has died is the wrong shape entirely.
+        scheduler.finished.push(id);
 
         // Take the list before waking anyone: this thread is about to be
         // reaped, and the list goes with it. Waking under the same lock that
@@ -638,27 +777,30 @@ pub fn exit_current() -> ! {
 /// Called from the timer interrupt. Charges this CPU's thread a tick and
 /// preempts it when its slice runs out.
 pub fn on_timer_tick() {
-    let expired = {
-        let cpu = cpu_index();
-        let now = crate::time::ticks();
-        let mut guard = SCHEDULER.lock();
-        match guard.as_mut() {
-            Some(scheduler) => {
-                // One comparison in the common case. Every core runs this on
-                // every tick, so the sleeper list is only walked when something
-                // in it is actually due.
-                if now >= scheduler.next_wake {
-                    scheduler.wake_due_sleepers(now);
-                }
+    let cpu = cpu_index();
+    let now = crate::time::ticks();
 
-                scheduler.slice[cpu] = scheduler.slice[cpu].saturating_sub(1);
-                scheduler.slice[cpu] == 0
-            }
-            None => false,
-        }
+    // Neither of these touches the scheduler lock. This runs on every core on
+    // every tick, and both answers are almost always "no" -- queueing four cores
+    // on one lock a hundred times a second to find that out was the single
+    // busiest thing the scheduler did.
+    let sleeper_due = now >= NEXT_WAKE.load(Ordering::Acquire);
+    let slice_expired = match SLICE.get(cpu) {
+        // A saturating update rather than a decrement, so a slice already at
+        // zero is not wrapped by ticks arriving while a switch is in flight.
+        Some(slice) => slice
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                Some(left.saturating_sub(1))
+            })
+            .is_ok_and(|previous| previous <= 1),
+        None => false,
     };
 
-    if expired {
+    if sleeper_due {
+        with(|scheduler| scheduler.wake_due_sleepers(cpu, now));
+    }
+
+    if slice_expired {
         schedule();
     }
 }

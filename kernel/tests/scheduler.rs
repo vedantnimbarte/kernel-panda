@@ -358,6 +358,60 @@ fn a_high_priority_thread_runs_more_often_than_a_low_one() {
     );
 }
 
+static MIDDLE_RAN: AtomicBool = AtomicBool::new(false);
+
+fn middle_priority_probe() {
+    MIDDLE_RAN.store(true, Ordering::Release);
+}
+
+#[test_case]
+fn the_middle_priority_is_not_squeezed_out() {
+    // The obvious anti-starvation rule -- every so often, serve the lowest
+    // occupied queue -- skips the middle entirely. With High and Low both busy,
+    // every guarded turn goes to Low and a Normal thread never runs again.
+    //
+    // It is not a subtle failure once it happens: the boot thread is Normal, so
+    // a kernel with this bug hangs the moment something saturates the other two
+    // levels. This case saturates them deliberately and asks whether an
+    // ordinary thread can still get in.
+    HIGH_RUNS.store(0, Ordering::Relaxed);
+    LOW_RUNS.store(0, Ordering::Relaxed);
+    MIDDLE_RAN.store(false, Ordering::Release);
+    PRIORITY_STOP.store(false, Ordering::Release);
+
+    const EACH: usize = 6;
+    let mut busy = [sched::ThreadId(0); EACH * 2];
+    for slot in busy.iter_mut().take(EACH) {
+        *slot = sched::spawn_with_priority("squeeze-high", high_priority_loop, sched::Priority::High)
+            .expect("spawn failed");
+    }
+    for slot in busy.iter_mut().skip(EACH) {
+        *slot = sched::spawn_with_priority("squeeze-low", low_priority_loop, sched::Priority::Low)
+            .expect("spawn failed");
+    }
+
+    let middle = sched::spawn_with_priority(
+        "squeezed",
+        middle_priority_probe,
+        sched::Priority::Normal,
+    )
+    .expect("spawn failed");
+
+    let ran = spin_until(|| MIDDLE_RAN.load(Ordering::Acquire));
+
+    PRIORITY_STOP.store(true, Ordering::Release);
+    for thread in busy {
+        sched::join(thread);
+    }
+    sched::join(middle);
+
+    assert!(
+        ran,
+        "a Normal thread never got the CPU while High and Low were both busy; \
+         the starvation guard is skipping the level between them"
+    );
+}
+
 #[test_case]
 fn finished_threads_are_reaped() {
     // Let anything left over from earlier cases drain first, so the baseline is
