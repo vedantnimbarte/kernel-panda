@@ -843,6 +843,63 @@ impl FileSystem {
     }
 }
 
+/// The filesystem the rest of the kernel talks to.
+///
+/// One, because there is no mount table yet: a second disk is visible as a
+/// block device and nothing above knows how to name it.
+static ROOT: crate::sync::Mutex<Option<Arc<FileSystem>>> = crate::sync::Mutex::new(None);
+
+/// Find a filesystem on the attached disks and mount it.
+///
+/// Deliberately does not format anything it fails to recognise. A kernel that
+/// formats an unrecognised disk destroys whatever was on it -- and "I did not
+/// recognise it" covers a disk written by a newer version of this very
+/// filesystem.
+pub fn mount_root() {
+    for index in 0..crate::block::count() {
+        let Some(disk) = crate::block::device(index) else {
+            continue;
+        };
+
+        // Whole-device first, then each partition. A disk formatted directly is
+        // what the tests produce; a partitioned one is what a real install
+        // looks like.
+        let mut candidates: alloc::vec::Vec<Arc<dyn BlockDevice>> = alloc::vec![disk.clone()];
+        if let Ok(partitions) = crate::block::partition::read(&*disk) {
+            for entry in partitions {
+                if let Ok(view) = crate::block::partition::PartitionDevice::new(disk.clone(), &entry)
+                {
+                    candidates.push(Arc::new(view));
+                }
+            }
+        }
+
+        for candidate in candidates {
+            let Ok(fs) = FileSystem::mount(candidate) else {
+                continue;
+            };
+            crate::println!(
+                "fs: mounted on disk {index}, {} free blocks",
+                fs.free_blocks()
+            );
+            crate::sync::without_interrupts(|| {
+                *ROOT.lock() = Some(Arc::new(fs));
+            });
+            return;
+        }
+    }
+}
+
+/// The mounted filesystem, if there is one.
+pub fn root() -> Option<Arc<FileSystem>> {
+    crate::sync::without_interrupts(|| ROOT.lock().clone())
+}
+
+/// Mount a filesystem the caller has already opened. Test support.
+pub fn set_root(fs: Arc<FileSystem>) {
+    crate::sync::without_interrupts(|| *ROOT.lock() = Some(fs));
+}
+
 /// Split a path into its parent and final component.
 fn split_path(path: &str) -> Result<(&str, &str), FsError> {
     let trimmed = path.trim_end_matches('/');

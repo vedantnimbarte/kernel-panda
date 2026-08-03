@@ -128,6 +128,12 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // SAFETY: called once, during boot, with PCI and paging up.
     unsafe { block::init() };
 
+    // And mount whatever is on it. Nothing is formatted here: a kernel that
+    // formats a disk it does not recognise destroys whatever was on it, and
+    // "did not recognise it" covers a disk written by a newer version of this
+    // very filesystem.
+    fs::mount_root();
+
     // Other processors last of all: they need the APIC calibrated, the heap for
     // their stacks, and the scheduler ready to adopt them.
     //

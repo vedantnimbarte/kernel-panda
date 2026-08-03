@@ -356,6 +356,88 @@ fn a_commit_advances_the_generation() {
     assert!(fs.generation() > second, "writing a file did not commit");
 }
 
+// --- the Ring 3 surface ------------------------------------------------------
+
+static PROBE_RESULT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn file_probe_thread() {
+    use panda_kernel::{sched, userspace};
+
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_probe(owner, userspace::probe::FILES, 0)
+        .expect("failed to load the probe");
+    // SAFETY: load_probe mapped the entry user-executable, the stack
+    // user-writable, and filled in the parameter page.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
+}
+
+#[test_case]
+fn a_ring3_process_can_use_the_filesystem() {
+    use panda_kernel::sched;
+
+    // A filesystem the kernel can reach and user space cannot is half a
+    // filesystem. This drives the whole surface -- create, write, read back,
+    // stat, mkdir, list, remove -- from Ring 3, through validated pointers and
+    // the SMAP window.
+    let (_, fs) = fresh();
+    panda_kernel::fs::set_root(Arc::new(fs));
+
+    PROBE_RESULT.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    let thread = sched::spawn("file-probe", file_probe_thread).expect("spawn failed");
+
+    for _ in 0..2_000_000_000u64 {
+        if !sched::is_alive(thread) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    assert!(!sched::is_alive(thread), "the probe never finished");
+
+    // What the probe left behind is the evidence: the directory it made
+    // survives, and the file it removed is gone.
+    let fs = panda_kernel::fs::root().expect("the filesystem was unmounted");
+    let names = fs.list("/").expect("could not list the root");
+    assert!(
+        names.iter().any(|name| name == "ring3-dir"),
+        "the directory the Ring 3 process created is not there; it has {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "ring3-probe"),
+        "the file the Ring 3 process removed is still there"
+    );
+}
+
+#[test_case]
+fn a_bad_path_from_ring3_is_refused() {
+    // Every argument here is attacker-controlled. A pointer outside the
+    // caller's own mappings has to be rejected before the kernel dereferences
+    // it, and a length it cannot back up has to be rejected before the kernel
+    // copies it.
+    use panda_kernel::syscall::Error;
+
+    let (_, fs) = fresh();
+    panda_kernel::fs::set_root(Arc::new(fs));
+
+    // These go through the same validation the syscall entry uses. A kernel
+    // address is not a user address however plausible it looks.
+    assert!(!panda_kernel::userspace::validate_user_buffer(
+        panda_kernel::memory::heap::HEAP_START as u64,
+        16,
+        false
+    ));
+
+    // And the error mapping does not leak what the disk is doing: a device
+    // fault and a corrupt structure both report the same thing.
+    assert_eq!(Error::from(FsError::NotFound), Error::NotFound);
+    assert_eq!(Error::from(FsError::Exists), Error::AlreadyExists);
+    assert_eq!(Error::from(FsError::Corrupt), Error::NoFileSystem);
+    assert_eq!(
+        Error::from(FsError::Device(panda_kernel::block::BlockError::DeviceFault)),
+        Error::NoFileSystem
+    );
+}
+
 #[test_case]
 fn the_allocator_never_hands_out_metadata() {
     // A filesystem whose allocator can return the superblock or the bitmap will

@@ -25,6 +25,12 @@ pub mod nr {
     pub const BUF_INFO: u64 = 11;
     pub const BUF_SCANOUT: u64 = 12;
     pub const READ: u64 = 13;
+    pub const FILE_READ: u64 = 14;
+    pub const FILE_WRITE: u64 = 15;
+    pub const FILE_CREATE: u64 = 16;
+    pub const FILE_REMOVE: u64 = 17;
+    pub const FILE_STAT: u64 = 18;
+    pub const FILE_LIST: u64 = 19;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -66,6 +72,30 @@ pub fn syscall(number: u64, a: u64, b: u64, c: u64) -> i64 {
             in("rdi") a,
             in("rsi") b,
             in("rdx") c,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// As [`syscall`], with a fourth argument.
+///
+/// R10 rather than RCX, matching the kernel's table. The Linux convention this
+/// borrows from uses R10 for the fourth argument because `syscall` clobbers RCX
+/// -- entry here is `int 0x80`, which does not, but keeping the register
+/// assignment means the ABI does not have to change if the mechanism ever does.
+#[inline(always)]
+pub fn syscall4(number: u64, a: u64, b: u64, c: u64, d: u64) -> i64 {
+    let result: i64;
+    // SAFETY: as `syscall`; the kernel restores every register but RAX.
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") number => result,
+            in("rdi") a,
+            in("rsi") b,
+            in("rdx") c,
+            in("r10") d,
             options(nostack),
         );
     }
@@ -120,6 +150,63 @@ pub fn buffer_info(buffer: u64, info: &mut BufferInfo) -> i64 {
 
 pub fn scanout() -> i64 {
     syscall(nr::BUF_SCANOUT, 0, 0, 0)
+}
+
+// --- files -------------------------------------------------------------------
+
+/// Read a whole file into `buffer`. Returns the bytes read.
+pub fn file_read(path: &str, buffer: &mut [u8]) -> i64 {
+    syscall4(
+        nr::FILE_READ,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        buffer.as_mut_ptr() as u64,
+        buffer.len() as u64,
+    )
+}
+
+/// Replace a file's contents.
+pub fn file_write(path: &str, data: &[u8]) -> i64 {
+    syscall4(
+        nr::FILE_WRITE,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        data.as_ptr() as u64,
+        data.len() as u64,
+    )
+}
+
+pub fn file_create(path: &str) -> i64 {
+    syscall(nr::FILE_CREATE, path.as_ptr() as u64, path.len() as u64, 0)
+}
+
+pub fn dir_create(path: &str) -> i64 {
+    syscall(nr::FILE_CREATE, path.as_ptr() as u64, path.len() as u64, 1)
+}
+
+pub fn file_remove(path: &str) -> i64 {
+    syscall(nr::FILE_REMOVE, path.as_ptr() as u64, path.len() as u64, 0)
+}
+
+/// Size into `size`; returns 1 for a directory, 0 for a file.
+pub fn file_stat(path: &str, size: &mut u64) -> i64 {
+    syscall(
+        nr::FILE_STAT,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        size as *mut u64 as u64,
+    )
+}
+
+/// Newline-separated names into `buffer`. Returns the bytes written.
+pub fn dir_list(path: &str, buffer: &mut [u8]) -> i64 {
+    syscall4(
+        nr::FILE_LIST,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        buffer.as_mut_ptr() as u64,
+        buffer.len() as u64,
+    )
 }
 
 /// Write a decimal number to the console.

@@ -178,6 +178,7 @@ pub mod probe {
     pub const TRESPASS: u64 = 1;
     pub const IPC: u64 = 2;
     pub const PEEK: u64 = 3;
+    pub const FILES: u64 = 4;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

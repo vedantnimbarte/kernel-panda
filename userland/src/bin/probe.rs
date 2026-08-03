@@ -16,6 +16,7 @@ pub const MODE_DEMO: u64 = 0;
 pub const MODE_TRESPASS: u64 = 1;
 pub const MODE_IPC: u64 = 2;
 pub const MODE_PEEK: u64 = 3;
+pub const MODE_FILES: u64 = 4;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -56,6 +57,54 @@ extern "C" fn main(parameters: u64) {
             user::write("  [ring 3] READ ANOTHER ADDRESS SPACE -- isolation broken: ");
             user::write_number(value);
             user::write("\n");
+        }
+
+        // The whole file surface from Ring 3, exercised in one pass. Exits with
+        // a code naming the step that failed, so a kernel-side test can say
+        // which call broke rather than only that something did.
+        MODE_FILES => {
+            const PATH: &str = "/ring3-probe";
+            const PAYLOAD: &[u8] = b"written from user space";
+
+            if user::file_create(PATH) < 0 {
+                user::exit(1);
+            }
+            if user::file_write(PATH, PAYLOAD) < 0 {
+                user::exit(2);
+            }
+
+            let mut buffer = [0u8; 64];
+            let read = user::file_read(PATH, &mut buffer);
+            if read != PAYLOAD.len() as i64 {
+                user::exit(3);
+            }
+            if &buffer[..PAYLOAD.len()] != PAYLOAD {
+                user::exit(4);
+            }
+
+            let mut size = 0u64;
+            if user::file_stat(PATH, &mut size) != 0 || size != PAYLOAD.len() as u64 {
+                user::exit(5);
+            }
+
+            if user::dir_create("/ring3-dir") < 0 {
+                user::exit(6);
+            }
+            let mut listing = [0u8; 256];
+            if user::dir_list("/", &mut listing) <= 0 {
+                user::exit(7);
+            }
+
+            if user::file_remove(PATH) < 0 {
+                user::exit(8);
+            }
+            // Gone means gone: reading it again has to fail.
+            if user::file_read(PATH, &mut buffer) >= 0 {
+                user::exit(9);
+            }
+
+            user::write("  [ring 3] files: created, wrote, read back, removed\n");
+            user::exit(0);
         }
 
         MODE_IPC => {
