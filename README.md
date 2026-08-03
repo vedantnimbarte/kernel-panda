@@ -272,6 +272,24 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**PCI configuration space is reached by memory when the firmware describes a
+window.** The port mechanism latches an address in `0xCF8` and reads `0xCFC`,
+which works everywhere and reaches only the first 256 bytes of each function —
+its selector has nowhere to put a wider offset. Everything PCI Express added
+lives above that: MSI-X, AER, link control. ECAM makes bus, device and function
+into address bits of a window named by the ACPI MCFG table, so there is no
+latch, no pair of accesses to keep together, no lock, and 4 KiB per function.
+
+The two are views of the same registers, so they must agree about the low 256
+bytes. `both_views_of_configuration_space_agree` checks that rather than
+assuming it — if MCFG describes a window somewhere other than where the firmware
+actually put it, every extended read afterwards lands on unrelated physical
+memory, which is far worse than having no ECAM at all.
+
+The test harness runs QEMU as `-machine q35`. The default i440FX is a 1996
+chipset with no PCI Express, so it publishes no MCFG and every extended-config
+path would go untested.
+
 **Serial input arrives by interrupt, not by polling.** It was drained from the
 timer handler before, which capped throughput at the tick rate and made a
 keystroke wait up to a full quantum to be noticed. That was not laziness:
@@ -543,8 +561,11 @@ which only means the hang would be intermittent.
   something Rust will express, and it is the right tool for that one job.
 * The compositor has no damage tracking, no double buffering and no z-order. It
   blits each surface once, as it arrives.
-* PCI uses the port-based config mechanism, so extended config space above
-  offset 0xFF is unreachable. Getting there means parsing the ACPI MCFG table.
+* The ECAM window is clamped to the first 64 buses. Firmware routinely describes
+  all 256 whether or not anything is on them, and mapping that eagerly is 65,536
+  page-table entries at boot for buses that will never answer. A device beyond
+  the cap still works through the port mechanism; only its extended
+  configuration space is out of reach.
 * The I/O APIC decides which pin owns a global interrupt by base address alone;
   it does not read each chip's redirection-entry count. Exact with one I/O APIC,
   which is every machine this has run on, and wrong on a machine with two whose

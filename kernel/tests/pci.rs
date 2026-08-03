@@ -40,6 +40,67 @@ fn the_bus_has_devices_on_it() {
 }
 
 #[test_case]
+fn both_views_of_configuration_space_agree() {
+    // ECAM and the configuration ports are two windows onto the same registers,
+    // so they must agree about the low 256 bytes. If they do not, the MCFG table
+    // describes a window somewhere other than where the firmware actually put
+    // it -- and every extended read after that is of unrelated physical memory,
+    // which is a much worse failure than having no ECAM at all.
+    match pci::both_mechanisms_agree() {
+        None => panda_kernel::serial_println!("  (skipped: no ECAM on this machine)"),
+        Some(agreed) => assert!(
+            agreed,
+            "the memory-mapped and port-based views of configuration space \
+             disagree; the ECAM window is not where MCFG says it is"
+        ),
+    }
+}
+
+#[test_case]
+fn extended_configuration_space_is_reachable() {
+    if !pci::ecam_available() {
+        panda_kernel::serial_println!("  (skipped: no ECAM on this machine)");
+        return;
+    }
+
+    assert_eq!(
+        pci::config_limit(),
+        pci::EXTENDED_CONFIG_LIMIT,
+        "ECAM is mapped but the kernel still thinks it is limited to 256 bytes"
+    );
+
+    // Every PCI Express function has at least one extended capability, and
+    // conventional PCI devices behind a bridge have none. Requiring that *some*
+    // device on the bus has one proves the reads above 0xFF are landing on real
+    // registers rather than returning the all-ones of an unmapped read.
+    let devices = pci::enumerate();
+    let with_capabilities = devices
+        .iter()
+        .filter(|device| !pci::extended_capabilities(device.address).is_empty())
+        .count();
+
+    panda_kernel::serial_println!(
+        "  ({with_capabilities} of {} devices expose extended capabilities)",
+        devices.len()
+    );
+
+    for device in &devices {
+        for capability in pci::extended_capabilities(device.address) {
+            assert!(
+                capability.offset >= 0x100 && capability.offset < pci::EXTENDED_CONFIG_LIMIT,
+                "an extended capability was reported at {:#x}, outside extended \
+                 configuration space",
+                capability.offset
+            );
+            assert_ne!(
+                capability.id, 0xFFFF,
+                "a capability id of all-ones means the read did not reach a device"
+            );
+        }
+    }
+}
+
+#[test_case]
 fn there_is_a_host_bridge_at_the_root() {
     let devices = pci::enumerate();
     let root = devices

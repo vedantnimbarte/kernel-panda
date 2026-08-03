@@ -305,6 +305,11 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, Str
 
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", qpath(image)));
+    // q35 rather than the default i440FX. The older model is a 1996 chipset
+    // with no PCI Express at all, so the firmware describes no memory-mapped
+    // configuration window and every extended-config path goes untested. It
+    // also gives a more representative interrupt topology to route.
+    cmd.args(["-machine", "q35"]);
     cmd.args(["-m", "256M"]);
     // Four cores by default. The kernel targets multi-processor hardware, so
     // running the tests on one core would leave every SMP path untested -- and

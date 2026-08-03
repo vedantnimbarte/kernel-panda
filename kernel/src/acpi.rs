@@ -25,6 +25,9 @@ pub enum AcpiError {
     Corrupt,
     /// The tables are valid but contain no MADT.
     NoMadt,
+    /// The tables are valid but do not contain the one asked for. Not an error
+    /// in itself: MCFG is absent on anything predating PCI Express.
+    NoSuchTable,
 }
 
 /// One I/O APIC, and where in the global interrupt space its inputs start.
@@ -279,6 +282,147 @@ fn parse_madt(madt: &[u8]) -> Topology {
         io_apics,
         overrides,
     }
+}
+
+/// One PCI segment's memory-mapped configuration window, from the MCFG table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EcamRegion {
+    /// Physical base of the window.
+    pub base: u64,
+    /// PCI segment group. Almost always zero; a machine with more than one is
+    /// large enough that nothing here would run on it.
+    pub segment: u16,
+    pub start_bus: u8,
+    pub end_bus: u8,
+}
+
+impl EcamRegion {
+    /// Physical address of a device's configuration space.
+    ///
+    /// The layout is fixed by the PCI Express specification: bus, device and
+    /// function are simply address bits, which is the whole appeal -- no latch,
+    /// no pair of port accesses to keep together, and 4 KiB per function
+    /// instead of 256 bytes.
+    pub fn address_of(&self, bus: u8, device: u8, function: u8) -> Option<u64> {
+        if bus < self.start_bus || bus > self.end_bus || device >= 32 || function >= 8 {
+            return None;
+        }
+        let bus_offset = (bus - self.start_bus) as u64;
+        Some(
+            self.base
+                + (bus_offset << 20)
+                + ((device as u64) << 15)
+                + ((function as u64) << 12),
+        )
+    }
+
+    /// Bytes the whole window spans.
+    pub fn length(&self) -> u64 {
+        ((self.end_bus - self.start_bus) as u64 + 1) << 20
+    }
+}
+
+/// Find the memory-mapped configuration windows, if the firmware describes any.
+///
+/// Separate from [`topology`] because the two tables answer unrelated questions
+/// and a machine can perfectly well have one and not the other -- MCFG is absent
+/// on anything that predates PCI Express.
+///
+/// # Safety
+///
+/// As [`topology`].
+pub unsafe fn ecam_regions(rsdp: Physical) -> Result<Vec<EcamRegion>, AcpiError> {
+    // SAFETY: forwarded from this function's contract.
+    let table = unsafe { find_table(rsdp, b"MCFG")? };
+
+    // Header, then eight reserved bytes, then 16-byte allocation entries.
+    let mut regions = Vec::new();
+    let mut offset = SDT_HEADER_LEN + 8;
+    while offset + 16 <= table.len() {
+        regions.push(EcamRegion {
+            base: read_u64(&table, offset),
+            segment: u16::from_le_bytes([table[offset + 8], table[offset + 9]]),
+            start_bus: table[offset + 10],
+            end_bus: table[offset + 11],
+        });
+        offset += 16;
+    }
+
+    Ok(regions)
+}
+
+/// Walk the table directory and return the table with `signature`, validated.
+///
+/// # Safety
+///
+/// As [`topology`].
+unsafe fn find_table(rsdp: Physical, signature: &[u8; 4]) -> Result<Vec<u8>, AcpiError> {
+    if rsdp == 0 {
+        return Err(AcpiError::NoRsdp);
+    }
+
+    // SAFETY: forwarded from this function's contract.
+    let header = unsafe { physical_slice(rsdp, 20) };
+    if &header[..8] != b"RSD PTR " || !checksum_ok(&header[..20]) {
+        return Err(AcpiError::Corrupt);
+    }
+
+    let revision = header[15];
+    let (pointer_size, directory_address) = if revision >= 2 {
+        // SAFETY: as above.
+        let extended = unsafe { physical_slice(rsdp, 36) };
+        if !checksum_ok(extended) {
+            return Err(AcpiError::Corrupt);
+        }
+        (8usize, read_u64(extended, 24))
+    } else {
+        (4usize, read_u32(header, 16) as u64)
+    };
+
+    // SAFETY: a directory reported by a validated RSDP.
+    let directory_header = unsafe { physical_slice(directory_address, SDT_HEADER_LEN) };
+    let directory_length = read_u32(directory_header, 4) as usize;
+    if directory_length < SDT_HEADER_LEN {
+        return Err(AcpiError::Corrupt);
+    }
+
+    // SAFETY: the length came from the table's own header.
+    let directory = unsafe { physical_slice(directory_address, directory_length) };
+    if !checksum_ok(directory) {
+        return Err(AcpiError::Corrupt);
+    }
+
+    let entries = (directory_length - SDT_HEADER_LEN) / pointer_size;
+    for index in 0..entries {
+        let offset = SDT_HEADER_LEN + index * pointer_size;
+        let table = if pointer_size == 8 {
+            read_u64(directory, offset)
+        } else {
+            read_u32(directory, offset) as u64
+        };
+
+        // SAFETY: a pointer from a checksum-validated directory.
+        let table_header = unsafe { physical_slice(table, SDT_HEADER_LEN) };
+        if &table_header[..4] != signature {
+            continue;
+        }
+
+        let length = read_u32(table_header, 4) as usize;
+        if length < SDT_HEADER_LEN {
+            return Err(AcpiError::Corrupt);
+        }
+        // SAFETY: the length came from the table's own header.
+        let body = unsafe { physical_slice(table, length) };
+        if !checksum_ok(body) {
+            return Err(AcpiError::Corrupt);
+        }
+        // Copied out rather than borrowed: the caller will map pages and take
+        // locks, and holding a reference into firmware memory across that is a
+        // lifetime nobody is checking.
+        return Ok(body.to_vec());
+    }
+
+    Err(AcpiError::NoSuchTable)
 }
 
 /// Log what the firmware says the machine looks like.

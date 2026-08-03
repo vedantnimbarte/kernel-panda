@@ -1,23 +1,175 @@
 //! PCI / PCI Express bus enumeration.
 //!
-//! Uses the legacy port-based configuration mechanism (0xCF8/0xCFC) rather than
-//! memory-mapped ECAM. ECAM is the modern path and reaches extended config space
-//! beyond offset 0xFF, but finding its window means parsing the ACPI MCFG table,
-//! and nothing here needs a register above 0xFF yet. The port mechanism reaches
-//! PCIe devices perfectly well for enumeration and BAR discovery.
+//! Two ways to reach configuration space, and the kernel uses whichever it has.
+//!
+//! The legacy mechanism is a pair of ports: latch an address in 0xCF8, read or
+//! write 0xCFC. It works on everything, and it reaches PCIe devices perfectly
+//! well -- but only the first 256 bytes of each function's configuration space,
+//! because the selector has nowhere to put a wider offset. Everything PCI
+//! Express added lives above that: capability structures for MSI-X, AER, link
+//! control, and the rest.
+//!
+//! ECAM is the memory-mapped alternative, and bus, device and function are
+//! simply address bits in a window the firmware describes in the ACPI MCFG
+//! table. No latch, no pair of accesses to keep together, no lock, and 4 KiB
+//! per function instead of 256 bytes.
+//!
+//! ECAM is preferred when the firmware describes it, and the port mechanism
+//! remains as the fallback. They must agree about the low 256 bytes -- they are
+//! two views of the same registers -- and `both_mechanisms_agree` checks that
+//! rather than assuming it.
 //!
 //! Enumeration is a brute-force sweep rather than a recursive walk across
 //! bridges. 64k config reads cost microseconds, and a flat scan cannot get lost
 //! in a misreported bridge topology.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use x86_64::instructions::port::Port;
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::{PhysAddr, VirtAddr};
 
+use crate::acpi::EcamRegion;
+use crate::memory::paging;
 use crate::sync::without_interrupts;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
+
+/// Where the ECAM window is mapped. Clear of the heap, the kernel stacks, both
+/// APIC windows and user space.
+const ECAM_VIRT_BASE: u64 = 0x0000_7100_0000_0000;
+
+/// Virtual base of the mapped window, or zero if there is none.
+static ECAM_VIRT: AtomicU64 = AtomicU64::new(0);
+static ECAM_START_BUS: AtomicU8 = AtomicU8::new(0);
+static ECAM_END_BUS: AtomicU8 = AtomicU8::new(0);
+
+/// Largest configuration offset the legacy port mechanism can reach.
+pub const LEGACY_CONFIG_LIMIT: u16 = 0x100;
+/// Largest offset ECAM can reach: 4 KiB per function.
+pub const EXTENDED_CONFIG_LIMIT: u16 = 0x1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EcamError {
+    /// The firmware described no configuration window.
+    NotDescribed,
+    /// The window could not be mapped.
+    Mapping,
+}
+
+/// Buses actually covered by the mapped window.
+///
+/// May be narrower than what the firmware described -- see [`init_ecam`].
+pub fn ecam_bus_range() -> Option<(u8, u8)> {
+    if !ecam_available() {
+        return None;
+    }
+    Some((
+        ECAM_START_BUS.load(Ordering::Relaxed),
+        ECAM_END_BUS.load(Ordering::Relaxed),
+    ))
+}
+
+/// Map the memory-mapped configuration window.
+///
+/// # Safety
+///
+/// `region` must come from the firmware's own MCFG table. Call once, from the
+/// boot processor, after paging is up.
+pub unsafe fn init_ecam(region: EcamRegion) -> Result<(), EcamError> {
+    if ECAM_VIRT.load(Ordering::Acquire) != 0 {
+        return Ok(());
+    }
+
+    // Firmware routinely describes all 256 buses whether or not anything is on
+    // them -- QEMU's q35 does. That is 256 MiB of window and 65,536 mappings to
+    // establish at boot, for buses that will never answer.
+    //
+    // So the range is clamped rather than refused. Buses above the cap fall
+    // back to the port mechanism, which still reaches their low 256 bytes; only
+    // extended configuration space is lost, and only for a device sitting
+    // further out than any machine this runs on puts one.
+    const MAX_BUSES: u16 = 64;
+    let described = (region.end_bus as u16) - (region.start_bus as u16) + 1;
+    let end_bus = if described > MAX_BUSES {
+        region.start_bus + (MAX_BUSES as u8) - 1
+    } else {
+        region.end_bus
+    };
+    let region = EcamRegion { end_bus, ..region };
+
+    // Uncached: configuration space is device registers, and a cached read can
+    // answer from a line fetched before the device changed.
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::WRITE_THROUGH
+        | PageTableFlags::NO_EXECUTE;
+
+    let pages = region.length() / 4096;
+    for index in 0..pages {
+        let virtual_address = VirtAddr::new(ECAM_VIRT_BASE + index * 4096);
+        let physical = PhysAddr::new(region.base + index * 4096);
+        let page = Page::<Size4KiB>::containing_address(virtual_address);
+        let frame = PhysFrame::<Size4KiB>::containing_address(physical);
+
+        // SAFETY: the range is device memory the firmware named, and this
+        // virtual range belongs to nothing else.
+        if unsafe { paging::map_to_frame(page, frame, flags) }.is_err() {
+            // Unwind, or a partial window is worse than none: reads would
+            // succeed for low buses and fault for high ones.
+            for done in 0..index {
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(
+                    ECAM_VIRT_BASE + done * 4096,
+                ));
+                let _ = paging::unmap(page);
+            }
+            return Err(EcamError::Mapping);
+        }
+    }
+
+    ECAM_START_BUS.store(region.start_bus, Ordering::Relaxed);
+    ECAM_END_BUS.store(region.end_bus, Ordering::Relaxed);
+    ECAM_VIRT.store(ECAM_VIRT_BASE, Ordering::Release);
+    Ok(())
+}
+
+/// Whether configuration space is reachable by memory rather than by ports.
+pub fn ecam_available() -> bool {
+    ECAM_VIRT.load(Ordering::Acquire) != 0
+}
+
+/// The highest configuration offset that can be read on this machine.
+pub fn config_limit() -> u16 {
+    if ecam_available() {
+        EXTENDED_CONFIG_LIMIT
+    } else {
+        LEGACY_CONFIG_LIMIT
+    }
+}
+
+/// Virtual address of a function's configuration space, if ECAM covers it.
+fn ecam_address(address: Address, offset: u16) -> Option<u64> {
+    let base = ECAM_VIRT.load(Ordering::Acquire);
+    if base == 0 || offset >= EXTENDED_CONFIG_LIMIT {
+        return None;
+    }
+
+    let start = ECAM_START_BUS.load(Ordering::Relaxed);
+    let end = ECAM_END_BUS.load(Ordering::Relaxed);
+    if address.bus < start || address.bus > end {
+        return None;
+    }
+
+    Some(
+        base + (((address.bus - start) as u64) << 20)
+            + ((address.device as u64) << 15)
+            + ((address.function as u64) << 12)
+            + (offset & !0x3) as u64,
+    )
+}
 
 /// Returned by a config read for a device that is not there. The bus floats
 /// high when nothing answers.
@@ -106,17 +258,38 @@ pub enum Bar {
     },
 }
 
-/// Read a 32-bit configuration register.
-///
-/// Interrupts are held off across the pair of port accesses: the address latch
-/// and the data port are separate, so anything that slipped in between would
-/// read from whatever device it selected instead.
+/// Read a 32-bit configuration register, through whichever mechanism exists.
 pub fn read_config(address: Address, offset: u8) -> u32 {
+    read_config_extended(address, offset as u16)
+}
+
+/// Read a configuration register at any offset ECAM can reach.
+///
+/// Offsets at or above 0x100 return all-ones without ECAM, which is what the
+/// bus returns for a register that is not there -- so a caller walking the
+/// extended capability list terminates rather than looping on a value it
+/// invented.
+pub fn read_config_extended(address: Address, offset: u16) -> u32 {
+    if let Some(virtual_address) = ecam_address(address, offset) {
+        // SAFETY: the address is inside the window mapped by `init_ecam`, and
+        // is dword aligned by construction. Volatile because the device, not
+        // the compiler, decides what a read means.
+        return unsafe { core::ptr::read_volatile(virtual_address as *const u32) };
+    }
+
+    if offset >= LEGACY_CONFIG_LIMIT {
+        return u32::MAX;
+    }
+
+    // Interrupts are held off across the pair of port accesses: the address
+    // latch and the data port are separate, so anything that slipped in between
+    // would read from whatever device it selected instead. ECAM needs none of
+    // this, which is a real part of its appeal.
     without_interrupts(|| {
         // SAFETY: 0xCF8/0xCFC are the architecturally fixed PCI configuration
         // ports. Reading configuration space has no side effects.
         unsafe {
-            Port::<u32>::new(CONFIG_ADDRESS).write(address.selector(offset));
+            Port::<u32>::new(CONFIG_ADDRESS).write(address.selector(offset as u8));
             Port::<u32>::new(CONFIG_DATA).read()
         }
     })
@@ -129,11 +302,32 @@ pub fn read_config(address: Address, offset: u8) -> u32 {
 /// Writing configuration space reprograms hardware. The caller must know what
 /// the register does; a careless write can remap or disable a device.
 pub unsafe fn write_config(address: Address, offset: u8, value: u32) {
+    if let Some(virtual_address) = ecam_address(address, offset as u16) {
+        // SAFETY: forwarded from this function's contract; the address is
+        // inside the mapped window and dword aligned.
+        unsafe { core::ptr::write_volatile(virtual_address as *mut u32, value) };
+        return;
+    }
+
     without_interrupts(|| {
         // SAFETY: forwarded from this function's contract.
         unsafe {
             Port::<u32>::new(CONFIG_ADDRESS).write(address.selector(offset));
             Port::<u32>::new(CONFIG_DATA).write(value);
+        }
+    })
+}
+
+/// Read a register through the port mechanism specifically.
+///
+/// Only useful for checking the two views agree; everything else should go
+/// through [`read_config`].
+pub fn read_config_legacy(address: Address, offset: u8) -> u32 {
+    without_interrupts(|| {
+        // SAFETY: as in `read_config_extended`.
+        unsafe {
+            Port::<u32>::new(CONFIG_ADDRESS).write(address.selector(offset));
+            Port::<u32>::new(CONFIG_DATA).read()
         }
     })
 }
@@ -194,6 +388,88 @@ pub fn find_display() -> Option<DeviceInfo> {
     enumerate()
         .into_iter()
         .find(|device| device.class == CLASS_DISPLAY)
+}
+
+/// A PCI Express extended capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedCapability {
+    pub id: u16,
+    pub version: u8,
+    /// Offset of the capability header within configuration space.
+    pub offset: u16,
+}
+
+/// Where the extended capability list starts. Fixed by the specification.
+const EXTENDED_CAPABILITY_BASE: u16 = 0x100;
+
+/// Walk a device's extended capability list.
+///
+/// Empty without ECAM: the whole list lives above offset 0xFF, which the port
+/// mechanism cannot address. This is the concrete thing the MCFG table buys.
+pub fn extended_capabilities(address: Address) -> Vec<ExtendedCapability> {
+    let mut found = Vec::new();
+    if !ecam_available() {
+        return found;
+    }
+
+    let mut offset = EXTENDED_CAPABILITY_BASE;
+    // Bounded by the space itself: a device whose list points in a circle would
+    // otherwise spin here forever, and firmware bugs of that shape are real.
+    for _ in 0..(EXTENDED_CONFIG_LIMIT / 4) {
+        if !(EXTENDED_CAPABILITY_BASE..EXTENDED_CONFIG_LIMIT).contains(&offset) {
+            break;
+        }
+
+        let header = read_config_extended(address, offset);
+        // All-ones is an absent device; all-zeroes is a device with no extended
+        // capabilities at all. Both mean stop.
+        if header == 0 || header == u32::MAX {
+            break;
+        }
+
+        found.push(ExtendedCapability {
+            id: (header & 0xFFFF) as u16,
+            version: ((header >> 16) & 0xF) as u8,
+            offset,
+        });
+
+        let next = ((header >> 20) & 0xFFF) as u16;
+        if next == 0 {
+            break;
+        }
+        offset = next;
+    }
+
+    found
+}
+
+/// Check the two views of configuration space describe the same registers.
+///
+/// They are two windows onto one set of registers, so they must agree about the
+/// low 256 bytes. If they do not, the MCFG table describes a window that is not
+/// where the firmware says -- and every ECAM read after that is of some
+/// unrelated physical memory, which is a far worse failure than not having ECAM
+/// at all.
+///
+/// Returns `None` when there is nothing to compare.
+pub fn both_mechanisms_agree() -> Option<bool> {
+    if !ecam_available() {
+        return None;
+    }
+
+    let mut compared = 0;
+    for device in enumerate() {
+        // The identity register: vendor and device id, the one register whose
+        // value is certain to be stable between two reads.
+        let through_ports = read_config_legacy(device.address, 0x00);
+        let through_memory = read_config_extended(device.address, 0x00);
+        if through_ports != through_memory {
+            return Some(false);
+        }
+        compared += 1;
+    }
+
+    Some(compared > 0)
 }
 
 /// Decode base address register `index` (0-5) of a device.

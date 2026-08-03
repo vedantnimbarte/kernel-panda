@@ -112,6 +112,13 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // carries on.
     route_device_interrupts();
 
+    // Memory-mapped PCI configuration, if the firmware describes a window.
+    // Survivable too: without it the port mechanism still reaches everything
+    // below offset 0x100, which is all the kernel reads today.
+    if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
+        map_pci_config(rsdp);
+    }
+
     // Other processors last of all: they need the APIC calibrated, the heap for
     // their stacks, and the scheduler ready to adopt them.
     //
@@ -160,6 +167,50 @@ fn route_device_interrupts() {
     match arch::x86_64::ioapic::route_serial(&topology, apic_id) {
         Ok(()) => crate::println!("ioapic: serial input on vector {:#x}", arch::x86_64::apic::SERIAL_VECTOR),
         Err(error) => crate::println!("warning: could not route serial input: {error:?}"),
+    }
+}
+
+/// Map the memory-mapped PCI configuration window, if there is one.
+///
+/// The port mechanism reaches only the first 256 bytes of each function's
+/// configuration space, because its selector has nowhere to put a wider offset.
+/// Everything PCI Express added -- MSI-X, AER, link control -- lives above that.
+fn map_pci_config(rsdp: u64) {
+    // SAFETY: the address comes from the bootloader, and physical memory is
+    // mapped by this point.
+    let regions = match unsafe { acpi::ecam_regions(rsdp) } {
+        Ok(regions) => regions,
+        Err(acpi::AcpiError::NoSuchTable) => {
+            // Expected on anything predating PCI Express. Not worth a warning.
+            return;
+        }
+        Err(error) => {
+            crate::println!("warning: could not read the PCI config table: {error:?}");
+            return;
+        }
+    };
+
+    let Some(region) = regions.first().copied() else {
+        return;
+    };
+
+    // SAFETY: the region came from the firmware's own MCFG table, and this runs
+    // once during boot with paging up.
+    match unsafe { pci::init_ecam(region) } {
+        Ok(()) => {
+            // The mapped range, not the described one: firmware routinely
+            // claims all 256 buses and the window is clamped.
+            let (first, last) = pci::ecam_bus_range().unwrap_or((0, 0));
+            crate::println!(
+                "pci: extended config at {:#x}, buses {first}-{last} of {}-{}",
+                region.base,
+                region.start_bus,
+                region.end_bus
+            );
+        }
+        Err(error) => {
+            crate::println!("warning: could not map PCI extended config: {error:?}");
+        }
     }
 }
 
