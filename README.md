@@ -272,6 +272,29 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**Serial input arrives by interrupt, not by polling.** It was drained from the
+timer handler before, which capped throughput at the tick rate and made a
+keystroke wait up to a full quantum to be noticed. That was not laziness:
+routing IRQ 4 needs an I/O APIC, and finding one needs ACPI, so it had to wait
+for both.
+
+The MADT's interrupt source overrides are honoured rather than assumed away.
+Firmware is allowed to wire an ISA IRQ to a pin other than the one its number
+suggests — the timer usually arrives on pin 2, not pin 0 — and programming the
+obvious pin instead is the classic way to configure a redirection entry nothing
+is connected to, then wait forever.
+
+Order matters at both ends. The redirection entry's high half is written before
+its low half, because the low half carries the mask bit and the entry must never
+be briefly live with no destination set — on a multiprocessor that is an
+interrupt delivered to whichever core happens to be APIC id zero. And the UART
+is told to raise the line only *after* something is listening: a level-triggered
+input asserted with the entry still masked stays asserted.
+
+The timer handler still polls the console when routing did not happen — no ACPI,
+no chip, a firmware layout this does not understand. A machine whose only
+interface is the serial port should be slow rather than deaf.
+
 **The lock is a ticket lock, so waiters are served in the order they arrived.**
 A test-and-set spinlock has no queue: every waiter races for the same word on
 release, and the core whose cache already holds the line tends to win again.
@@ -498,8 +521,6 @@ which only means the hang would be intermittent.
 
 * Quotas are fixed constants, identical for every process. Real ones would be
   per-process policy set by whoever spawned it.
-* The ACPI IOAPIC address is read but never used — nothing routes a device
-  interrupt yet, so console input is still polled.
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
   timing is exactly where this class of code breaks.
 * The ticket lock is fair but not priority-aware: a `High` thread queues behind
@@ -524,9 +545,10 @@ which only means the hang would be intermittent.
   blits each surface once, as it arrives.
 * PCI uses the port-based config mechanism, so extended config space above
   offset 0xFF is unreachable. Getting there means parsing the ACPI MCFG table.
-* Input is polled from the timer rather than driven by an interrupt, which caps
-  throughput at the tick rate. Routing IRQ 4 needs the IOAPIC, and finding the
-  IOAPIC properly needs ACPI.
+* The I/O APIC decides which pin owns a global interrupt by base address alone;
+  it does not read each chip's redirection-entry count. Exact with one I/O APIC,
+  which is every machine this has run on, and wrong on a machine with two whose
+  interrupt ranges are not contiguous.
 
 ## Phase 3 progress
 

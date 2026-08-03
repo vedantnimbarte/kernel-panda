@@ -46,6 +46,12 @@ const MCR_LOOPBACK: u8 = 0x1E;
 /// Modem control: DTR, RTS, OUT1, OUT2 asserted; loopback off.
 const MCR_NORMAL: u8 = 0x0F;
 
+/// Interrupt enable: raise IRQ 4 when a byte has been received.
+const IER_DATA_AVAILABLE: u8 = 0x01;
+
+/// The ISA interrupt COM1 is wired to, by convention on every PC.
+pub const COM1_IRQ: u8 = 4;
+
 /// Line status: a received byte is waiting in the receive buffer.
 const LSR_DATA_READY: u8 = 0x01;
 /// Line status: the transmit holding register is free.
@@ -115,6 +121,17 @@ impl SerialPort {
         true
     }
 
+    /// Raise an interrupt when a received byte is available.
+    ///
+    /// Only that source. Transmit-empty would fire continuously while the
+    /// kernel has nothing to send, and the modem-status lines mean nothing on
+    /// a port QEMU has attached to a pipe.
+    pub fn enable_receive_interrupt(&mut self) {
+        // SAFETY: the interrupt-enable register of the port `init` configured.
+        // DLAB is clear by then, so offset 1 is IER and not the divisor.
+        unsafe { self.interrupt_enable.write(IER_DATA_AVAILABLE) };
+    }
+
     /// Take a received byte if one is waiting.
     pub fn try_read_byte(&mut self) -> Option<u8> {
         // SAFETY: polling LSR and reading RBR on the port configured by `init`.
@@ -158,6 +175,15 @@ pub static COM1: Mutex<SerialPort> = Mutex::new(SerialPort::new(COM1_BASE));
 /// Returns `false` if the loopback self-test did not pass.
 pub fn init() -> bool {
     COM1.lock().init()
+}
+
+/// Ask the UART to raise IRQ 4 when a byte arrives.
+///
+/// Left until the I/O APIC is routed: an interrupt the chip has been told to
+/// raise, with nothing listening, is asserted forever on a level-triggered line
+/// and wedges the port.
+pub fn enable_receive_interrupt() {
+    COM1.lock().enable_receive_interrupt();
 }
 
 /// Drain any bytes the UART has received.

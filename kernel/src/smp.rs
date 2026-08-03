@@ -165,6 +165,14 @@ pub fn record_topology(topology: Topology) {
     });
 }
 
+/// What the firmware reported, if it was readable.
+///
+/// Cloned rather than borrowed: the caller would otherwise hold the lock for
+/// as long as it looked at the result, and one of them programs an I/O APIC.
+pub fn topology() -> Option<Topology> {
+    without_interrupts(|| TOPOLOGY.lock().clone())
+}
+
 /// Processors the firmware reported, boot processor included.
 pub fn processor_count() -> usize {
     PROCESSORS.load(Ordering::Acquire).max(1)

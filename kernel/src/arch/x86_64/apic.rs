@@ -63,6 +63,9 @@ pub const SPURIOUS_VECTOR: u8 = 0xFF;
 /// Asks every other processor to drop its cached translations.
 pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xFD;
 
+/// The serial port has received something. Delivered by the I/O APIC.
+pub const SERIAL_VECTOR: u8 = 0x31;
+
 /// How often the timer should fire once calibration is done.
 pub const TIMER_HZ: u32 = 100;
 

@@ -100,6 +100,70 @@ fn uptime_advances() {
 }
 
 #[test_case]
+fn serial_input_is_routed_through_the_io_apic() {
+    use panda_kernel::arch::x86_64::ioapic;
+
+    if !ioapic::is_initialised() {
+        println!("  (skipped: no I/O APIC on this machine)");
+        return;
+    }
+
+    let topology = panda_kernel::smp::topology().expect("ACPI reported nothing");
+    let (gsi, _) = topology.resolve_irq(panda_kernel::console::uart::COM1_IRQ);
+    let (_, pin) = topology
+        .pin_for_gsi(gsi)
+        .expect("no I/O APIC owns the serial interrupt");
+
+    assert!(
+        ioapic::serial_is_routed(),
+        "the I/O APIC is present but serial input was never routed, so the \
+         console is still being polled from the timer"
+    );
+    assert_eq!(
+        ioapic::vector_of(pin),
+        Some(apic::SERIAL_VECTOR),
+        "pin {pin} does not deliver the serial vector"
+    );
+    assert_eq!(
+        ioapic::is_masked(pin),
+        Some(false),
+        "the serial interrupt is routed but still masked, so nothing will \
+         ever be delivered"
+    );
+}
+
+#[test_case]
+fn an_unrouted_pin_stays_masked() {
+    use panda_kernel::arch::x86_64::ioapic;
+
+    if !ioapic::is_initialised() {
+        return;
+    }
+
+    // The chip comes out of reset with every entry masked, and nothing here
+    // unmasks a pin it has not been asked to route. A pin that is live without
+    // a handler behind it delivers to whatever vector the firmware left in the
+    // entry, which on a level-triggered line means forever.
+    let pins = ioapic::pin_count();
+    assert!(pins > 0, "the I/O APIC reports no input pins");
+
+    let (gsi, _) = panda_kernel::smp::topology()
+        .expect("ACPI reported nothing")
+        .resolve_irq(panda_kernel::console::uart::COM1_IRQ);
+
+    for pin in 0..pins {
+        if pin as u32 == gsi {
+            continue;
+        }
+        assert_eq!(
+            ioapic::is_masked(pin),
+            Some(true),
+            "pin {pin} is unmasked and nothing routed it"
+        );
+    }
+}
+
+#[test_case]
 fn only_one_processor_keeps_the_clock() {
     // Every core has its own APIC timer and every one of them reaches the same
     // handler. Counting the clock on all of them makes uptime run at the number

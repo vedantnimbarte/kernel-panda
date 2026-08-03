@@ -36,6 +36,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
 
     idt[apic::TIMER_VECTOR].set_handler_fn(timer_handler);
+    idt[apic::SERIAL_VECTOR].set_handler_fn(serial_handler);
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
     idt[apic::TLB_SHOOTDOWN_VECTOR].set_handler_fn(tlb_shootdown_handler);
 
@@ -149,17 +150,31 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
     crate::time::tick(crate::smp::cpu_index());
     apic::end_of_interrupt();
 
-    // Drain the serial port before scheduling. There is no receive interrupt --
-    // routing IRQ 4 would mean programming the IOAPIC, and finding it properly
-    // means ACPI. At 100 Hz this adds at most 10 ms of latency, well inside the
-    // UART's FIFO for anything a person types.
-    crate::console::input::poll();
+    // A safety net, not the mechanism. Input arrives on its own vector now, but
+    // if the I/O APIC could not be routed -- no ACPI, no chip, a firmware layout
+    // this does not understand -- the console would otherwise go deaf, and a
+    // system whose only interface is the serial port would be unusable rather
+    // than merely slow.
+    if !super::ioapic::serial_is_routed() {
+        crate::console::input::poll();
+    }
 
     // May not return until this thread is scheduled again. The switch happens on
     // this thread's stack, below the interrupt frame the CPU just pushed, so
     // resuming later unwinds back out through this handler and `iret`s
     // correctly.
     crate::sched::on_timer_tick();
+}
+
+/// The serial port has something for us.
+///
+/// Draining the FIFO is what deasserts the line. Failing to drain it on a
+/// level-triggered input would leave the interrupt asserted and re-delivered
+/// forever, which presents as a machine that has stopped rather than a console
+/// that has stopped.
+extern "x86-interrupt" fn serial_handler(_frame: InterruptStackFrame) {
+    crate::console::input::poll();
+    apic::end_of_interrupt();
 }
 
 /// Another processor changed a shared mapping and this one must forget what it

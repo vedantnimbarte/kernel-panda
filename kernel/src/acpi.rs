@@ -27,6 +27,28 @@ pub enum AcpiError {
     NoMadt,
 }
 
+/// One I/O APIC, and where in the global interrupt space its inputs start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoApic {
+    pub address: u64,
+    /// The global system interrupt its first input pin corresponds to.
+    pub gsi_base: u32,
+}
+
+/// The firmware saying an ISA IRQ is not wired where the ISA convention says.
+///
+/// The one that matters in practice is IRQ 0: on almost every machine the timer
+/// arrives on GSI 2 rather than GSI 0. Ignoring these and assuming IRQ number
+/// equals pin number is the classic way to program a redirection entry that
+/// nothing is connected to, and then wait forever for an interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceOverride {
+    pub irq: u8,
+    pub gsi: u32,
+    /// The MPS INTI flags as reported: bits 0-1 polarity, bits 2-3 trigger mode.
+    pub flags: u16,
+}
+
 /// What the MADT says about the machine.
 #[derive(Debug, Clone)]
 pub struct Topology {
@@ -34,8 +56,44 @@ pub struct Topology {
     pub local_apic_address: u64,
     /// APIC ids of every enabled processor, boot processor included.
     pub processors: Vec<u8>,
+    /// Every I/O APIC the firmware reported.
+    pub io_apics: Vec<IoApic>,
+    /// ISA interrupts the firmware says are wired somewhere unexpected.
+    pub overrides: Vec<SourceOverride>,
+}
+
+impl Topology {
     /// Physical address of the first I/O APIC, if there is one.
-    pub io_apic_address: Option<u64>,
+    pub fn io_apic_address(&self) -> Option<u64> {
+        self.io_apics.first().map(|io_apic| io_apic.address)
+    }
+
+    /// Where an ISA IRQ actually lands, and how it is signalled.
+    ///
+    /// Identity-mapped unless the firmware said otherwise, which is what the
+    /// ACPI specification prescribes for anything without an override.
+    pub fn resolve_irq(&self, irq: u8) -> (u32, u16) {
+        match self.overrides.iter().find(|entry| entry.irq == irq) {
+            Some(entry) => (entry.gsi, entry.flags),
+            None => (irq as u32, 0),
+        }
+    }
+
+    /// The I/O APIC owning a global interrupt, and the pin within it.
+    pub fn pin_for_gsi(&self, gsi: u32) -> Option<(IoApic, u8)> {
+        // No redirection-entry count is read from the chip here, so ownership is
+        // decided by base address alone: the last I/O APIC whose base is at or
+        // below the interrupt. With one I/O APIC -- every machine this runs on
+        // so far -- that is exact.
+        let owner = self
+            .io_apics
+            .iter()
+            .filter(|io_apic| io_apic.gsi_base <= gsi)
+            .max_by_key(|io_apic| io_apic.gsi_base)?;
+        u8::try_from(gsi - owner.gsi_base)
+            .ok()
+            .map(|pin| (*owner, pin))
+    }
 }
 
 /// Read `count` bytes at a physical address through the offset window.
@@ -150,6 +208,8 @@ pub unsafe fn topology(rsdp: Physical) -> Result<Topology, AcpiError> {
 const ENTRY_LOCAL_APIC: u8 = 0;
 /// Entry type 1: an I/O APIC.
 const ENTRY_IO_APIC: u8 = 1;
+/// Entry type 2: an ISA IRQ wired somewhere other than the obvious pin.
+const ENTRY_SOURCE_OVERRIDE: u8 = 2;
 /// Entry type 9: a Local APIC for a processor with an id above 255.
 const ENTRY_LOCAL_X2APIC: u8 = 9;
 
@@ -159,7 +219,8 @@ const PROCESSOR_ENABLED: u32 = 1;
 fn parse_madt(madt: &[u8]) -> Topology {
     let local_apic_address = read_u32(madt, SDT_HEADER_LEN) as u64;
     let mut processors = Vec::new();
-    let mut io_apic_address = None;
+    let mut io_apics = Vec::new();
+    let mut overrides = Vec::new();
 
     // Entries begin after the header, the 32-bit APIC address and the flags.
     let mut offset = SDT_HEADER_LEN + 8;
@@ -182,8 +243,18 @@ fn parse_madt(madt: &[u8]) -> Topology {
                     processors.push(apic_id);
                 }
             }
-            ENTRY_IO_APIC if length >= 12 && io_apic_address.is_none() => {
-                io_apic_address = Some(read_u32(madt, offset + 4) as u64);
+            ENTRY_IO_APIC if length >= 12 => {
+                io_apics.push(IoApic {
+                    address: read_u32(madt, offset + 4) as u64,
+                    gsi_base: read_u32(madt, offset + 8),
+                });
+            }
+            ENTRY_SOURCE_OVERRIDE if length >= 10 => {
+                overrides.push(SourceOverride {
+                    irq: madt[offset + 3],
+                    gsi: read_u32(madt, offset + 4),
+                    flags: u16::from_le_bytes([madt[offset + 8], madt[offset + 9]]),
+                });
             }
             ENTRY_LOCAL_X2APIC if length >= 16 => {
                 let apic_id = read_u32(madt, offset + 4);
@@ -205,7 +276,8 @@ fn parse_madt(madt: &[u8]) -> Topology {
     Topology {
         local_apic_address,
         processors,
-        io_apic_address,
+        io_apics,
+        overrides,
     }
 }
 
@@ -216,8 +288,20 @@ pub fn log_topology(topology: &Topology) {
         topology.processors.len(),
         topology.local_apic_address
     );
-    if let Some(io_apic) = topology.io_apic_address {
-        crate::println!("  io apic at {io_apic:#x}");
+    for io_apic in &topology.io_apics {
+        crate::println!(
+            "  io apic at {:#x}, interrupts from {}",
+            io_apic.address,
+            io_apic.gsi_base
+        );
+    }
+    for entry in &topology.overrides {
+        crate::println!(
+            "  irq {} is wired to interrupt {} (flags {:#06x})",
+            entry.irq,
+            entry.gsi,
+            entry.flags
+        );
     }
 }
 

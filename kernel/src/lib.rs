@@ -106,6 +106,12 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
         crate::println!("warning: could not start the APIC timer: {error:?}");
     }
 
+    // Device interrupts, which need both the firmware tables and a Local APIC
+    // to deliver to. Every failure here is survivable -- the timer handler keeps
+    // polling the console when routing did not happen -- so each one reports and
+    // carries on.
+    route_device_interrupts();
+
     // Other processors last of all: they need the APIC calibrated, the heap for
     // their stacks, and the scheduler ready to adopt them.
     //
@@ -125,6 +131,36 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     }
 
     boot_info
+}
+
+/// Bring up the I/O APIC and point the serial port's interrupt at this
+/// processor.
+///
+/// Serial input was polled from the timer handler before this, which capped
+/// throughput at the tick rate and meant a keystroke waited up to a full
+/// quantum to be noticed. It was not laziness: routing IRQ 4 needs an I/O APIC,
+/// and finding one needs ACPI, so it had to wait for both.
+fn route_device_interrupts() {
+    let Some(topology) = smp::topology() else {
+        return;
+    };
+    let Some(io_apic) = topology.io_apics.first().copied() else {
+        crate::println!("warning: the firmware reported no I/O APIC; console input stays polled");
+        return;
+    };
+
+    // SAFETY: the address came from the firmware's own MADT, and this runs once
+    // during boot with paging up.
+    if let Err(error) = unsafe { arch::x86_64::ioapic::init(io_apic) } {
+        crate::println!("warning: could not map the I/O APIC: {error:?}");
+        return;
+    }
+
+    let apic_id = arch::x86_64::apic::id();
+    match arch::x86_64::ioapic::route_serial(&topology, apic_id) {
+        Ok(()) => crate::println!("ioapic: serial input on vector {:#x}", arch::x86_64::apic::SERIAL_VECTOR),
+        Err(error) => crate::println!("warning: could not route serial input: {error:?}"),
+    }
 }
 
 /// Give back everything a thread was holding.
