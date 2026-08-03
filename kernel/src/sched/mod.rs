@@ -333,6 +333,17 @@ impl Scheduler {
             return;
         };
         if thread.state != State::Blocked {
+            // Not parked yet. It registered with its waker, released that lock
+            // and has not reached `block_current` -- a window this cannot close
+            // by waiting, because the thread is on another processor. Leaving
+            // now would drop the wake and park it forever, so it is recorded
+            // and the thread's own attempt to block consumes it.
+            //
+            // Only meaningful for a live thread; a Finished one is not going to
+            // block again.
+            if thread.state != State::Finished {
+                thread.wake_pending = true;
+            }
             return;
         }
         thread.state = State::Ready;
@@ -632,17 +643,35 @@ pub fn yield_now() {
 
 /// Park the current thread until something calls [`unblock`] on it.
 ///
-/// The caller must have registered itself somewhere a waker can find it, with
-/// interrupts still disabled, *before* calling this -- otherwise a waker running
-/// in the gap finds a thread that is not yet blocked and the wake is lost.
-pub fn block_current() {
-    with(|scheduler| {
+/// The caller must have registered itself somewhere a waker can find it before
+/// calling this. It need not hold that registration's lock -- a wake arriving in
+/// the gap is recorded rather than lost, and consumed here.
+///
+/// Returns whether the thread actually parked. A `false` means a wake beat it
+/// to the punch and there is something to collect, so the caller should go back
+/// and look rather than assuming it was woken for nothing.
+pub fn block_current() -> bool {
+    let parked = with(|scheduler| {
         let cpu = cpu_index();
-        if let Some(id) = scheduler.current[cpu] {
-            scheduler.thread_mut(id).state = State::Blocked;
+        let Some(id) = scheduler.current[cpu] else {
+            return false;
+        };
+
+        let thread = scheduler.thread_mut(id);
+        if core::mem::take(&mut thread.wake_pending) {
+            // Woken between registering and getting here. Parking now would
+            // wait for a wake that has already been delivered.
+            return false;
         }
-    });
-    schedule();
+        thread.state = State::Blocked;
+        true
+    })
+    .unwrap_or(false);
+
+    if parked {
+        schedule();
+    }
+    parked
 }
 
 /// Return a blocked thread to the ready queue. Does nothing if it is not
@@ -671,7 +700,11 @@ pub fn sleep_ticks(ticks: u64) {
         };
 
         let deadline = crate::time::ticks().saturating_add(ticks);
-        scheduler.thread_mut(id).state = State::Blocked;
+        let thread = scheduler.thread_mut(id);
+        // Registering and parking happen under one lock here, so there is no
+        // gap for a wake to fall into. Any pending one is stale.
+        thread.wake_pending = false;
+        thread.state = State::Blocked;
         scheduler.sleepers.push((id, deadline));
 
         // Published under the lock, so it cannot race with the recomputation in
@@ -730,7 +763,11 @@ pub fn join(id: ThreadId) {
         }
 
         scheduler.thread_mut(id).joiners.push(me);
-        scheduler.thread_mut(me).state = State::Blocked;
+        let waiter = scheduler.thread_mut(me);
+        // As in `sleep_ticks`: registration and parking share one acquisition
+        // of the lock, so nothing can slip between them.
+        waiter.wake_pending = false;
+        waiter.state = State::Blocked;
         true
     })
     .unwrap_or(false);

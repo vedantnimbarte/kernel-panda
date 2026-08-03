@@ -105,11 +105,13 @@ pub fn inject(byte: u8) {
 /// Read up to `limit` bytes, blocking until at least one is available.
 pub fn read(reader: ThreadId, limit: usize, mut sink: impl FnMut(u8)) -> usize {
     loop {
-        // Interrupts stay off across both the registration and the block. If
-        // they were re-enabled in between, a byte arriving in the gap would pop
-        // this thread off the waiter list and call `unblock` while it is still
-        // `Running` -- the wake is dropped, and the thread then sleeps with
-        // nothing left to wake it.
+        // Masking interrupts closes this window on one processor and not on
+        // four: a byte arriving on another core pops this thread off the waiter
+        // list and calls `unblock` while it is still `Running`. That used to
+        // drop the wake and leave the thread parked with nothing left to wake
+        // it -- roughly one console read in five, which presented as a shell
+        // that stopped responding. `block_current` now records such a wake and
+        // returns `false` instead of parking, and the loop goes back to look.
         let taken = without_interrupts(|| {
             let count = {
                 let mut guard = INPUT.lock();
@@ -128,7 +130,7 @@ pub fn read(reader: ThreadId, limit: usize, mut sink: impl FnMut(u8)) -> usize {
             };
 
             if count == 0 {
-                sched::block_current();
+                let _ = sched::block_current();
             }
             count
         });

@@ -84,6 +84,21 @@ pub struct Thread {
     /// thread's stack corrupts that thread silently.
     pub kernel_stack_top: u64,
 
+    /// A wake arrived for this thread before it managed to park.
+    ///
+    /// Every blocking path outside the scheduler has the same shape: register
+    /// somewhere a waker can find you, release *that* lock, then call
+    /// `block_current`. The gap between the two is real, and on more than one
+    /// processor a waker can land inside it -- finding the thread still
+    /// `Running`, doing nothing, and leaving it to park with nothing left to
+    /// wake it. The console read path lost roughly one wake in five that way.
+    ///
+    /// The two locks cannot simply be nested: waking takes the scheduler lock,
+    /// and the console and IPC paths deliberately release theirs first so the
+    /// pair is never taken in both orders. So the wake is recorded instead, and
+    /// the next attempt to block consumes it and stays runnable.
+    pub wake_pending: bool,
+
     /// Some processor is executing on this thread's stack.
     ///
     /// True from the moment a CPU commits to switching *to* the thread until the
@@ -142,6 +157,7 @@ impl Thread {
             state: State::Ready,
             priority,
             joiners: alloc::vec::Vec::new(),
+            wake_pending: false,
             stack_pointer,
             entry: Some(entry),
             address_space: None,
@@ -163,6 +179,7 @@ impl Thread {
             state: State::Running,
             priority: Priority::Normal,
             joiners: alloc::vec::Vec::new(),
+            wake_pending: false,
             stack_pointer: 0,
             entry: None,
             address_space: None,

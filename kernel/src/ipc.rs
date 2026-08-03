@@ -317,7 +317,11 @@ pub fn receive(receiver: ThreadId, endpoint: EndpointId) -> Result<Message, Erro
             };
 
             if popped.is_none() {
-                sched::block_current();
+                // The registry lock is released above before parking, so a
+                // sender on another processor can wake this thread before it
+                // gets here. `block_current` records that and declines to park,
+                // and the loop goes round to collect the message.
+                let _ = sched::block_current();
             }
             Ok(popped)
         })?;

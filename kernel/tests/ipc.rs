@@ -341,6 +341,62 @@ fn receive_parks_the_thread_until_a_message_arrives() {
     );
 }
 
+static PINGPONG_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+static PINGPONG_RECEIVED: AtomicUsize = AtomicUsize::new(0);
+static PINGPONG_SENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Sends as fast as it can, deliberately aiming at the moment the receiver is
+/// between registering itself and parking.
+fn pingpong_sender() {
+    let endpoint = EndpointId(PINGPONG_ENDPOINT.load(Ordering::Acquire));
+    let me = me();
+    let mut sent = 0;
+    while sent < PINGPONG_ROUNDS {
+        if ipc::send(me, endpoint, Message::default()).is_ok() {
+            sent += 1;
+            PINGPONG_SENT.store(sent, Ordering::Release);
+        } else {
+            sched::yield_now();
+        }
+    }
+}
+
+const PINGPONG_ROUNDS: usize = 400;
+
+#[test_case]
+fn a_wake_that_arrives_before_the_receiver_parks_is_not_lost() {
+    // Registering as a waiter and parking cannot happen under one lock -- waking
+    // takes the scheduler lock, and the registry lock is deliberately released
+    // first so the two are never taken in both orders. That leaves a window in
+    // which a sender on another core finds the receiver still Running, and a
+    // wake delivered there used to be dropped: the receiver then parked with
+    // nothing left to wake it, and the system quietly stopped.
+    //
+    // Hammering the window is the only way to test it. Every lost wake is a
+    // hang, so this case either passes or takes the whole kernel down with it,
+    // which is the honest outcome for this class of bug.
+    let endpoint = ipc::create(me(), 4).expect("create failed");
+    PINGPONG_ENDPOINT.store(endpoint.0, Ordering::Release);
+    PINGPONG_RECEIVED.store(0, Ordering::Release);
+    PINGPONG_SENT.store(0, Ordering::Release);
+
+    sync::without_interrupts(|| {
+        let id = sched::spawn("pingpong-sender", pingpong_sender).expect("spawn failed");
+        ipc::grant(me(), id, endpoint, Rights::SEND).expect("grant failed");
+    });
+
+    for round in 0..PINGPONG_ROUNDS {
+        ipc::receive(me(), endpoint).expect("receive failed");
+        PINGPONG_RECEIVED.store(round + 1, Ordering::Release);
+    }
+
+    assert_eq!(
+        PINGPONG_RECEIVED.load(Ordering::Acquire),
+        PINGPONG_ROUNDS,
+        "the receiver did not collect every message"
+    );
+}
+
 #[test_case]
 fn try_receive_does_not_block_on_an_empty_endpoint() {
     let endpoint = ipc::create(me(), 4).expect("create failed");
