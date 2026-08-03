@@ -397,9 +397,10 @@ pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
         },
     )?;
 
-    let freed_tables = reclaim_tables_for(&space, page);
-    if freed_tables {
-        shoot_down_if_shared(&space);
+    if reclaim_tables_for(&space, page) {
+        shoot_down_all_if_shared(&space);
+    } else {
+        shoot_down_if_shared(&space, page);
     }
     Ok(frame)
 }
@@ -553,8 +554,11 @@ pub fn unmap_in(
         },
     )?;
 
-    reclaim_tables_for(space, page);
-    shoot_down_if_shared(space);
+    if reclaim_tables_for(space, page) {
+        shoot_down_all_if_shared(space);
+    } else {
+        shoot_down_if_shared(space, page);
+    }
     Ok(frame)
 }
 
@@ -595,7 +599,19 @@ fn reclaim_tables_for(space: &AddressSpace, page: Page<Size4KiB>) -> bool {
 /// Only the kernel's own tables are shared. A process's are used by whichever
 /// CPU is running it, and the CR3 reload on the way in already flushes
 /// everything non-global -- so a shootdown there would be pure cost.
-fn shoot_down_if_shared(space: &AddressSpace) {
+fn shoot_down_if_shared(space: &AddressSpace, page: Page<Size4KiB>) {
+    if KERNEL_SPACE.get() == Some(space) {
+        crate::arch::x86_64::apic::shoot_down_page(page.start_address().as_u64());
+    }
+}
+
+/// As above, but for a change the other processors cannot be told about one
+/// address at a time.
+///
+/// Freeing an intermediate page table invalidates what they cached about the
+/// *structure*, not just one leaf, and a single-address invalidation does not
+/// reach that.
+fn shoot_down_all_if_shared(space: &AddressSpace) {
     if KERNEL_SPACE.get() == Some(space) {
         crate::arch::x86_64::apic::broadcast_tlb_shootdown();
     }
@@ -624,7 +640,7 @@ pub fn set_flags_in(
 
     // Narrowing permissions matters as much as unmapping: another CPU holding a
     // writable entry for a page just made read-only would keep writing to it.
-    shoot_down_if_shared(space);
+    shoot_down_if_shared(space, page);
     Ok(())
 }
 

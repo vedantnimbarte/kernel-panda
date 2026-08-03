@@ -68,7 +68,31 @@ pub fn user_bytes_written() -> u64 {
     USER_BYTES_WRITTEN.load(Ordering::Relaxed)
 }
 
+/// System calls dispatched, and how many of those the timer could have
+/// interrupted.
+///
+/// The two should be equal. They were not while the gate was an interrupt gate:
+/// `IF` was cleared on entry, so a call ran to completion no matter how long it
+/// took and the thread's quantum meant nothing. Counting both makes a
+/// regression -- someone reaching for an interrupt gate again, or a handler
+/// leaving interrupts off -- visible instead of merely slow.
+static SYSCALLS: AtomicU64 = AtomicU64::new(0);
+static PREEMPTIBLE_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn syscall_count() -> u64 {
+    SYSCALLS.load(Ordering::Relaxed)
+}
+
+pub fn preemptible_syscall_count() -> u64 {
+    PREEMPTIBLE_SYSCALLS.load(Ordering::Relaxed)
+}
+
 pub fn dispatch(frame: &mut SyscallFrame) {
+    SYSCALLS.fetch_add(1, Ordering::Relaxed);
+    if crate::sync::interrupts_enabled() {
+        PREEMPTIBLE_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
     // `exit` is the one call that does not come back, so it cannot go through
     // the result path below.
     if frame.rax == numbers::EXIT {

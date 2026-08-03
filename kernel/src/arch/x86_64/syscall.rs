@@ -1,11 +1,14 @@
 //! The kernel entry point for user-space system calls.
 //!
-//! Entry is through a software interrupt rather than `SYSCALL`. An interrupt
-//! gate switches to the stack named by `TSS.privilege_stack_table[0]`
-//! automatically, where `SYSCALL` does not switch stacks at all and would need
-//! `swapgs` plus a per-CPU block to find one. The gate costs more cycles and
-//! buys a great deal less that can go quietly wrong; the ABI here does not
-//! depend on the mechanism, so it can be swapped for `SYSCALL` later.
+//! Entry is through a software interrupt rather than `SYSCALL`. The gate
+//! switches to the stack named by `TSS.privilege_stack_table[0]` automatically,
+//! where `SYSCALL` does not switch stacks at all and would need `swapgs` plus a
+//! per-CPU block to find one. The gate costs more cycles and buys a great deal
+//! less that can go quietly wrong; the ABI here does not depend on the
+//! mechanism, so it can be swapped for `SYSCALL` later.
+//!
+//! It is a trap gate, so a system call runs with interrupts enabled and can be
+//! preempted like any other kernel work. See [`register`].
 //!
 //! ## ABI
 //!
@@ -138,6 +141,20 @@ extern "C" fn dispatch_trampoline(frame: &mut SyscallFrame) {
 /// The DPL must be 3, or `int 0x80` from user space raises a general protection
 /// fault instead of entering the kernel -- the CPU checks the caller's privilege
 /// against the gate's before it will use it.
+///
+/// It is a *trap* gate rather than an interrupt gate, which is the difference
+/// between clearing `IF` on entry and leaving it as the caller had it. As an
+/// interrupt gate, a syscall ran with interrupts off from `int` to `iretq`: no
+/// timer could reach the thread, so its quantum was a fiction and every call
+/// had to stay short or the whole machine stuttered. That is a constraint the
+/// design cannot keep -- the point of a microkernel is that calls do real work.
+///
+/// What it demands in return is that the dispatcher be reentrant with respect to
+/// preemption, which it is: every lock it touches masks interrupts for the
+/// window it holds them, the user-memory windows are bracketed by a guard that
+/// does the same, and the frame it edits lives on the calling thread's own
+/// kernel stack, so a preemption saves and restores it along with everything
+/// else.
 pub fn register(idt: &mut InterruptDescriptorTable) {
     // SAFETY: `syscall_entry` is a naked function whose body is a valid
     // interrupt entry sequence ending in `iretq`, and it is `'static`.
@@ -146,6 +163,7 @@ pub fn register(idt: &mut InterruptDescriptorTable) {
             // Via a pointer: casting a function *item* straight to an integer
             // is a different and much easier thing to get subtly wrong.
             .set_handler_addr(VirtAddr::new(syscall_entry as *const () as u64))
-            .set_privilege_level(PrivilegeLevel::Ring3);
+            .set_privilege_level(PrivilegeLevel::Ring3)
+            .disable_interrupts(false);
     }
 }

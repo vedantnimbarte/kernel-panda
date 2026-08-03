@@ -11,8 +11,7 @@
 //! patched at runtime, because every address inside the page is a compile-time
 //! constant offset from [`TRAMPOLINE_BASE`].
 
-use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
@@ -124,7 +123,26 @@ const GDT64_DATA: u64 = 0x00AF_9200_0000_FFFF;
 static TOPOLOGY: Mutex<Option<Topology>> = Mutex::new(None);
 
 /// APIC id of each CPU, indexed by the dense CPU index the kernel uses.
-static APIC_IDS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+///
+/// A lock-free mirror of what ACPI reported, rather than the `Vec` it arrives
+/// in. `cpu_index` is called from the timer handler, from every scheduler
+/// operation and from every wake, and it used to take a lock and search a `Vec`
+/// to answer -- putting a contended shared lock on the hottest path in the
+/// kernel, which is exactly what the scheduler had just been restructured to
+/// avoid. The fan-out below used to *clone* that `Vec`, so a TLB shootdown
+/// allocated.
+///
+/// Written once, during `record_topology`, before any application processor
+/// exists. `NO_CPU` marks a slot the firmware did not fill.
+const NO_CPU: u8 = u8::MAX;
+static APIC_ID_OF: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(NO_CPU) }; MAX_CPUS];
+
+/// The reverse map: APIC id to dense index, biased by one so zero means
+/// "not a processor we know about".
+static INDEX_OF: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+
+/// How many entries of `APIC_ID_OF` the firmware filled.
+static PROCESSORS: AtomicUsize = AtomicUsize::new(0);
 
 /// How many processors have reported for duty, boot processor included.
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
@@ -133,15 +151,23 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 static HANDSHAKE: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_topology(topology: Topology) {
+    // Published before anything reads it: this runs during boot, on the boot
+    // processor, with no application processor started and interrupts off.
+    let count = topology.processors.len().min(MAX_CPUS);
+    for (index, apic_id) in topology.processors.iter().take(MAX_CPUS).enumerate() {
+        APIC_ID_OF[index].store(*apic_id, Ordering::Relaxed);
+        INDEX_OF[*apic_id as usize].store(index as u8 + 1, Ordering::Relaxed);
+    }
+    PROCESSORS.store(count, Ordering::Release);
+
     without_interrupts(|| {
-        *APIC_IDS.lock() = topology.processors.clone();
         *TOPOLOGY.lock() = Some(topology);
     });
 }
 
 /// Processors the firmware reported, boot processor included.
 pub fn processor_count() -> usize {
-    without_interrupts(|| APIC_IDS.lock().len().max(1))
+    PROCESSORS.load(Ordering::Acquire).max(1)
 }
 
 /// Processors that have actually come up.
@@ -157,18 +183,25 @@ pub fn online_count() -> usize {
 /// from, rather than the "all except self" shorthand.
 static ONLINE_MASK: AtomicU64 = AtomicU64::new(1);
 
-/// Call `f` with the APIC id of every online processor except this one.
-pub fn for_each_other_online_processor(mut f: impl FnMut(u8)) {
+/// Call `f` with the index and APIC id of every online processor except this
+/// one.
+///
+/// Takes no lock and allocates nothing. It is reached from TLB shootdown, which
+/// runs with the scheduler mid-switch and sometimes with interrupts already
+/// masked; cloning a `Vec` to answer it meant a page unmap could end up inside
+/// the heap allocator.
+pub fn for_each_other_online_processor(mut f: impl FnMut(usize, u8)) {
     let mask = ONLINE_MASK.load(Ordering::Acquire);
     if mask.count_ones() <= 1 {
         return;
     }
     let self_index = cpu_index();
-    let identifiers = without_interrupts(|| APIC_IDS.lock().clone());
 
-    for (index, apic_id) in identifiers.iter().enumerate() {
-        if index != self_index && mask & (1 << index) != 0 {
-            f(*apic_id);
+    let count = PROCESSORS.load(Ordering::Acquire).min(MAX_CPUS);
+    for (index, slot) in APIC_ID_OF.iter().enumerate().take(count) {
+        let apic_id = slot.load(Ordering::Relaxed);
+        if index != self_index && apic_id != NO_CPU && mask & (1 << index) != 0 {
+            f(index, apic_id);
         }
     }
 }
@@ -180,13 +213,13 @@ pub fn for_each_other_online_processor(mut f: impl FnMut(u8)) {
 /// APIC id register is a single uncached read.
 pub fn cpu_index() -> usize {
     let apic_id = crate::arch::x86_64::apic::id();
-    without_interrupts(|| {
-        APIC_IDS
-            .lock()
-            .iter()
-            .position(|id| *id == apic_id)
-            .unwrap_or(0)
-    })
+    match INDEX_OF[apic_id as usize].load(Ordering::Relaxed) {
+        // Zero means the table has not been filled in yet, which is true for
+        // every call before ACPI is parsed. There is only one processor running
+        // at that point, and it is the boot one.
+        0 => 0,
+        biased => biased as usize - 1,
+    }
 }
 
 /// Start every application processor the firmware reported.
@@ -196,8 +229,8 @@ pub fn cpu_index() -> usize {
 /// Call once, from the boot processor, after the APIC, the heap and the
 /// scheduler are up.
 pub unsafe fn start_application_processors() -> usize {
-    let identifiers = without_interrupts(|| APIC_IDS.lock().clone());
-    if identifiers.len() <= 1 {
+    let count = PROCESSORS.load(Ordering::Acquire).min(MAX_CPUS);
+    if count <= 1 {
         return 0;
     }
     // SAFETY: called once during boot, before anything else can touch the
@@ -207,8 +240,9 @@ pub unsafe fn start_application_processors() -> usize {
     let boot_apic_id = crate::arch::x86_64::apic::id();
     let mut started = 0;
 
-    for (index, apic_id) in identifiers.iter().enumerate() {
-        if *apic_id == boot_apic_id {
+    for (index, slot) in APIC_ID_OF.iter().enumerate().take(count) {
+        let apic_id = slot.load(Ordering::Relaxed);
+        if apic_id == boot_apic_id || apic_id == NO_CPU {
             continue;
         }
 
@@ -227,7 +261,7 @@ pub unsafe fn start_application_processors() -> usize {
         HANDSHAKE.store(0, Ordering::Release);
 
         // SAFETY: `apic_id` came from the firmware's own processor list.
-        unsafe { crate::arch::x86_64::apic::start_processor(*apic_id, TRAMPOLINE_BASE) };
+        unsafe { crate::arch::x86_64::apic::start_processor(apic_id, TRAMPOLINE_BASE) };
 
         // Wait for the CPU to say it is up. Bounded, so one processor that
         // refuses to start does not stop the machine booting.

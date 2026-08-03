@@ -165,12 +165,11 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
 /// Another processor changed a shared mapping and this one must forget what it
 /// had cached.
 ///
-/// Reloads CR3, which discards every non-global entry. Invalidating just the
-/// affected page would be cheaper, but it would mean carrying the address across
-/// the interrupt, and shootdowns are rare enough that the whole-TLB flush is not
-/// worth the machinery.
+/// The address to invalidate is left in a per-CPU slot rather than carried in
+/// the interrupt, which a fixed-delivery IPI has no room for. Acknowledging is
+/// clearing that slot, and the sender waits for it.
 extern "x86-interrupt" fn tlb_shootdown_handler(_frame: InterruptStackFrame) {
-    x86_64::instructions::tlb::flush_all();
+    apic::service_shootdown_request();
     apic::end_of_interrupt();
 }
 

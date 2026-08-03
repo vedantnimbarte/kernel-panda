@@ -17,10 +17,11 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::memory::frame;
+use panda_kernel::sync::Mutex;
 use panda_kernel::{allocator, arch::x86_64::halt_loop, sched, smp, testing, time, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
@@ -121,6 +122,81 @@ fn work_reaches_more_than_one_processor() {
         spin_until(|| CPU_MASK.load(Ordering::Relaxed).count_ones() >= 2),
         "every thread ran on one processor; the ready queue is not being drained \
          by the others, so the extra cores are idle by accident"
+    );
+}
+
+static CONTENDED: Mutex<u64> = Mutex::new(0);
+static GRABS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static LOCK_STOP: AtomicBool = AtomicBool::new(false);
+static LOCK_WORKERS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+fn hammer_the_lock() {
+    while !LOCK_STOP.load(Ordering::Acquire) {
+        {
+            let mut held = CONTENDED.lock();
+            *held += 1;
+            // Long enough that the other cores are genuinely queued behind this
+            // one rather than arriving after it has finished.
+            for _ in 0..400 {
+                core::hint::spin_loop();
+            }
+        }
+        let cpu = smp::cpu_index();
+        if let Some(counter) = GRABS.get(cpu) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    LOCK_WORKERS_DONE.fetch_add(1, Ordering::AcqRel);
+}
+
+#[test_case]
+fn a_contended_lock_is_shared_out_evenly() {
+    if smp::online_count() < 2 {
+        return;
+    }
+
+    // A test-and-set spinlock has no queue: every waiter races for the same
+    // word on release and the core whose cache already holds the line tends to
+    // win again. Under sustained contention that leaves a processor waiting for
+    // reasons nothing in the code explains. A ticket lock serves arrivals in
+    // order, so every core that keeps asking keeps getting it.
+    const WORKERS: usize = 8;
+
+    LOCK_STOP.store(false, Ordering::Release);
+    LOCK_WORKERS_DONE.store(0, Ordering::Release);
+    for counter in &GRABS {
+        counter.store(0, Ordering::Relaxed);
+    }
+
+    for _ in 0..WORKERS {
+        sched::spawn("lock-hammer", hammer_the_lock).expect("spawn failed");
+    }
+
+    sched::sleep_ticks(25);
+    LOCK_STOP.store(true, Ordering::Release);
+    assert!(
+        spin_until(|| LOCK_WORKERS_DONE.load(Ordering::Acquire) >= WORKERS),
+        "the lock hammering threads did not all finish"
+    );
+
+    let online = smp::online_count().min(GRABS.len());
+    let per_cpu: Vec<u64> = (0..online)
+        .map(|cpu| GRABS[cpu].load(Ordering::Relaxed))
+        .collect();
+    let total: u64 = per_cpu.iter().sum();
+    assert!(total > 0, "nobody took the lock at all");
+
+    let quietest = per_cpu.iter().copied().min().unwrap_or(0);
+    let busiest = per_cpu.iter().copied().max().unwrap_or(0);
+
+    // Deliberately loose. Threads are not pinned and the scheduler moves them,
+    // so exact shares are not the claim -- the claim is that no processor is
+    // shut out while the others keep going, which is what an unfair lock does.
+    assert!(
+        quietest * 8 >= busiest,
+        "lock acquisitions across {online} processors were {per_cpu:?}; the \
+         quietest core got {quietest} against the busiest core's {busiest}, so \
+         the lock is not handing out turns in order"
     );
 }
 

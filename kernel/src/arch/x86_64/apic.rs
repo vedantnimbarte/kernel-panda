@@ -295,7 +295,16 @@ pub unsafe fn start_processor(apic_id: u8, trampoline: u64) {
     }
 }
 
-/// Tell every other processor to discard its cached page translations.
+/// What each processor has been asked to invalidate.
+///
+/// `NOTHING` means no request outstanding; `EVERYTHING` means reload CR3 and
+/// discard the lot. Anything else is a single page address.
+const NOTHING: u64 = 0;
+const EVERYTHING: u64 = u64::MAX;
+static SHOOTDOWN_REQUEST: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(NOTHING) }; crate::smp::MAX_CPUS];
+
+/// Tell every other processor to forget one page, and wait until they have.
 ///
 /// The TLB is per-CPU and the hardware does not keep them coherent. Unmapping a
 /// page that other processors share -- anything in the kernel's own address
@@ -303,17 +312,101 @@ pub unsafe fn start_processor(apic_id: u8, trampoline: u64) {
 /// someone else. Nothing faults; they simply keep reading and writing memory
 /// that is no longer theirs, which is the worst shape a bug can take.
 ///
+/// Two things changed here from the first version, which flushed everything and
+/// did not wait. Naming the page means one `invlpg` instead of discarding every
+/// translation the processor had learned. Waiting means the unmap has actually
+/// taken effect everywhere by the time it returns, rather than at some point
+/// afterwards -- the old comment argued the gap was harmless because the sender
+/// had already finished, which is true only if nothing reuses the frame in the
+/// meantime, and freeing it is precisely what happens next.
+///
 /// A process's own tables need no shootdown: only one CPU runs it at a time, and
 /// the CR3 reload on the way in flushes everything non-global.
+pub fn shoot_down_page(address: u64) {
+    broadcast_shootdown(if address == NOTHING { EVERYTHING } else { address });
+}
+
+/// Tell every other processor to discard all of its cached translations.
+///
+/// For the cases where naming one page is not enough -- freeing an intermediate
+/// page table invalidates whatever the processors cached *about the structure*,
+/// not just one leaf.
 pub fn broadcast_tlb_shootdown() {
+    broadcast_shootdown(EVERYTHING);
+}
+
+fn broadcast_shootdown(what: u64) {
     if APIC_VIRT.load(Ordering::Acquire) == 0 {
         return;
     }
-    crate::smp::for_each_other_online_processor(|apic_id| {
+
+    let mut targeted = 0u64;
+    crate::smp::for_each_other_online_processor(|index, apic_id| {
+        let slot = &SHOOTDOWN_REQUEST[index];
+
+        // Merge rather than overwrite. Another processor may already have asked
+        // this one for a different page, and dropping that request would leave
+        // a stale translation alive with nothing left to report it. Two
+        // different pages become "everything", which is always a safe answer.
+        let _ = slot.try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            Some(match pending {
+                NOTHING => what,
+                already if already == what => already,
+                _ => EVERYTHING,
+            })
+        });
+
+        targeted |= 1 << index;
+
         // SAFETY: the id came from the online set, so that processor has its
         // descriptor tables loaded and can take the vector.
         unsafe { send_ipi(apic_id, TLB_SHOOTDOWN_VECTOR) };
     });
+
+    if targeted == 0 {
+        return;
+    }
+
+    // Wait for every target to report in. The budget exists because a hang here
+    // would be worse than a stale translation, not because exceeding it is
+    // expected -- a processor that never answers has already stopped being a
+    // processor.
+    for _ in 0..50_000_000u64 {
+        // Servicing our own slot while waiting is what makes this deadlock-free.
+        // Two processors can be inside this loop at the same time, each waiting
+        // on the other, and callers reach it with interrupts masked -- so
+        // neither would ever take the other's IPI. Doing the work inline instead
+        // of relying on delivery breaks that cycle.
+        service_shootdown_request();
+
+        let outstanding = (0..crate::smp::MAX_CPUS).any(|index| {
+            targeted & (1 << index) != 0
+                && SHOOTDOWN_REQUEST[index].load(Ordering::Acquire) != NOTHING
+        });
+        if !outstanding {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+
+    crate::println!("warning: a TLB shootdown went unacknowledged");
+}
+
+/// Carry out whatever this processor has been asked to invalidate.
+///
+/// Idempotent and safe to call at any time: it takes the request, so a second
+/// call with nothing outstanding does nothing.
+pub fn service_shootdown_request() {
+    let index = crate::smp::cpu_index();
+    let Some(slot) = SHOOTDOWN_REQUEST.get(index) else {
+        return;
+    };
+
+    match slot.swap(NOTHING, Ordering::AcqRel) {
+        NOTHING => {}
+        EVERYTHING => x86_64::instructions::tlb::flush_all(),
+        page => x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page)),
+    }
 }
 
 /// Send a fixed-delivery interrupt to one processor.

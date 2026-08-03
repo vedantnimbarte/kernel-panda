@@ -272,6 +272,49 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**The lock is a ticket lock, so waiters are served in the order they arrived.**
+A test-and-set spinlock has no queue: every waiter races for the same word on
+release, and the core whose cache already holds the line tends to win again.
+Under sustained contention on the heap or the frame allocator — which every core
+touches — that leaves a processor waiting for reasons nothing in the code
+explains. Each caller now takes a number and waits for it, so the longest waiter
+is always next. The cost is one extra atomic per acquisition, against a single
+contended cache line bouncing between four cores.
+
+**A TLB shootdown names one page and waits for an answer.** It used to flush
+everything and return immediately. The old comment argued the gap was harmless
+because the sender had already finished its unmap — true only if nothing reuses
+the frame in the meantime, and freeing it is exactly what happens next.
+
+Waiting introduces a deadlock that has to be designed out rather than hoped
+away: two processors can each be waiting on the other, and callers arrive with
+interrupts already masked, so neither would ever take the other's IPI. The
+request lives in a per-CPU slot, and a processor waiting for acknowledgements
+services *its own* slot inline on every pass of the wait loop. That breaks the
+cycle without relying on interrupt delivery at all. Requests merge rather than
+overwrite — two different pages become "everything", because dropping one would
+leave a stale translation alive with nothing left to report it.
+
+Freeing an intermediate page table still flushes wholesale: what the processors
+cached is the structure, not one leaf, and a single-address invalidation does not
+reach it.
+
+**`cpu_index` takes no lock.** It is called from the timer handler, from every
+scheduler operation and from every wake, and it used to lock a `Vec` and search
+it — a contended shared lock on the hottest path in the kernel, which is what the
+scheduler had just been restructured to avoid. The IPI fan-out *cloned* that
+`Vec`, so a page unmap could end up inside the heap allocator. Both now read a
+fixed table of atomics written once during boot.
+
+**System calls are preemptible.** The gate is a trap gate, not an interrupt gate,
+so `IF` survives the transition. As an interrupt gate a syscall ran to completion
+however long it took, the calling thread's quantum meant nothing, and every
+future call had to stay short — a constraint a microkernel cannot keep, since the
+point is that calls do real work. What it demands in return is that the
+dispatcher tolerate preemption: every lock it touches masks interrupts for the
+window it holds them, the user-memory windows are bracketed by a guard that does
+the same, and the frame it edits lives on the calling thread's own kernel stack.
+
 **Run queues are per-CPU, and an idle core steals rather than idling.** A thread
 goes back on the queue of the processor that last ran it, so it tends to return
 to a core whose caches still know about it. Left there, that would be four
@@ -459,17 +502,15 @@ which only means the hang would be intermittent.
   interrupt yet, so console input is still polled.
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
   timing is exactly where this class of code breaks.
-* `spin::Mutex` still has no priority awareness and no fairness — a contended
-  lock is won by whichever core asks at the right moment.
+* The ticket lock is fair but not priority-aware: a `High` thread queues behind
+  a `Low` one that asked first. Fixing that means priority inheritance, which
+  needs the lock to know who holds it and the scheduler to be reachable from the
+  locking primitive.
 * The thread table is still one lock. The timer tick no longer takes it and the
   run queues are per-CPU, but a context *switch* does. Removing that means each
   thread being owned by exactly one processor's queue, with migration
   transferring ownership under both locks in index order — a real ownership model
   rather than a data-structure change.
-* TLB shootdown flushes the whole TLB rather than one page, and does not wait for
-  the other cores to acknowledge. Sufficient here because shootdowns only follow
-  an unmap the sender has already completed, but a finer implementation would
-  invalidate a single address and confirm receipt.
 * The APIC MMIO page is mapped uncached at its own virtual address while the
   bootloader's physical-memory window also maps it cached. Two mappings with
   different cache attributes is architecturally discouraged; it works here, and
@@ -486,9 +527,6 @@ which only means the hang would be intermittent.
 * Input is polled from the timer rather than driven by an interrupt, which caps
   throughput at the tick rate. Routing IRQ 4 needs the IOAPIC, and finding the
   IOAPIC properly needs ACPI.
-* Syscalls run with interrupts disabled, because the gate is an interrupt gate.
-  Long-running calls are therefore not preemptible; only `write` is bounded
-  today, and every future call has to stay short or the quantum is a fiction.
 
 ## Phase 3 progress
 

@@ -216,6 +216,34 @@ fn user_code_cannot_execute_its_own_stack() {
 }
 
 #[test_case]
+fn a_system_call_can_be_preempted() {
+    // As an interrupt gate, `int 0x80` cleared IF on the way in and a syscall
+    // ran to completion however long it took -- the calling thread's quantum was
+    // a fiction, and every call had to stay short or the machine stuttered. A
+    // trap gate leaves IF as the caller had it.
+    //
+    // This observes the property directly rather than trying to catch a
+    // preemption in the act: the dispatcher records, for every call, whether the
+    // timer could have reached it.
+    let before = syscall::syscall_count();
+    assert!(
+        run_user_program("preempt-probe", demo_thread),
+        "the probe program never finished"
+    );
+
+    let made = syscall::syscall_count() - before;
+    assert!(made > 0, "the probe program made no system calls");
+    assert_eq!(
+        syscall::preemptible_syscall_count(),
+        syscall::syscall_count(),
+        "{} of {} system calls ran with interrupts disabled; the gate is not a \
+         trap gate, so a long call cannot be preempted",
+        syscall::syscall_count() - syscall::preemptible_syscall_count(),
+        syscall::syscall_count()
+    );
+}
+
+#[test_case]
 fn the_kernel_survives_a_user_fault() {
     // Reaching this case at all means the fault above did not panic the kernel,
     // which is PRD 1.2's requirement. Confirm scheduling still works afterwards.
