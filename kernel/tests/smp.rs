@@ -125,6 +125,53 @@ fn work_reaches_more_than_one_processor() {
     );
 }
 
+#[test_case]
+fn a_lock_holder_cannot_be_preempted() {
+    use panda_kernel::sync;
+
+    // The kernel has no priority inheritance, and the argument for why it does
+    // not need any rests entirely on this: every lock is held with interrupts
+    // masked, so a holder runs its critical section to completion and a waiter
+    // waits for that section rather than for a scheduling decision. Unbounded
+    // priority inversion needs a holder that is not running.
+    //
+    // Checking the property directly is worth more than checking the lock types,
+    // because it is the property the argument uses.
+    assert!(
+        sync::interrupts_enabled(),
+        "this case is meaningless if interrupts were already off"
+    );
+
+    {
+        let _held = CONTENDED.lock();
+        // A plain `Mutex`, reached the way its callers reach it.
+        assert!(
+            !sync::interrupts_enabled(),
+            "a lock is held with interrupts enabled; its holder can be \
+             preempted, and a high-priority waiter can then be starved for as \
+             long as the scheduler keeps choosing something else"
+        );
+    }
+    assert!(
+        sync::interrupts_enabled(),
+        "the lock did not restore interrupts on release"
+    );
+
+    // The frame allocator, which every core touches and which the timer handler
+    // reaches through thread teardown.
+    panda_kernel::memory::frame::with(|_| {
+        assert!(
+            !sync::interrupts_enabled(),
+            "the frame allocator is held with interrupts enabled"
+        );
+    });
+
+    // The scheduler's own lock, taken here through a read that needs it.
+    assert!(sync::interrupts_enabled(), "interrupts stayed off");
+}
+
+/// Deliberately a plain `Mutex` rather than an `IrqMutex`, so the case above is
+/// testing the type most likely to get this wrong.
 static CONTENDED: Mutex<u64> = Mutex::new(0);
 static GRABS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static LOCK_STOP: AtomicBool = AtomicBool::new(false);

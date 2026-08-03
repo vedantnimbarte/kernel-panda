@@ -318,13 +318,32 @@ pixels behind; and having cleared, it has to redraw *every* surface intersecting
 the cleared region, not just the newest. Both directions are tested, because
 each one alone passes a plausible-looking wrong implementation.
 
-Damage is accumulated as a single rectangle covering both a surface's old and
-new bounds. One rectangle cannot grow without bound and is cheap to intersect
-against; the cost is redrawing some pixels that did not need it.
+Damage is a list of up to eight regions, not one bounding box. A surface that
+moves damages where it was and where it went, and one rectangle covering both
+recomposes everything in between — for a surface crossing the screen, the
+screen. When the list fills, the pair whose merged box wastes least is combined,
+so it degrades toward the old behaviour rather than failing.
 
-`depth_decides_what_is_on_top_not_arrival_order` sends the nearer surface
-*first*, so a compositor painting in arrival order fails it — which the previous
-one does, checked rather than assumed.
+Tearing *is* observed, not argued: a thread on another core samples one pixel
+while that area is recomposed repeatedly, and checks it never catches the
+cleared-to-black intermediate state. Around 25,000 samples per run see it zero
+times; composing straight into the scanout instead makes it about 16.
+
+Writing that test found something the design does not cover. The final copy to
+the scanout is a `memcpy`, and a 24-bit pixel is three bytes written
+non-atomically — so a reader can catch one byte updated and the next not. The
+first version of the test alternated blue `(FF,00,00)` and green `(00,FF,00)`,
+and a half-written pixel between them reads as `(00,00,00)`: indistinguishable
+from the cleared state it was hunting. Double buffering prevents a *frame* from
+being seen half-composed; it does not make the copy atomic, and was never going
+to. The test now alternates two colours differing in one byte, so it measures
+the property it names.
+
+Each of these was checked by breaking it. `depth_decides_what_is_on_top_not_
+arrival_order` fails against the previous arrival-order compositor;
+`a_surface_that_moves_far_does_not_repaint_everything_between` fails against a
+single bounding box; `the_display_never_shows_a_half_composed_frame` fails
+against composition without the back buffer.
 
 **PCI configuration space is reached by memory when the firmware describes a
 window.** The port mechanism latches an address in `0xCF8` and reads `0xCFC`,
@@ -366,6 +385,24 @@ input asserted with the entry still masked stays asserted.
 The timer handler still polls the console when routing did not happen — no ACPI,
 no chip, a firmware layout this does not understand. A machine whose only
 interface is the serial port should be slow rather than deaf.
+
+**There is no priority inheritance, and the reason is structural.** Unbounded
+priority inversion needs a lock holder that is *not running*: a `Low` thread
+takes a lock, is preempted, and a `High` thread waits for as long as the
+scheduler keeps choosing something in between.
+
+Acquiring a lock masks interrupts on the holder's processor, and every lock in
+the kernel is that one lock. A thread that cannot be interrupted cannot be
+preempted, so a holder always runs its critical section to completion and a
+waiter waits for that section rather than for a scheduling decision. Boosting a
+holder that is already running and cannot be descheduled would change nothing.
+
+The masking used to live in a separate `IrqMutex` wrapper, which left every call
+site to pick the right type — a decision nobody should have to get right
+repeatedly, and the I/O APIC's register lock got it wrong. Folding it into the
+one lock makes the invariant hold by construction, and
+`a_lock_holder_cannot_be_preempted` checks the property the argument rests on
+rather than the types.
 
 **The lock is a ticket lock, so waiters are served in the order they arrived.**
 A test-and-set spinlock has no queue: every waiter races for the same word on
@@ -594,9 +631,9 @@ which only means the hang would be intermittent.
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
   timing is exactly where this class of code breaks.
 * The ticket lock is fair but not priority-aware: a `High` thread queues behind
-  a `Low` one that asked first. Fixing that means priority inheritance, which
-  needs the lock to know who holds it and the scheduler to be reachable from the
-  locking primitive.
+  a `Low` one that asked first. That is bounded by a critical section rather than
+  by a scheduling decision — see the note on priority inversion below — so it is
+  a fairness cost, not a liveness one.
 * The thread table is still one lock. The timer tick no longer takes it and the
   run queues are per-CPU, but a context *switch* does. Removing that means each
   thread being owned by exactly one processor's queue, with migration
@@ -605,21 +642,17 @@ which only means the hang would be intermittent.
 * One user program is still hand-written assembly: the W^X test, which plants
   two bytes of machine code on its own stack and jumps to them. That is not
   something Rust will express, and it is the right tool for that one job.
-* The compositor's damage is one rectangle rather than a region list, so two
-  small changes at opposite corners recompose everything between them. A region
-  list is the answer, and it needs an allocator the userland does not have.
-* Nothing catches tearing from inside the machine. The back buffer's existence
-  is checked; that the display never sees a half-composed frame is argued from
-  the structure, not observed.
-* The ECAM window is clamped to the first 64 buses. Firmware routinely describes
-  all 256 whether or not anything is on them, and mapping that eagerly is 65,536
-  page-table entries at boot for buses that will never answer. A device beyond
-  the cap still works through the port mechanism; only its extended
-  configuration space is out of reach.
-* The I/O APIC decides which pin owns a global interrupt by base address alone;
-  it does not read each chip's redirection-entry count. Exact with one I/O APIC,
-  which is every machine this has run on, and wrong on a machine with two whose
-  interrupt ranges are not contiguous.
+* The compositor tracks eight damage regions. Beyond that it merges the least
+  wasteful pair, degrading toward a single bounding box — which is the right
+  failure mode, but a workload with many small scattered updates will hit it.
+* A 24-bit pixel reaches the screen as three separate byte writes, so the display
+  can latch a half-written pixel during the flush. Invisible in practice at these
+  sizes, and not something double buffering addresses; fixing it means writing
+  whole aligned words, which means the scanout and the back buffer agreeing on a
+  32-bit format.
+* ECAM maps a bus the first time something reads above offset 0xFF on it, and
+  never unmaps. A workload touching every bus ends up with the whole window
+  mapped, which is what the eager version did to begin with.
 
 ## Phase 3 progress
 

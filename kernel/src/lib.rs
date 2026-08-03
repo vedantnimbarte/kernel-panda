@@ -23,6 +23,7 @@ use bootloader_api::BootInfo;
 
 pub mod acpi;
 pub mod allocator;
+pub mod block;
 pub mod arch;
 pub mod console;
 pub mod elf;
@@ -119,6 +120,12 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
         map_pci_config(rsdp);
     }
+
+    // Storage last: it needs PCI to find the controller and the heap for the
+    // device list, and it is the first subsystem whose state outlives a reboot.
+    //
+    // SAFETY: called once, during boot, with PCI and paging up.
+    unsafe { block::init() };
 
     // Other processors last of all: they need the APIC calibrated, the heap for
     // their stacks, and the scheduler ready to adopt them.

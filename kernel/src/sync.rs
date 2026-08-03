@@ -1,4 +1,4 @@
-//! Synchronisation primitives.
+﻿//! Synchronisation primitives.
 //!
 //! The rest of the kernel locks through this module rather than naming a crate
 //! directly, so the primitive underneath can change without touching call sites.
@@ -29,9 +29,33 @@ pub use x86_64::instructions::interrupts::without_interrupts;
 /// extra atomic per acquisition, which is nothing beside a single contended
 /// cache line bouncing between four cores.
 ///
-/// This is not priority-aware: a `High` thread queues behind a `Low` one that
-/// asked first. Fixing that means priority inheritance, which needs the lock to
-/// know who holds it and the scheduler to be reachable from here.
+/// ## Why there is no priority inheritance
+///
+/// The usual reason to want it is unbounded priority inversion: a `Low` thread
+/// takes a lock, is preempted, and a `High` thread then waits on it for as long
+/// as the scheduler keeps choosing something in between. The waiting is
+/// unbounded because the holder is not running.
+///
+/// That cannot happen here, and the reason is structural rather than lucky:
+/// **acquiring this lock masks interrupts on the holder's processor**, and every
+/// lock in the kernel is this one. A thread that cannot be interrupted cannot be
+/// preempted, so a holder always runs its critical section to completion and a
+/// waiter waits for that section, not for a scheduling decision.
+///
+/// The masking used to live in a separate `IrqMutex` wrapper, leaving each call
+/// site to pick the right type. That is a decision nobody should have to get
+/// right repeatedly, and the one place that got it wrong -- the I/O APIC's
+/// register lock -- was a plain lock taken with interrupts live.
+///
+/// What remains is bounded inversion: a `High` thread can wait behind a `Low`
+/// one for the length of a critical section, and the ticket order means it waits
+/// behind everyone who asked first. That is a fairness cost measured in
+/// microseconds, not a liveness problem, and priority inheritance would not
+/// remove it -- boosting a holder that is already running and cannot be
+/// descheduled changes nothing.
+///
+/// The invariant is what makes the argument, so `a_lock_holder_cannot_be_
+/// preempted` checks it rather than trusting the reading above.
 pub struct Mutex<T> {
     /// Handed out to arriving callers.
     next_ticket: AtomicUsize,
@@ -39,6 +63,12 @@ pub struct Mutex<T> {
     now_serving: AtomicUsize,
     value: UnsafeCell<T>,
 }
+
+/// Kept as a name for the cases that want to say "this one is definitely
+/// reachable from an interrupt handler". Every lock masks interrupts now, so it
+/// is the same type.
+pub type IrqMutex<T> = Mutex<T>;
+pub type IrqMutexGuard<'a, T> = MutexGuard<'a, T>;
 
 // SAFETY: the lock is what makes `&T` from several threads sound, and it hands
 // out `&mut T` to one holder at a time. `T: Send` is required because the value
@@ -57,31 +87,59 @@ impl<T> Mutex<T> {
     }
 
     /// Wait for this caller's turn and take the lock.
+    ///
+    /// Interrupts are masked before the ticket is taken, not after: a tick
+    /// landing between the two would put this processor in the queue and then
+    /// run a handler that queues behind itself.
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        // Sampled before disabling, so nested locks restore correctly -- only
+        // the outermost re-enables.
+        let restore = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
 
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         while self.now_serving.load(Ordering::Acquire) != ticket {
             core::hint::spin_loop();
         }
 
-        MutexGuard { lock: self }
+        MutexGuard {
+            lock: self,
+            restore,
+        }
     }
 
     /// Take the lock only if it is free and nobody is already queued.
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        let restore = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+
         let serving = self.now_serving.load(Ordering::Acquire);
         // Only succeeds when the queue is empty: `next_ticket` still equals the
         // ticket being served. Taking a number and hoping would make this a
         // blocking call under another name.
-        self.next_ticket
+        let taken = self
+            .next_ticket
             .compare_exchange(serving, serving + 1, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| MutexGuard { lock: self })
+            .is_ok();
+
+        if !taken {
+            if restore {
+                x86_64::instructions::interrupts::enable();
+            }
+            return None;
+        }
+
+        Some(MutexGuard {
+            lock: self,
+            restore,
+        })
     }
 }
 
 pub struct MutexGuard<'a, T> {
     lock: &'a Mutex<T>,
+    /// Whether this acquisition is the one that turned interrupts off.
+    restore: bool,
 }
 
 impl<T> Deref for MutexGuard<'_, T> {
@@ -110,75 +168,10 @@ impl<T> Drop for MutexGuard<'_, T> {
         // advances this, so there is nothing to race with.
         let next = self.lock.now_serving.load(Ordering::Relaxed).wrapping_add(1);
         self.lock.now_serving.store(next, Ordering::Release);
-    }
-}
 
-/// A spinlock that also masks interrupts on the holding CPU.
-///
-/// Required for any lock that can be taken from both thread context and an
-/// interrupt handler. Without the masking, a handler that needs the lock can
-/// interrupt the very thread holding it, and then spins forever: the holder
-/// cannot run again to release it, because the handler is standing on it. The
-/// heap allocator is exactly this case -- the timer handler reaps threads and
-/// buffers console input, and both of those allocate.
-///
-/// This is the right primitive on a multi-core machine too, not just a
-/// single-core stand-in. Masking is per-CPU and stops *this* core deadlocking
-/// against itself; the spin still provides mutual exclusion against the others.
-/// What it must never be mistaken for is a way to get exclusion by disabling
-/// interrupts alone -- that only ever worked with one core.
-///
-/// Inherits the ticket ordering of [`Mutex`], so a core cannot be starved of a
-/// lock the others are hammering.
-pub struct IrqMutex<T> {
-    inner: Mutex<T>,
-}
-
-impl<T> IrqMutex<T> {
-    pub const fn new(value: T) -> Self {
-        Self {
-            inner: Mutex::new(value),
-        }
-    }
-
-    pub fn lock(&self) -> IrqMutexGuard<'_, T> {
-        // Sample before disabling, so nested locks restore correctly: only the
-        // outermost one re-enables.
-        let restore = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::disable();
-
-        IrqMutexGuard {
-            guard: Some(self.inner.lock()),
-            restore,
-        }
-    }
-}
-
-pub struct IrqMutexGuard<'a, T> {
-    guard: Option<MutexGuard<'a, T>>,
-    restore: bool,
-}
-
-impl<T> Deref for IrqMutexGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        self.guard.as_ref().expect("guard taken only on drop")
-    }
-}
-
-impl<T> DerefMut for IrqMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        self.guard.as_mut().expect("guard taken only on drop")
-    }
-}
-
-impl<T> Drop for IrqMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        // Order matters: release the spinlock first, then re-enable. Doing it
-        // the other way round reopens the exact window this type exists to
-        // close, for the instant between the two.
-        drop(self.guard.take());
+        // Order matters: hand the lock on first, then re-enable. The other way
+        // round reopens the window this exists to close, for the instant
+        // between the two.
         if self.restore {
             x86_64::instructions::interrupts::enable();
         }

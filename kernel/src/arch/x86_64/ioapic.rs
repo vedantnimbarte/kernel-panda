@@ -28,7 +28,7 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use crate::acpi::IoApic;
 use crate::memory::paging;
-use crate::sync::Mutex;
+use crate::sync::IrqMutex;
 
 /// Where I/O APIC registers are mapped, one page apiece.
 ///
@@ -68,10 +68,11 @@ static PHYSICAL: [AtomicU64; MAX_IO_APICS] = [const { AtomicU64::new(0) }; MAX_I
 /// Serialises the two-step select-then-access sequence.
 ///
 /// The index register is shared state on the chip itself: two processors
-/// interleaving would have one read the value the other selected. Nothing here
-/// runs from an interrupt handler, but the lock masks interrupts anyway -- a
-/// timer landing between the select and the access would be the same bug.
-static ACCESS: Mutex<()> = Mutex::new(());
+/// interleaving would have one read the value the other selected. A timer
+/// landing between the select and the access would be the same bug, so this
+/// masks interrupts -- and that is also what keeps it inside the kernel-wide
+/// rule that a lock holder is never preemptible. See [`crate::sync`].
+static ACCESS: IrqMutex<()> = IrqMutex::new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoApicError {

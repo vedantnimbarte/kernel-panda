@@ -292,6 +292,31 @@ fn make_images(kernel: &Path, verbose_boot: bool) -> Result<Images, String> {
 // QEMU
 // ---------------------------------------------------------------------------
 
+/// Bytes of scratch disk handed to the guest.
+///
+/// Small on purpose: it is created fresh for every QEMU launch, and every test
+/// kernel launches its own, so the cost is paid nineteen times a run.
+const SCRATCH_DISK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Create an empty raw disk image for the guest to write to.
+///
+/// Zero-filled rather than left as whatever was on disk, so a test reading a
+/// sector it never wrote sees a defined value.
+fn scratch_disk() -> Result<PathBuf, String> {
+    let path = workspace_root()
+        .join("target")
+        .join("images")
+        .join("scratch.img");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("could not create {parent:?}: {e}"))?;
+    }
+
+    let file = fs::File::create(&path).map_err(|e| format!("could not create {path:?}: {e}"))?;
+    file.set_len(SCRATCH_DISK_BYTES)
+        .map_err(|e| format!("could not size {path:?}: {e}"))?;
+    Ok(path)
+}
+
 fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, String> {
     let mut cmd = Command::new(find_qemu()?);
 
@@ -320,6 +345,23 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, Str
     // provide goes untested, and a missing `stac` reads as working code. Asking
     // for them explicitly is what makes those paths real here.
     cmd.args(["-cpu", "qemu64,+smep,+smap"]);
+    // A scratch SATA disk for the block driver to talk to.
+    //
+    // Attached through q35's own ICH9 AHCI controller, which is the same
+    // interface most x86 machines expose for SATA -- so the driver exercised
+    // here is the driver a real machine would need, not a QEMU-only shim.
+    //
+    // A fresh image per run: the tests write to it, and a disk carrying over
+    // state from a previous run would make failures depend on what ran before.
+    // q35 already has an ICH9 AHCI controller, and the boot drive above lands on
+    // its first port. Adding a second controller instead of using the one that
+    // is there gives the firmware two things to boot from and it picks the empty
+    // one. This hangs on the second port of the existing controller.
+    let disk = scratch_disk()?;
+    cmd.arg("-drive")
+        .arg(format!("id=panda-disk,if=none,format=raw,file={}", qpath(&disk)));
+    cmd.args(["-device", "ide-hd,drive=panda-disk,bus=ide.1"]);
+
     cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     // Turn a triple fault into a dead VM instead of an invisible reboot loop.
     cmd.arg("-no-reboot");

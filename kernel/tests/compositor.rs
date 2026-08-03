@@ -19,7 +19,9 @@ use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::console::{framebuffer, input};
 use panda_kernel::ipc::{self, EndpointId, Rights};
 use panda_kernel::sched::ThreadId;
-use panda_kernel::{arch::x86_64::halt_loop, gbm, sched, sync, testing, userspace, BOOTLOADER_CONFIG};
+use panda_kernel::{
+    arch::x86_64::halt_loop, gbm, sched, smp, sync, testing, userspace, BOOTLOADER_CONFIG,
+};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -293,6 +295,117 @@ fn a_surface_that_moves_far_does_not_repaint_everything_between() {
         sentinel,
         "a pixel midway between a surface's old and new positions was \
          repainted; damage is one bounding box rather than a region list"
+    );
+}
+
+static TEAR_STOP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static TEAR_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static TEAR_SEEN_CLEARED: AtomicU64 = AtomicU64::new(0);
+static TEAR_X: AtomicU64 = AtomicU64::new(0);
+static TEAR_Y: AtomicU64 = AtomicU64::new(0);
+
+/// Watches one pixel from another core for the intermediate state.
+///
+/// Composition clears a region to black before drawing into it. In the back
+/// buffer nobody can see that; done straight into the scanout it is a black
+/// flash the display can latch. So "did anyone ever observe black here" is the
+/// question, and it is answerable only from a processor that is not the one
+/// compositing.
+fn tear_watcher() {
+    let x = TEAR_X.load(Ordering::Acquire) as usize;
+    let y = TEAR_Y.load(Ordering::Acquire) as usize;
+
+    while !TEAR_STOP.load(Ordering::Acquire) {
+        let pixel = pixel_at(x, y);
+        TEAR_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        if pixel == (0x00, 0x00, 0x00) {
+            TEAR_SEEN_CLEARED.fetch_add(1, Ordering::Relaxed);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[test_case]
+fn the_display_never_shows_a_half_composed_frame() {
+    if smp::online_count() < 2 {
+        panda_kernel::serial_println!("  (skipped: needs a second processor to watch from)");
+        return;
+    }
+
+    let (endpoint, compositor) = start_compositor();
+
+    // Establish a surface, then watch one of its pixels while it is repeatedly
+    // recomposed underneath a second surface.
+    //
+    // Well down the screen and off to the right, because the kernel's own
+    // framebuffer console draws test names from the top left and blanks the
+    // glyph cells it writes. A watcher sitting in that region catches the
+    // console clearing a character cell and reports it as a torn frame -- which
+    // it did, once in twenty-three thousand samples, until this moved.
+    let x = 820u64;
+    let y = 600u64;
+    present_at_depth(endpoint, compositor, 0x0000FF, x, y, 1);
+    assert!(
+        spin_until(|| pixel_at(x as usize + 10, y as usize + 10) == (0xFF, 0x00, 0x00)),
+        "the watched surface never appeared"
+    );
+
+    TEAR_X.store(x + 10, Ordering::Release);
+    TEAR_Y.store(y + 10, Ordering::Release);
+    TEAR_STOP.store(false, Ordering::Release);
+    TEAR_SAMPLES.store(0, Ordering::Relaxed);
+    TEAR_SEEN_CLEARED.store(0, Ordering::Relaxed);
+
+    let watcher = sched::spawn_with_priority(
+        "tear-watcher",
+        tear_watcher,
+        sched::Priority::High,
+    )
+    .expect("spawn failed");
+
+    // Recompose that exact area several times over, alternating between two
+    // colours chosen so that *no* partial pixel write between them can read as
+    // black: 0x0000FF is (FF,00,00) and 0x00FFFF is (FF,FF,00), so only the
+    // middle byte changes and every intermediate is one of the two.
+    //
+    // That matters, because the final copy to the scanout is a memcpy and a
+    // three-byte pixel is not written atomically. Alternating blue and green
+    // -- (FF,00,00) and (00,FF,00) -- lets a reader catch the first byte updated
+    // and the second not, which reads as black and looks exactly like the
+    // cleared state this is hunting for. Double buffering does not make the
+    // flush atomic and was never going to; conflating the two would have this
+    // case failing for a reason it does not name.
+    // Driven by how much the watcher has actually seen, not by a fixed number
+    // of rounds. A busy host gives the watcher less CPU, and a round count tuned
+    // on an idle one then fails for want of samples rather than for anything
+    // about the compositor -- which is exactly how this first went wrong.
+    const WANTED_SAMPLES: u64 = 4_000;
+    const MAX_ROUNDS: u64 = 60;
+
+    let mut round = 0;
+    while round < MAX_ROUNDS && TEAR_SAMPLES.load(Ordering::Relaxed) < WANTED_SAMPLES {
+        let colour = if round % 2 == 0 { 0x00FFFF } else { 0x0000FF };
+        present_at_depth(endpoint, compositor, colour, x, y, 2);
+        round += 1;
+    }
+
+    TEAR_STOP.store(true, Ordering::Release);
+    sched::join(watcher);
+
+    let samples = TEAR_SAMPLES.load(Ordering::Relaxed);
+    let cleared = TEAR_SEEN_CLEARED.load(Ordering::Relaxed);
+    panda_kernel::serial_println!("  ({samples} samples, {cleared} saw the cleared state)");
+
+    assert!(
+        samples > 500,
+        "only {samples} samples taken over {round} rounds; the watcher barely \
+         ran, so seeing nothing proves nothing"
+    );
+    assert_eq!(
+        cleared, 0,
+        "a processor watching the screen saw it cleared to black {cleared} \
+         times out of {samples} while a surface was being recomposed; \
+         composition is reaching the display before it is finished"
     );
 }
 
