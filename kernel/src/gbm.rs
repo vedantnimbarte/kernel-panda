@@ -42,15 +42,18 @@ pub fn bytes_per_pixel() -> u32 {
 /// memory by asking for an enormous buffer.
 const MAX_BUFFER_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Buffers one thread may own at once.
-pub const MAX_BUFFERS_PER_THREAD: usize = 16;
+/// Buffers a thread may own at once by default.
+///
+/// The real limit is per-thread and set by whoever spawned it; see
+/// [`crate::quota`].
+pub const MAX_BUFFERS_PER_THREAD: usize = crate::quota::Quota::DEFAULT.buffers;
 
-/// Total bytes one thread may hold across all its buffers.
+/// Total bytes a thread may hold across all its buffers, by default.
 ///
 /// The per-allocation cap alone is not a quota: a process just asks sixteen
 /// times. Graphics memory is the easiest thing in the system to exhaust, because
 /// a single full-screen surface is already megabytes.
-pub const MAX_BYTES_PER_THREAD: u64 = 64 * 1024 * 1024;
+pub const MAX_BYTES_PER_THREAD: u64 = crate::quota::Quota::DEFAULT.buffer_bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BufferId(pub u64);
@@ -162,7 +165,8 @@ pub fn create(owner: ThreadId, width: u32, height: u32) -> Result<BufferId, Erro
                 (count + 1, bytes + buffer.info.size)
             });
 
-        if count >= MAX_BUFFERS_PER_THREAD || bytes.saturating_add(size) > MAX_BYTES_PER_THREAD {
+        let allowance = crate::quota::of(owner);
+        if count >= allowance.buffers || bytes.saturating_add(size) > allowance.buffer_bytes {
             return Err(Error::QuotaExceeded);
         }
         Ok(())

@@ -136,7 +136,15 @@ pub unsafe fn init() -> Result<u32, ApicError> {
     // the allocator might hand out.
     unsafe { paging::map_to_frame(page, frame, flags) }.map_err(ApicError::MappingFailed)?;
 
+    APIC_PHYSICAL.store(physical_base, Ordering::Release);
     APIC_VIRT.store(APIC_VIRT_BASE, Ordering::Release);
+
+    // The bootloader's physical-memory window maps every physical address,
+    // including this one, and it maps RAM cacheable. Two mappings of one page
+    // with different memory types is architecturally undefined: a speculative
+    // read through the cacheable view can return a value the device has since
+    // changed, and nothing reports it.
+    narrow_physical_window_alias(physical_base);
 
     // SAFETY: the MMIO page is mapped and the base recorded, so the register
     // accessors below are valid from here on.
@@ -179,6 +187,49 @@ const ICR_STARTUP: u32 = 0x0000_4600;
 /// The measured tick rate, so secondary processors do not each repeat the PIT
 /// calibration -- it is a property of the machine, not of the CPU.
 static CALIBRATED_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Make the physical-memory window's view of the APIC uncached, so it agrees
+/// with the kernel's own mapping.
+///
+/// The bootloader covers that window with 2 MiB pages, so the alias has to be
+/// split down to 4 KiB before one page of it can be treated differently --
+/// changing the memory type of the whole 2 MiB would take other device
+/// registers, or RAM, with it.
+///
+/// Failures are survivable and quiet. Without this the alias is safe in
+/// practice anyway, because firmware marks the MMIO hole uncacheable by MTRR
+/// and an MTRR of UC cannot be overridden to cacheable by a page-table
+/// attribute. The point of doing it properly is to stop depending on that.
+fn narrow_physical_window_alias(physical_base: u64) {
+    if !paging::is_initialised() {
+        return;
+    }
+
+    let alias = paging::physical_offset() + physical_base;
+    if paging::split_huge_page(alias).is_err() {
+        return;
+    }
+
+    let Some(flags) = paging::flags(alias) else {
+        return;
+    };
+    if flags.contains(PageTableFlags::NO_CACHE) {
+        return;
+    }
+
+    let page = Page::<Size4KiB>::containing_address(alias);
+    let _ = paging::set_flags(
+        page,
+        flags | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH,
+    );
+}
+
+/// Physical base of the APIC's register window, or zero before `init`.
+static APIC_PHYSICAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn physical_base() -> u64 {
+    APIC_PHYSICAL.load(Ordering::Acquire)
+}
 
 /// This processor's Local APIC id.
 pub fn id() -> u8 {
@@ -477,6 +528,44 @@ fn is_supported() -> bool {
 ///
 /// The APIC MMIO page must be mapped and `APIC_VIRT` set.
 unsafe fn calibrate() -> Result<u32, ApicError> {
+    // Several samples, and the median of them.
+    //
+    // One 10 ms sample is at the mercy of whatever else the machine was doing
+    // during those 10 ms. Under a hypervisor -- which is the only place this has
+    // ever run -- the host can deschedule the guest mid-measurement, and the
+    // APIC count then reflects the pause rather than the tick rate. That is a
+    // timer running at the wrong speed for the life of the boot, silently.
+    //
+    // The median rather than the mean, because the errors are not symmetric: a
+    // stolen slice makes a sample far too large and nothing makes one too
+    // small, so an outlier drags a mean but cannot move a median past its
+    // neighbours.
+    const SAMPLES: usize = 5;
+    let mut measurements = [0u32; SAMPLES];
+
+    for measurement in measurements.iter_mut() {
+        // SAFETY: forwarded from this function's contract.
+        *measurement = unsafe { calibrate_once()? };
+    }
+
+    measurements.sort_unstable();
+    let median = measurements[SAMPLES / 2];
+
+    // `median` counts post-divisor ticks over CALIBRATION_MS. Scale to one
+    // second and report that: the initial-count register is denominated in the
+    // same post-divisor ticks, so the caller can divide this by any target rate
+    // directly.
+    let ticks_per_second = median as u64 * (1000 / CALIBRATION_MS) as u64;
+    Ok(ticks_per_second.try_into().unwrap_or(u32::MAX))
+}
+
+/// One PIT-gated measurement of the APIC tick rate, in post-divisor ticks over
+/// [`CALIBRATION_MS`].
+///
+/// # Safety
+///
+/// As [`calibrate`].
+unsafe fn calibrate_once() -> Result<u32, ApicError> {
     let pit_count = (PIT_FREQUENCY / (1000 / CALIBRATION_MS)) as u16;
 
     let mut control = Port::<u8>::new(PIT_CONTROL);
@@ -531,12 +620,7 @@ unsafe fn calibrate() -> Result<u32, ApicError> {
         return Err(ApicError::CalibrationFailed);
     }
 
-    // `elapsed` counts post-divisor ticks over CALIBRATION_MS. Scale to one
-    // second and report that: the initial-count register is denominated in the
-    // same post-divisor ticks, so the caller can divide this by any target rate
-    // directly.
-    let ticks_per_second = elapsed as u64 * (1000 / CALIBRATION_MS) as u64;
-    Ok(ticks_per_second.try_into().unwrap_or(u32::MAX))
+    Ok(elapsed)
 }
 
 /// # Safety

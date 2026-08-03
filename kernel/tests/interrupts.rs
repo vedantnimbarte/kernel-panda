@@ -100,6 +100,44 @@ fn uptime_advances() {
 }
 
 #[test_case]
+fn the_apic_has_no_cacheable_alias() {
+    use panda_kernel::memory::paging;
+    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::VirtAddr;
+
+    // The APIC's registers are mapped uncached at their own address. The
+    // bootloader's physical-memory window maps every physical address including
+    // that one, so without care there is a second mapping of the same device
+    // memory with different cache attributes -- which the architecture leaves
+    // undefined, and which in practice means a speculative read through the
+    // cacheable view can hold a value the device has since changed.
+    let physical = apic::physical_base();
+    if physical == 0 {
+        println!("  (skipped: no APIC)");
+        return;
+    }
+
+    let alias = paging::physical_offset() + physical;
+    let Some(flags) = paging::flags(alias) else {
+        // No alias at all is the ideal outcome.
+        return;
+    };
+
+    println!(
+        "  (alias maps a {} KiB page)",
+        paging::mapping_size(alias).unwrap_or(0) / 1024
+    );
+
+    assert!(
+        flags.contains(PageTableFlags::NO_CACHE),
+        "the physical-memory window maps the APIC cacheable while the kernel's \
+         own mapping is uncached; two views of one device with different memory \
+         types"
+    );
+    let _ = VirtAddr::new(0);
+}
+
+#[test_case]
 fn serial_input_is_routed_through_the_io_apic() {
     use panda_kernel::arch::x86_64::ioapic;
 

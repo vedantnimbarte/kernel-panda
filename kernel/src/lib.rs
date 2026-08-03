@@ -30,6 +30,7 @@ pub mod gbm;
 pub mod ipc;
 pub mod memory;
 pub mod pci;
+pub mod quota;
 pub mod sched;
 pub mod smp;
 pub mod sync;
@@ -227,6 +228,8 @@ pub fn release_thread_resources(thread: sched::ThreadId) {
     gbm::release_thread(thread);
     ipc::release_thread(thread);
     userspace::release_slot(thread);
+    // Last: the three above consult it while they are giving things back.
+    quota::release_thread(thread);
 }
 
 /// Hand the bootloader's framebuffer to the console.

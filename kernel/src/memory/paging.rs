@@ -644,6 +644,154 @@ pub fn set_flags_in(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitError {
+    /// Nothing maps the address.
+    NotMapped,
+    /// No frame for the new table.
+    OutOfFrames,
+}
+
+/// Break the huge page covering `address` into the next size down, repeating
+/// until it is described by 4 KiB entries.
+///
+/// The bootloader covers the physical-memory window with 2 MiB pages where it
+/// can, which is efficient and exactly wrong when one 4 KiB page inside it needs
+/// different treatment -- device registers that must not be cached, say. Without
+/// this, the only options are to change the memory type of the whole 2 MiB or to
+/// leave two mappings of one page disagreeing about it.
+///
+/// A no-op if the address is already mapped by a 4 KiB page.
+///
+/// The permissions move down a level rather than being duplicated: the effective
+/// right to read, write or reach a page from Ring 3 is the AND of every level,
+/// so the new parent entry is made permissive and the leaves carry what the huge
+/// entry said. Execute permission is the other way round -- `NO_EXECUTE` is ORed
+/// down the path -- so it must be cleared on the parent and set on the leaves,
+/// or the split would silently make an executable range non-executable.
+pub fn split_huge_page(address: VirtAddr) -> Result<(), SplitError> {
+    loop {
+        match mapping_size(address) {
+            None => return Err(SplitError::NotMapped),
+            Some(4096) => return Ok(()),
+            Some(_) => {}
+        }
+
+        let offset = physical_offset();
+        let outcome = without_interrupts(|| -> Result<(), SplitError> {
+            let _guard = PAGING.lock();
+            let space = AddressSpace::active();
+
+            // Walk to the entry that is huge. Level 3 covers 1 GiB, level 2
+            // covers 2 MiB; both are split the same way, into 512 entries of
+            // the size below.
+            // SAFETY: the level 4 frame is live and the lock is held.
+            let level_4 = unsafe { table_at(space.frame(), offset) };
+            let l3_entry = &mut level_4[address.p4_index()];
+            if !l3_entry.flags().contains(PageTableFlags::PRESENT) {
+                return Err(SplitError::NotMapped);
+            }
+            let l3_frame = l3_entry.frame().map_err(|_| SplitError::NotMapped)?;
+
+            // SAFETY: reached through a present, non-huge level 4 entry.
+            let level_3 = unsafe { table_at(l3_frame, offset) };
+            let entry = &mut level_3[address.p3_index()];
+            let flags = entry.flags();
+            if !flags.contains(PageTableFlags::PRESENT) {
+                return Err(SplitError::NotMapped);
+            }
+
+            if flags.contains(PageTableFlags::HUGE_PAGE) {
+                let base = entry.addr();
+                // SAFETY: splitting a live 1 GiB entry into 512 2 MiB entries
+                // describing exactly the same memory.
+                return unsafe {
+                    populate_split(entry, base, flags, offset, 2 * 1024 * 1024, true)
+                };
+            }
+
+            let l2_frame = entry.frame().map_err(|_| SplitError::NotMapped)?;
+            // SAFETY: reached through a present, non-huge level 3 entry.
+            let level_2 = unsafe { table_at(l2_frame, offset) };
+            let entry = &mut level_2[address.p2_index()];
+            let flags = entry.flags();
+            if !flags.contains(PageTableFlags::PRESENT) {
+                return Err(SplitError::NotMapped);
+            }
+            if !flags.contains(PageTableFlags::HUGE_PAGE) {
+                // Already 4 KiB below here.
+                return Ok(());
+            }
+
+            let base = entry.addr();
+            // SAFETY: splitting a live 2 MiB entry into 512 4 KiB entries
+            // describing exactly the same memory.
+            unsafe { populate_split(entry, base, flags, offset, 4096, false) }
+        });
+
+        outcome?;
+
+        // The structure changed, not just one translation, so the caches of
+        // paging structures have to go -- here and on every other processor.
+        x86_64::instructions::tlb::flush_all();
+        crate::arch::x86_64::apic::broadcast_tlb_shootdown();
+    }
+}
+
+/// Replace a huge entry with a table of 512 smaller ones covering the same
+/// memory.
+///
+/// # Safety
+///
+/// `entry` must be a present huge entry at the level above `step`, `base` its
+/// frame address, and `PAGING` must be held.
+unsafe fn populate_split(
+    entry: &mut x86_64::structures::paging::page_table::PageTableEntry,
+    base: PhysAddr,
+    flags: PageTableFlags,
+    offset: VirtAddr,
+    step: u64,
+    children_are_huge: bool,
+) -> Result<(), SplitError> {
+    let table_frame = frame::with(|allocator| allocator.allocate()).ok_or(SplitError::OutOfFrames)?;
+
+    // SAFETY: freshly allocated, so nothing else refers to it, and reachable
+    // through the physical window.
+    let table = unsafe { table_at(table_frame, offset) };
+    table.zero();
+
+    let mut child_flags = flags;
+    if !children_are_huge {
+        child_flags.remove(PageTableFlags::HUGE_PAGE);
+    }
+
+    for index in 0..512u64 {
+        table[index as usize].set_addr(base + index * step, child_flags);
+    }
+
+    // Permissive at the parent: reading, writing and Ring 3 access are the AND
+    // of every level, so a restriction set here would apply to all 512. NX is
+    // ORed instead, so it must not be set here either -- the leaves carry it.
+    let mut parent_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+        parent_flags |= PageTableFlags::USER_ACCESSIBLE;
+    }
+    entry.set_addr(table_frame.start_address(), parent_flags);
+
+    Ok(())
+}
+
+/// How large a page maps an address, if any does.
+///
+/// Needed to tell a 4 KiB mapping that can simply have its flags changed from a
+/// huge one that would have to be split first.
+pub fn mapping_size(address: VirtAddr) -> Option<u64> {
+    with_mapper(|mapper| match mapper.translate(address) {
+        TranslateResult::Mapped { frame, .. } => Some(frame.size()),
+        _ => None,
+    })
+}
+
 /// Page flags for an address within `space`.
 pub fn flags_in(space: &AddressSpace, address: VirtAddr) -> Option<PageTableFlags> {
     with_space(space, |mapper| match mapper.translate(address) {

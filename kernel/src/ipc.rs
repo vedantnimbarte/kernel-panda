@@ -34,16 +34,18 @@ pub const MAX_MESSAGE_WORDS: usize = 4;
 /// allocate without limit on its behalf.
 pub const MAX_CAPACITY: usize = 256;
 
-/// Endpoints one thread may own.
+/// Endpoints a thread may own by default.
 ///
 /// Without a cap, a process loops on `create` until the kernel heap is gone and
 /// takes the whole system down with it -- denial of service from Ring 3 with four
-/// instructions.
-pub const MAX_ENDPOINTS_PER_THREAD: usize = 32;
+/// instructions. The real limit is per-thread and set by whoever spawned it;
+/// this is what a thread gets when nobody said otherwise. See [`crate::quota`].
+pub const MAX_ENDPOINTS_PER_THREAD: usize = crate::quota::Quota::DEFAULT.endpoints;
 
-/// Distinct endpoints one thread may hold capabilities for. Bounds the growth of
-/// the capability table when a thread is on the receiving end of many grants.
-pub const MAX_CAPABILITIES_PER_THREAD: usize = 128;
+/// Distinct endpoints a thread may hold capabilities for by default. Bounds the
+/// growth of the capability table when a thread is on the receiving end of many
+/// grants.
+pub const MAX_CAPABILITIES_PER_THREAD: usize = crate::quota::Quota::DEFAULT.capabilities;
 
 /// Shared with user space, so the layout is part of the ABI.
 #[repr(C)]
@@ -139,12 +141,13 @@ impl Registry {
     }
 
     fn add_rights(&mut self, thread: ThreadId, endpoint: u64, rights: Rights) -> Result<(), Error> {
+        let allowance = crate::quota::of(thread).capabilities;
         let list = self.capabilities.entry(thread.0).or_default();
         match list.iter_mut().find(|(id, _)| *id == endpoint) {
             // Widening an existing capability costs no new storage.
             Some((_, existing)) => *existing = existing.union(rights),
             None => {
-                if list.len() >= MAX_CAPABILITIES_PER_THREAD {
+                if list.len() >= allowance {
                     return Err(Error::QuotaExceeded);
                 }
                 list.push((endpoint, rights));
@@ -181,7 +184,7 @@ pub fn create(owner: ThreadId, capacity: usize) -> Result<EndpointId, Error> {
     }
 
     with(|registry| {
-        if registry.endpoints_owned_by(owner) >= MAX_ENDPOINTS_PER_THREAD {
+        if registry.endpoints_owned_by(owner) >= crate::quota::of(owner).endpoints {
             return Err(Error::QuotaExceeded);
         }
 

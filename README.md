@@ -272,6 +272,38 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**Resource limits are per process, and they only ever narrow.** They were four
+constants identical for every thread, which bounds the damage one process can do
+but says a throwaway test program deserves the same share as the compositor, and
+gives whoever launches a process no way to say otherwise. A thread's limits are
+now set by its spawner, capped by what the spawner itself holds — the rule the
+capability system already uses. Without that cap the limits mean nothing: a
+process at its ceiling spawns a helper, grants it a larger quota, and asks the
+helper for memory.
+
+**The APIC has no cacheable alias.** Its registers are mapped uncached at their
+own address, and the bootloader's physical-memory window maps every physical
+address including that one — cacheable, in a 2 MiB page. Two views of one device
+with different memory types is architecturally undefined, and in practice means
+a speculative read through the cacheable one can hold a value the device has
+since changed.
+
+Fixing it needed the huge page split, since changing the memory type of the
+whole 2 MiB would take neighbouring device registers with it. Splitting moves
+the permissions down a level rather than duplicating them: read, write and Ring 3
+access are the AND of every level, so the new parent is made permissive and the
+leaves carry the restrictions — but `NO_EXECUTE` is ORed down the path instead,
+so it has to be cleared on the parent or the split would silently make an
+executable range non-executable.
+
+**Timer calibration takes five samples and uses the median.** One 10 ms sample is
+at the mercy of whatever else the machine was doing during those 10 ms, and under
+a hypervisor — the only place this has run — the host can deschedule the guest
+mid-measurement. The APIC count then reflects the pause, and the timer runs at
+the wrong rate for the life of the boot with nothing to say so. The median rather
+than the mean because the errors are one-sided: a stolen slice makes a sample far
+too large and nothing makes one too small.
+
 **The compositor keeps a surface table, composes back to front, and only
 redraws what changed.** It was a blitter: each message painted straight into the
 scanout as it arrived, so what ended up on top was decided by which client sent
@@ -559,8 +591,6 @@ which only means the hang would be intermittent.
 
 ## Hardening left for later
 
-* Quotas are fixed constants, identical for every process. Real ones would be
-  per-process policy set by whoever spawned it.
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
   timing is exactly where this class of code breaks.
 * The ticket lock is fair but not priority-aware: a `High` thread queues behind
@@ -572,12 +602,6 @@ which only means the hang would be intermittent.
   thread being owned by exactly one processor's queue, with migration
   transferring ownership under both locks in index order — a real ownership model
   rather than a data-structure change.
-* The APIC MMIO page is mapped uncached at its own virtual address while the
-  bootloader's physical-memory window also maps it cached. Two mappings with
-  different cache attributes is architecturally discouraged; it works here, and
-  every access goes through the uncached mapping, but it should be tidied up.
-* Calibration trusts a single 10 ms PIT sample. Averaging several would be more
-  robust on a loaded host.
 * One user program is still hand-written assembly: the W^X test, which plants
   two bytes of machine code on its own stack and jumps to them. That is not
   something Rust will express, and it is the right tool for that one job.
