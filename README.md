@@ -272,6 +272,28 @@ processor. It sets the state and leaves the enqueue to the handshake.
 Symptom when this was wrong: an intermittent double fault with `rsp` of zero, one
 run in ten, from a blocking IPC receive.
 
+**The compositor keeps a surface table, composes back to front, and only
+redraws what changed.** It was a blitter: each message painted straight into the
+scanout as it arrived, so what ended up on top was decided by which client sent
+last. Surfaces now carry a depth and are composed in that order, into an
+off-screen buffer that reaches the display in one copy per frame — drawing
+directly into the scanout lets the display controller read a half-composed
+frame, which with overlapping surfaces is a visible flicker of whatever was
+underneath.
+
+Composition has to clear before it draws, or a surface that moved leaves its old
+pixels behind; and having cleared, it has to redraw *every* surface intersecting
+the cleared region, not just the newest. Both directions are tested, because
+each one alone passes a plausible-looking wrong implementation.
+
+Damage is accumulated as a single rectangle covering both a surface's old and
+new bounds. One rectangle cannot grow without bound and is cheap to intersect
+against; the cost is redrawing some pixels that did not need it.
+
+`depth_decides_what_is_on_top_not_arrival_order` sends the nearer surface
+*first*, so a compositor painting in arrival order fails it — which the previous
+one does, checked rather than assumed.
+
 **PCI configuration space is reached by memory when the firmware describes a
 window.** The port mechanism latches an address in `0xCF8` and reads `0xCFC`,
 which works everywhere and reaches only the first 256 bytes of each function —
@@ -559,8 +581,12 @@ which only means the hang would be intermittent.
 * One user program is still hand-written assembly: the W^X test, which plants
   two bytes of machine code on its own stack and jumps to them. That is not
   something Rust will express, and it is the right tool for that one job.
-* The compositor has no damage tracking, no double buffering and no z-order. It
-  blits each surface once, as it arrives.
+* The compositor's damage is one rectangle rather than a region list, so two
+  small changes at opposite corners recompose everything between them. A region
+  list is the answer, and it needs an allocator the userland does not have.
+* Nothing catches tearing from inside the machine. The back buffer's existence
+  is checked; that the display never sees a half-composed frame is argued from
+  the structure, not observed.
 * The ECAM window is clamped to the first 64 buses. Firmware routinely describes
   all 256 whether or not anything is on them, and mapping that eagerly is 65,536
   page-table entries at boot for buses that will never answer. A device beyond

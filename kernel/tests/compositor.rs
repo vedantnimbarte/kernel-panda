@@ -68,9 +68,29 @@ fn pixel_at(x: usize, y: usize) -> (u8, u8, u8) {
     }
 }
 
+/// Write a pixel straight into the display's memory.
+///
+/// Used to plant a sentinel somewhere the compositor should not touch, so that
+/// "only the damaged region was redrawn" is something the test can observe
+/// rather than infer.
+fn write_pixel(x: usize, y: usize, colour: (u8, u8, u8)) {
+    let info = framebuffer::info().expect("no framebuffer");
+    let base = framebuffer::buffer_address().expect("no framebuffer");
+    let offset = (y * info.stride + x) * info.bytes_per_pixel;
+
+    // SAFETY: as in `pixel_at`; the framebuffer is mapped for the life of the
+    // kernel and callers stay inside its dimensions.
+    unsafe {
+        let pixel = (base + offset as u64) as *mut u8;
+        pixel.write_volatile(colour.0);
+        pixel.add(1).write_volatile(colour.1);
+        pixel.add(2).write_volatile(colour.2);
+    }
+}
+
 static COMPOSITOR_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static COMPOSITOR_TID: AtomicU64 = AtomicU64::new(0);
-static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
+static CLIENT_PARAMS: sync::Mutex<[u64; 9]> = sync::Mutex::new([0; 9]);
 
 fn compositor_thread() {
     let owner = sched::current_id().expect("no current thread");
@@ -130,6 +150,18 @@ fn start_compositor() -> (EndpointId, ThreadId) {
 
 /// Run one client: fill a buffer with `colour` and ask for it at (x, y).
 fn present(endpoint: EndpointId, compositor: ThreadId, colour: u64, x: u64, y: u64) {
+    present_at_depth(endpoint, compositor, colour, x, y, 0);
+}
+
+/// As `present`, but at a chosen depth.
+fn present_at_depth(
+    endpoint: EndpointId,
+    compositor: ThreadId,
+    colour: u64,
+    x: u64,
+    y: u64,
+    z: u64,
+) {
     let depth = gbm::bytes_per_pixel() as u64;
     *CLIENT_PARAMS.lock() = [
         colour,
@@ -140,6 +172,7 @@ fn present(endpoint: EndpointId, compositor: ThreadId, colour: u64, x: u64, y: u
         30, // height
         compositor.0 as u64,
         depth,
+        z,
     ];
 
     let client = sync::without_interrupts(|| {
@@ -208,6 +241,141 @@ fn a_surface_lands_where_it_was_asked_to() {
         pixel_at(610, 545),
         (0x00, 0xFF, 0x00),
         "the blit ran past the bottom edge of the surface"
+    );
+}
+
+#[test_case]
+fn the_compositor_composes_off_screen() {
+    // Composition happens in a buffer the compositor owns and reaches the
+    // display in one copy per frame. Drawing surfaces straight into the scanout
+    // lets the display controller read the screen halfway through a frame,
+    // which with overlapping surfaces is a visible flicker of whatever was
+    // underneath.
+    //
+    // Tearing is not something this can catch from inside the machine. What it
+    // can check is that the back buffer exists and is the size of the screen --
+    // without which the property is not merely untested but absent.
+    let (_, compositor) = start_compositor();
+
+    let screen = framebuffer::info().expect("no framebuffer");
+    let owned = gbm::buffers_owned_by(compositor);
+
+    assert!(
+        owned.iter().any(|(_, info)| {
+            info.width as usize == screen.width && info.height as usize == screen.height
+        }),
+        "the compositor owns no buffer the size of the screen, so it is drawing \
+         straight into the scanout; it has {owned:?}"
+    );
+}
+
+#[test_case]
+fn depth_decides_what_is_on_top_not_arrival_order() {
+    let (endpoint, compositor) = start_compositor();
+
+    // The nearer surface arrives *first*. A compositor that simply blits each
+    // message as it comes would leave the second one on top, which is the
+    // behaviour this replaced.
+    present_at_depth(endpoint, compositor, 0x0000FF, 100, 600, 10);
+    assert!(
+        spin_until(|| pixel_at(110, 610) == (0xFF, 0x00, 0x00)),
+        "the near surface never appeared"
+    );
+
+    present_at_depth(endpoint, compositor, 0x00FF00, 100, 600, 1);
+
+    // Give the compositor a moment to have got it wrong, so this fails on a
+    // real ordering bug rather than on a race with the second client.
+    for _ in 0..200 {
+        sched::yield_now();
+    }
+
+    assert_eq!(
+        pixel_at(110, 610),
+        (0xFF, 0x00, 0x00),
+        "a surface at depth 1 covered one at depth 10; composition is following \
+         arrival order rather than z"
+    );
+}
+
+#[test_case]
+fn a_nearer_surface_covers_a_further_one() {
+    let (endpoint, compositor) = start_compositor();
+
+    // The other direction, so the case above cannot pass by ignoring the
+    // second surface entirely.
+    present_at_depth(endpoint, compositor, 0x0000FF, 200, 600, 1);
+    assert!(
+        spin_until(|| pixel_at(210, 610) == (0xFF, 0x00, 0x00)),
+        "the far surface never appeared"
+    );
+
+    present_at_depth(endpoint, compositor, 0x00FF00, 200, 600, 5);
+    assert!(
+        spin_until(|| pixel_at(210, 610) == (0x00, 0xFF, 0x00)),
+        "a surface at depth 5 did not cover one at depth 1"
+    );
+}
+
+#[test_case]
+fn only_the_damaged_region_is_written() {
+    let (endpoint, compositor) = start_compositor();
+
+    present(endpoint, compositor, 0x0000FF, 300, 600);
+    assert!(
+        spin_until(|| pixel_at(310, 610) == (0xFF, 0x00, 0x00)),
+        "the first surface never appeared"
+    );
+
+    // A sentinel written straight into the screen, far from anything the next
+    // client will touch. Only the damaged region should be recomposed, so this
+    // must survive -- a compositor redrawing the whole screen every frame would
+    // erase it.
+    let sentinel = (0x11, 0x22, 0x33);
+    write_pixel(700, 700, sentinel);
+    assert_eq!(pixel_at(700, 700), sentinel, "the sentinel did not take");
+
+    present(endpoint, compositor, 0x00FF00, 300, 650);
+    assert!(
+        spin_until(|| pixel_at(310, 660) == (0x00, 0xFF, 0x00)),
+        "the second surface never appeared"
+    );
+
+    assert_eq!(
+        pixel_at(700, 700),
+        sentinel,
+        "a pixel far outside the damaged region was rewritten; the whole screen \
+         is being recomposed on every frame"
+    );
+}
+
+#[test_case]
+fn a_surface_that_moves_does_not_leave_a_hole() {
+    let (endpoint, compositor) = start_compositor();
+
+    // The same client buffer twice would be ideal, but each client allocates
+    // its own. Two surfaces at the same depth, the second overlapping the
+    // first, is the same test of whether the damaged region is cleared before
+    // recomposition: without the clear, the first surface's pixels stay.
+    present_at_depth(endpoint, compositor, 0x0000FF, 400, 600, 3);
+    assert!(
+        spin_until(|| pixel_at(410, 610) == (0xFF, 0x00, 0x00)),
+        "the first surface never appeared"
+    );
+
+    present_at_depth(endpoint, compositor, 0x00FF00, 420, 600, 4);
+    assert!(
+        spin_until(|| pixel_at(430, 610) == (0x00, 0xFF, 0x00)),
+        "the second surface never appeared"
+    );
+
+    // The part of the first surface the second does not cover must still be
+    // there: clearing the damage rectangle must be followed by recomposing
+    // every surface that intersects it, not just the newest.
+    assert_eq!(
+        pixel_at(405, 610),
+        (0xFF, 0x00, 0x00),
+        "clearing the damaged region wiped a surface that was not replaced"
     );
 }
 

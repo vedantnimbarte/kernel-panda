@@ -193,6 +193,8 @@ static GRANT_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static GRANT_OUTCOME: AtomicU64 = AtomicU64::new(0);
 static GRANT_RAN: AtomicBool = AtomicBool::new(false);
 
+static GRANT_RELEASE: AtomicBool = AtomicBool::new(false);
+
 /// Holds SEND only, and tries to pass RECEIVE to itself.
 fn escalation_attempt() {
     let endpoint = EndpointId(GRANT_ENDPOINT.load(Ordering::Acquire));
@@ -206,6 +208,14 @@ fn escalation_attempt() {
         Ordering::Release,
     );
     GRANT_RAN.store(true, Ordering::Release);
+
+    // Kept alive for the assertions. The interesting one checks that this
+    // thread does *not* hold RECEIVE, and a thread that has exited holds
+    // nothing at all -- so letting it go would make that assertion pass however
+    // the escalation had turned out.
+    while !GRANT_RELEASE.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
 }
 
 #[test_case]
@@ -213,6 +223,7 @@ fn a_thread_cannot_grant_rights_it_does_not_hold() {
     let endpoint = ipc::create(me(), 4).expect("create failed");
     GRANT_ENDPOINT.store(endpoint.0, Ordering::Release);
     GRANT_RAN.store(false, Ordering::Release);
+    GRANT_RELEASE.store(false, Ordering::Release);
 
     let thread = sync::without_interrupts(|| {
         let id = sched::spawn("escalate", escalation_attempt).expect("spawn failed");
@@ -230,8 +241,16 @@ fn a_thread_cannot_grant_rights_it_does_not_hold() {
         1,
         "a thread without GRANT was able to hand itself new rights"
     );
+    let rights = ipc::rights_of(thread, endpoint);
+    GRANT_RELEASE.store(true, Ordering::Release);
+    sched::join(thread);
+
     assert!(
-        !ipc::rights_of(thread, endpoint).contains(Rights::RECEIVE),
+        rights.contains(Rights::SEND),
+        "the thread lost the SEND it was given, so the check below proves nothing"
+    );
+    assert!(
+        !rights.contains(Rights::RECEIVE),
         "the escalation actually took effect"
     );
 }

@@ -24,6 +24,9 @@ struct Parameters {
     height: u64,
     compositor: u64,
     bytes_per_pixel: u64,
+    /// Depth. Higher is nearer the viewer; the compositor composes back to
+    /// front, so this and not arrival order decides what ends up on top.
+    z: u64,
 }
 
 const TAG_PRESENT: u64 = 2;
@@ -54,7 +57,7 @@ extern "C" fn main(parameters: u64) {
 
     let message = user::Message {
         tag: TAG_PRESENT,
-        words: [buffer, parameters.x, parameters.y, 0],
+        words: [buffer, parameters.x, parameters.y, parameters.z],
         sender: 0,
     };
     user::ipc_send(parameters.endpoint, &message);

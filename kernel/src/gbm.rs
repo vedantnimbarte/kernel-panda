@@ -550,6 +550,19 @@ pub fn count() -> usize {
     with(|registry| registry.buffers.len())
 }
 
+/// Buffers a thread created, with their dimensions. Diagnostic, and used by
+/// tests.
+pub fn buffers_owned_by(owner: ThreadId) -> Vec<(BufferId, BufferInfo)> {
+    with(|registry| {
+        registry
+            .buffers
+            .iter()
+            .filter(|(_, entry)| entry.owner == owner)
+            .map(|(id, entry)| (BufferId(*id), entry.info))
+            .collect()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Syscall entry points
 // ---------------------------------------------------------------------------

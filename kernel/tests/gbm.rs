@@ -185,11 +185,19 @@ fn a_buffer_cannot_be_mapped_without_access() {
 static SHARED_BUFFER: AtomicU64 = AtomicU64::new(0);
 static INSIDER_OK: AtomicBool = AtomicBool::new(false);
 static INSIDER_RAN: AtomicBool = AtomicBool::new(false);
+static INSIDER_RELEASE: AtomicBool = AtomicBool::new(false);
 
 fn insider() {
     let buffer = BufferId(SHARED_BUFFER.load(Ordering::Acquire));
     INSIDER_OK.store(gbm::map(me(), buffer).is_ok(), Ordering::Release);
     INSIDER_RAN.store(true, Ordering::Release);
+
+    // Held open until the test is done looking. Exiting here would correctly
+    // withdraw this thread from the buffer's share list, and the assertions
+    // below would then be racing the teardown rather than testing the share.
+    while !INSIDER_RELEASE.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
 }
 
 #[test_case]
@@ -197,17 +205,19 @@ fn sharing_a_buffer_grants_access() {
     let buffer = gbm::create(me(), 32, 32).expect("create failed");
     SHARED_BUFFER.store(buffer.0, Ordering::Release);
     INSIDER_RAN.store(false, Ordering::Release);
+    INSIDER_RELEASE.store(false, Ordering::Release);
 
-    // Checked inside the same interrupts-off region as the grant. Once the
-    // thread can run it may finish and be torn down, at which point it is
-    // correctly removed from the share list -- so asserting afterwards is a race
-    // against the thread's own exit rather than a test of the grant.
-    let granted = panda_kernel::sync::without_interrupts(|| {
+    // `without_interrupts` masks this processor and no other, so it does not
+    // make the spawn and the grant atomic with respect to the thread itself --
+    // another core can pick it up the moment it is queued. Keeping the thread
+    // alive is what makes the observation stable.
+    let id = panda_kernel::sync::without_interrupts(|| {
         let id = sched::spawn("insider", insider).expect("spawn failed");
         gbm::share(me(), id, buffer).expect("share failed");
-        gbm::may_access(id, buffer)
+        id
     });
-    assert!(granted, "the share did not take effect");
+
+    assert!(gbm::may_access(id, buffer), "the share did not take effect");
 
     assert!(
         spin_until(|| INSIDER_RAN.load(Ordering::Acquire)),
@@ -217,6 +227,9 @@ fn sharing_a_buffer_grants_access() {
         INSIDER_OK.load(Ordering::Acquire),
         "a thread the buffer was shared with could not map it"
     );
+
+    INSIDER_RELEASE.store(true, Ordering::Release);
+    sched::join(id);
 }
 
 #[test_case]
