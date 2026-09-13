@@ -27,6 +27,9 @@ use std::{
 /// `(v << 1) | 1`. The kernel writes 0x10 for success and 0x11 for failure.
 const QEMU_EXIT_SUCCESS: i32 = (0x10 << 1) | 1; // 33
 const QEMU_EXIT_FAILED: i32 = (0x11 << 1) | 1; // 35
+/// "Boot me again": the runner starts the same kernel once more, with the same
+/// crash disk, so a test can see what one boot leaves for the next.
+const QEMU_EXIT_REBOOT: i32 = (0x12 << 1) | 1; // 37
 
 /// Generous enough for a debug build under a cold QEMU, short enough that a
 /// hung or triple-faulting kernel doesn't wedge CI.
@@ -92,7 +95,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let images = make_images(&kernel, has_flag(args, "--verbose-boot"))?;
     let image = if uefi { &images.uefi } else { &images.bios };
 
-    let code = match run_qemu(qemu_command(image, uefi, headless)?, timeout) {
+    // Kept between runs, so a panic is still there to read on the next boot.
+    let crash = crash_disk("crash.img", false)?;
+    let code = match run_qemu(qemu_command(image, uefi, headless, &crash)?, timeout) {
         Ok(code) => code,
         // A timeout is the expected outcome when one was requested: the kernel
         // halts rather than exiting.
@@ -152,8 +157,19 @@ fn cmd_runner(args: &[String]) -> Result<ExitCode, String> {
     let images = make_images(Path::new(elf), has_flag(args, "--verbose-boot"))?;
     let image = if uefi { &images.uefi } else { &images.bios };
 
-    match run_qemu(qemu_command(image, uefi, true)?, Some(TEST_TIMEOUT))? {
+    let crash = crash_disk("crash-test.img", true)?;
+    let mut code = run_qemu(qemu_command(image, uefi, true, &crash)?, Some(TEST_TIMEOUT))?;
+    if code == QEMU_EXIT_REBOOT {
+        println!("xtask: rebooting");
+        code = run_qemu(qemu_command(image, uefi, true, &crash)?, Some(TEST_TIMEOUT))?;
+    }
+
+    match code {
         QEMU_EXIT_SUCCESS => Ok(ExitCode::SUCCESS),
+        QEMU_EXIT_REBOOT => {
+            eprintln!("xtask: test kernel asked for a second reboot; it gets one");
+            Ok(ExitCode::FAILURE)
+        }
         QEMU_EXIT_FAILED => {
             eprintln!("xtask: test kernel reported a failure");
             Ok(ExitCode::FAILURE)
@@ -301,6 +317,11 @@ fn make_images(kernel: &Path, verbose_boot: bool) -> Result<Images, String> {
 const SCRATCH_DISK_BYTES: u64 = 16 * 1024 * 1024;
 const NVME_DISK_BYTES: u64 = 32 * 1024 * 1024;
 const VIRTIO_DISK_BYTES: u64 = 24 * 1024 * 1024;
+const CRASH_DISK_BYTES: u64 = 2 * 1024 * 1024;
+
+/// GPT type of the partition the kernel leaves crash records in. Must match
+/// `crash::PARTITION_TYPE`.
+const CRASH_PARTITION_TYPE: &[u8; 16] = b"KernelPandaCrash";
 
 /// Contents of the file the TFTP server hands out. A network test compares
 /// against this, so it is fixed here rather than generated.
@@ -331,7 +352,81 @@ fn scratch_disk(name: &str, bytes: u64) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, String> {
+/// A disk holding one crash partition, the way the kernel's own
+/// `write_single_partition_gpt` lays it out. Reused if it exists, unless `fresh`.
+fn crash_disk(name: &str, fresh: bool) -> Result<PathBuf, String> {
+    const SECTOR: usize = 512;
+    const ENTRIES: usize = 128;
+    const ENTRY_SIZE: usize = 128;
+    const ENTRY_SECTORS: u64 = 32;
+
+    let path = workspace_root().join("target").join("images").join(name);
+    if !fresh && path.exists() {
+        return Ok(path);
+    }
+
+    let total = CRASH_DISK_BYTES / SECTOR as u64;
+    let (first_usable, last_usable) = (2 + ENTRY_SECTORS, total - ENTRY_SECTORS - 2);
+    let mut disk = vec![0u8; CRASH_DISK_BYTES as usize];
+    let mut put = |at: u64, bytes: &[u8]| {
+        let at = at as usize * SECTOR;
+        disk[at..at + bytes.len()].copy_from_slice(bytes);
+    };
+
+    // Protective MBR.
+    let mut mbr = [0u8; SECTOR];
+    mbr[446 + 4] = 0xEE;
+    mbr[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    mbr[446 + 12..446 + 16].copy_from_slice(&((total - 1) as u32).to_le_bytes());
+    mbr[510..512].copy_from_slice(&[0x55, 0xAA]);
+    put(0, &mbr);
+
+    let mut entries = vec![0u8; ENTRY_SECTORS as usize * SECTOR];
+    entries[0..16].copy_from_slice(CRASH_PARTITION_TYPE);
+    entries[16..32].copy_from_slice(b"panda-crash-disk");
+    entries[32..40].copy_from_slice(&first_usable.to_le_bytes());
+    entries[40..48].copy_from_slice(&last_usable.to_le_bytes());
+    for (index, ch) in "crash".encode_utf16().enumerate() {
+        entries[56 + index * 2..58 + index * 2].copy_from_slice(&ch.to_le_bytes());
+    }
+    let entries_crc = crc32(&entries[..ENTRIES * ENTRY_SIZE]);
+    let backup_entries = total - 1 - ENTRY_SECTORS;
+    put(2, &entries);
+    put(backup_entries, &entries);
+
+    for (at, other, entries_lba) in [(1, total - 1, 2), (total - 1, 1, backup_entries)] {
+        let mut header = [0u8; SECTOR];
+        header[0..8].copy_from_slice(b"EFI PART");
+        header[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        header[12..16].copy_from_slice(&92u32.to_le_bytes());
+        header[24..32].copy_from_slice(&at.to_le_bytes());
+        header[32..40].copy_from_slice(&other.to_le_bytes());
+        header[40..48].copy_from_slice(&first_usable.to_le_bytes());
+        header[48..56].copy_from_slice(&last_usable.to_le_bytes());
+        header[56..72].copy_from_slice(b"panda-crash-gpt!");
+        header[72..80].copy_from_slice(&entries_lba.to_le_bytes());
+        header[80..84].copy_from_slice(&(ENTRIES as u32).to_le_bytes());
+        header[84..88].copy_from_slice(&(ENTRY_SIZE as u32).to_le_bytes());
+        header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        let checksum = crc32(&header[..92]);
+        header[16..20].copy_from_slice(&checksum.to_le_bytes());
+        put(at, &header);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("could not create {parent:?}: {e}"))?;
+    }
+    fs::write(&path, &disk).map_err(|e| format!("could not write {path:?}: {e}"))?;
+    Ok(path)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(!0u32, |crc, byte| {
+        (0..8).fold(crc ^ *byte as u32, |crc, _| (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg()))
+    })
+}
+
+fn qemu_command(image: &Path, uefi: bool, headless: bool, crash: &Path) -> Result<Command, String> {
     let mut cmd = Command::new(find_qemu()?);
 
     if uefi {
@@ -375,6 +470,10 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, Str
     cmd.arg("-drive")
         .arg(format!("id=panda-disk,if=none,format=raw,file={}", qpath(&disk)));
     cmd.args(["-device", "ide-hd,drive=panda-disk,bus=ide.1"]);
+    // Where a panic leaves its record, on the next port along.
+    cmd.arg("-drive")
+        .arg(format!("id=panda-crash,if=none,format=raw,file={}", qpath(crash)));
+    cmd.args(["-device", "ide-hd,drive=panda-crash,bus=ide.2"]);
 
     // The same again behind the two other interfaces a disk is likely to have:
     // an NVMe controller, as on nearly any machine built this decade, and

@@ -27,7 +27,7 @@ stack running as an unprivileged process.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 206 cases across 26 boot-and-assert test kernels, run on four cores
+**Testing:** 207 cases across 26 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -732,7 +732,10 @@ disk — because the holder may be a processor that was just stopped, or the cod
 that panicked. The backtrace follows frame pointers (forced on in
 `kernel/.cargo/config.toml`) and checks each frame is mapped and kernel-only
 before reading it; a panic inside a system call has the user's stack at the top
-of the chain, and SMAP would fault on it.
+of the chain, and SMAP would fault on it. Each return address is named from the
+kernel's own symbol table, read out of the ELF the bootloader leaves in memory:
+a linear walk, with no allocation and no locks. Symbols use legacy mangling so
+the names demangle in a few lines instead of a v0 demangler in the panic path.
 
 The report goes to a GPT partition whose type GUID is the ASCII
 `KernelPandaCrash`, text first and header last, so an interrupted save leaves
@@ -740,6 +743,13 @@ the old state rather than a header describing half-written text. If the disk
 lock is held the record is not written at all: going ahead would overwrite the
 bounce buffer a command already in flight is about to be DMA'd from. The next
 boot prints the record and clears it.
+
+xtask attaches a 2 MiB disk holding that partition to every launch. `cargo xtask
+run` keeps it in `target/images/crash.img` between boots, so a panic is there to
+read the next time. Test kernels get a fresh one, and a test kernel may exit
+asking to be booted again on the same disk: the crash test panics on its first
+boot, and on its second checks the record it finds names the function that
+panicked.
 
 **The PS/2 driver is a Ring 3 process, and is actually contained by it.** The
 disk driver cannot be, because a DMA engine ignores page tables; a keyboard
@@ -905,10 +915,9 @@ everything owned by the system and closed to all.
   daemon holds two frames while an address resolves and drops the rest, keeps
   one datagram per bound port, does not reassemble fragments, and neither sends
   nor checks UDP checksums.
-* Nothing outside the tests creates a crash partition yet, so on an ordinary
-  boot a panic is reported to the console and not saved. Backtraces are raw
-  return addresses: subtract the load base, `0x10000000000`, and look them up
-  in the kernel ELF. The image carries no symbol table to do it at panic time.
+* A crash record holds the first 4 KiB of a report. Backtraces name functions,
+  not lines: file and line need the DWARF data, which is far larger than the
+  symbol table and slower to search.
 
 ## Not built yet
 

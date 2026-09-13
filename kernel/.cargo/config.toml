@@ -15,4 +15,6 @@ build-std-features = ["compiler-builtins-mem"]
 runner = ["../target/release/xtask.exe", "runner"]
 # Frame pointers, so a panic can walk the stack. Without them `rbp` is just
 # another register and the chain it would describe does not exist.
-rustflags = ["-C", "force-frame-pointers=yes"]
+# Legacy symbol mangling, so the crash report can turn return addresses into
+# names without carrying a v0 demangler into the panic path.
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "symbol-mangling-version=legacy", "-Z", "unstable-options"]

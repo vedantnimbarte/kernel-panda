@@ -92,6 +92,7 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // IDT installed so a bad mapping surfaces as a page fault with an address
     // rather than as a reset. It ends by turning `alloc` on.
     memory::init(boot_info);
+    crash::set_kernel_image(boot_info);
     // The scheduler needs the heap for thread stacks, and it must exist before
     // the first timer tick -- that handler preempts through it.
     sched::init();

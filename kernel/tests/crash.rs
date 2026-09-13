@@ -3,10 +3,9 @@
 //! Drives itself rather than using `#[test_case]`: the thing under test is the
 //! panic handler, and a case cannot survive reaching it.
 //!
-//! "The next boot" is the same boot reading the partition back through the
-//! ordinary block path. The harness hands every launch a fresh disk, so a real
-//! reboot would find nothing; what this proves is that the bytes reached the
-//! device, in a form `take_previous` accepts.
+//! Two boots of the same kernel. The first finds no record, panics, and asks
+//! the harness to boot it again on the same crash disk; the second must find
+//! what the first left, with the backtrace named.
 
 #![no_std]
 #![no_main]
@@ -18,15 +17,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::arch::x86_64::qemu::{self, ExitCode};
-use panda_kernel::block::{self, partition, SECTOR_SIZE};
 use panda_kernel::{crash, sched, serial_print, serial_println, smp, testing, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
 const MESSAGE: &str = "a deliberate panic, for the crash test";
-
-/// The harness creates the scratch disk at exactly this size.
-const SCRATCH_SECTORS: u64 = 16 * 1024 * 1024 / SECTOR_SIZE as u64;
 
 /// Set just before the deliberate panic, so a failed setup step is reported as
 /// itself rather than as a crash record that says the wrong thing.
@@ -37,18 +32,15 @@ static SPINNER_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     panda_kernel::init(boot_info);
-    serial_print!("crash::a_panic_is_recorded_and_found ... ");
 
-    // The scratch disk, by size: the boot image is attached too, and writing a
-    // partition table over that one destroys it.
-    let disk = (0..block::count())
-        .filter_map(block::device)
-        .find(|disk| disk.sector_count() == SCRATCH_SECTORS)
-        .expect("no scratch disk");
-    partition::write_single_partition_gpt(&*disk, crash::PARTITION_TYPE)
-        .expect("could not write a GPT");
-    crash::init();
-    assert!(crash::take_previous().is_none(), "a blank partition held a record");
+    match crash::previous() {
+        None => first_boot(),
+        Some(record) => second_boot(record),
+    }
+}
+
+fn first_boot() -> ! {
+    serial_print!("crash::a_panic_is_recorded ... ");
 
     // Something running elsewhere, for the panic to stop.
     sched::spawn("spinner", spin).expect("spawn failed");
@@ -58,6 +50,30 @@ fn test_kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     DELIBERATE.store(true, Ordering::Relaxed);
     nested_call();
+}
+
+fn second_boot(record: &str) -> ! {
+    serial_print!("crash::the_next_boot_finds_it ... ");
+
+    if !record.contains(MESSAGE) {
+        fail("the record does not carry the panic message");
+    }
+    if !record.contains("thread '") {
+        fail("the record does not say which thread panicked");
+    }
+    let frames = || record.lines().filter(|line| line.starts_with("  0x"));
+    if frames().count() < 2 {
+        fail("the backtrace has fewer than two frames");
+    }
+    if !frames().any(|line| line.contains(" crash::nested_call+0x")) {
+        fail("no frame of the backtrace is named for the function that panicked");
+    }
+    if crash::take_previous().is_some() {
+        fail("the record was not cleared; every boot would report it again");
+    }
+
+    serial_println!("[ok]");
+    qemu::exit(ExitCode::Success)
 }
 
 fn spin() {
@@ -95,24 +111,8 @@ fn panic(info: &PanicInfo) -> ! {
         }
     }
 
-    let Some(record) = crash::take_previous() else {
-        fail("no record was found after the panic");
-    };
-    if !record.contains(MESSAGE) {
-        fail("the record does not carry the panic message");
-    }
-    if !record.contains("thread '") {
-        fail("the record does not say which thread panicked");
-    }
-    if record.lines().filter(|line| line.starts_with("  0x")).count() < 2 {
-        fail("the backtrace has fewer than two frames");
-    }
-    if crash::take_previous().is_some() {
-        fail("the record was not cleared; every boot would report it again");
-    }
-
     serial_println!("[ok]");
-    qemu::exit(ExitCode::Success)
+    qemu::exit(ExitCode::Reboot)
 }
 
 fn fail(why: &str) -> ! {

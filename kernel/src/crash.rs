@@ -8,6 +8,9 @@
 //! there, and writes the report to a partition reserved for it. The next boot
 //! prints what it finds there and clears it.
 //!
+//! Return addresses are named from the kernel's own symbol table, which the
+//! bootloader leaves in memory with the rest of the ELF.
+//!
 //! Everything on this path fails open. Locks are tried, never waited on: the
 //! holder may be a processor that was just stopped, or the very code that
 //! panicked. Whatever cannot be had without waiting is left out.
@@ -47,6 +50,12 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 /// Where records go, if a crash partition was found.
 static AREA: Once<Arc<dyn BlockDevice>> = Once::new();
+
+/// What the last boot left, as found by [`init`].
+static PREVIOUS: Once<String> = Once::new();
+
+/// The kernel's ELF file, and the address its image was loaded at.
+static IMAGE: Once<(&'static [u8], u64)> = Once::new();
 
 /// The report being written. Static rather than on the stack, which on a double
 /// fault is the 20 KiB IST stack and may already be most of the way down.
@@ -120,7 +129,7 @@ pub fn report(info: &PanicInfo) -> bool {
         crate::sched::try_current_name().unwrap_or("?")
     );
     let _ = writeln!(report, "{info}");
-    let _ = writeln!(report, "backtrace (return addresses; addr2line against the kernel ELF):");
+    let _ = writeln!(report, "backtrace:");
     backtrace(report);
 
     match save(report) {
@@ -161,7 +170,14 @@ fn backtrace(report: &mut Report) {
         if return_address == 0 {
             return;
         }
-        let _ = writeln!(report, "  {return_address:#018x}");
+        match symbol(return_address) {
+            Some((name, offset)) => {
+                let _ = writeln!(report, "  {return_address:#018x} {}+{offset:#x}", Demangled(name));
+            }
+            None => {
+                let _ = writeln!(report, "  {return_address:#018x}");
+            }
+        }
 
         // Stacks grow down, so a caller's frame is always higher.
         if caller_rbp <= rbp {
@@ -169,6 +185,125 @@ fn backtrace(report: &mut Report) {
         }
         rbp = caller_rbp;
     }
+}
+
+/// Record where the kernel's ELF is, so backtraces can carry names.
+pub fn set_kernel_image(boot_info: &bootloader_api::BootInfo) {
+    let start = crate::memory::paging::physical_offset() + boot_info.kernel_addr;
+    // SAFETY: the bootloader keeps the file in frames it does not report as
+    // usable, so nothing reuses them, and the physical window maps them.
+    let elf = unsafe { core::slice::from_raw_parts(start.as_ptr::<u8>(), boot_info.kernel_len as usize) };
+    IMAGE.call_once(|| (elf, boot_info.kernel_image_offset));
+}
+
+/// The function a return address is in, and how far into it.
+///
+/// A linear walk of the symbol table: slow, but it runs once per frame of one
+/// panic, allocates nothing, and takes no locks.
+fn symbol(address: u64) -> Option<(&'static [u8], u64)> {
+    const SHT_SYMTAB: u32 = 2;
+    const STT_FUNC: u8 = 2;
+    const SYMBOL_SIZE: usize = 24;
+
+    let (elf, base) = *IMAGE.get()?;
+    let u16_at = |at: usize| Some(u16::from_le_bytes(elf.get(at..at + 2)?.try_into().ok()?) as usize);
+    let u32_at = |at: usize| Some(u32::from_le_bytes(elf.get(at..at + 4)?.try_into().ok()?) as usize);
+    let u64_at = |at: usize| Some(u64::from_le_bytes(elf.get(at..at + 8)?.try_into().ok()?));
+
+    // A call that is the last instruction of a function returns to the first
+    // byte of the next one; the byte before is always inside the caller.
+    let target = address.checked_sub(base)?.checked_sub(1)?;
+
+    let (sections, section_size, count) = (u64_at(0x28)? as usize, u16_at(0x3A)?, u16_at(0x3C)?);
+    for index in 0..count {
+        let section = sections + index * section_size;
+        if u32_at(section + 4)? as u32 != SHT_SYMTAB {
+            continue;
+        }
+        let (start, size) = (u64_at(section + 0x18)? as usize, u64_at(section + 0x20)? as usize);
+        let strings = u64_at(sections + u32_at(section + 0x28)? * section_size + 0x18)? as usize;
+
+        for entry in (start..start.checked_add(size)?).step_by(SYMBOL_SIZE) {
+            if elf.get(entry + 4)? & 0xF != STT_FUNC {
+                continue;
+            }
+            let (value, length) = (u64_at(entry + 8)?, u64_at(entry + 16)?);
+            if (value..value + length).contains(&target) {
+                let name = elf.get(strings + u32_at(entry)?..)?;
+                let end = name.iter().position(|b| *b == 0)?;
+                return Some((&name[..end], target + 1 - value));
+            }
+        }
+    }
+    None
+}
+
+/// A legacy-mangled Rust name, readable: `_ZN4core6option13unwrap_failed17h..E`
+/// becomes `core::option::unwrap_failed`. Anything else is shown as it is.
+struct Demangled<'a>(&'a [u8]);
+
+impl fmt::Display for Demangled<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let raw = core::str::from_utf8(self.0).unwrap_or("?");
+        let Some(mut rest) = raw.strip_prefix("_ZN") else {
+            return f.write_str(raw);
+        };
+
+        let mut parts = 0;
+        while let Some(digits) = rest.find(|c: char| !c.is_ascii_digit()).filter(|d| *d > 0) {
+            let Some(length) = rest[..digits].parse::<usize>().ok().filter(|l| digits + l <= rest.len()) else {
+                break;
+            };
+            let part = &rest[digits..digits + length];
+            rest = &rest[digits + length..];
+            // The trailing hash says nothing a reader needs.
+            if rest == "E" && part.len() == 17 && part.starts_with('h') {
+                break;
+            }
+            if parts > 0 {
+                f.write_str("::")?;
+            }
+            parts += 1;
+            // A part that would start with `$` gets a `_` in front.
+            write_unescaped(f, part.strip_prefix('_').filter(|p| p.starts_with('$')).unwrap_or(part))?;
+        }
+        if parts == 0 {
+            return f.write_str(raw);
+        }
+        Ok(())
+    }
+}
+
+/// Undo the escapes legacy mangling uses for characters a symbol cannot hold.
+fn write_unescaped(f: &mut fmt::Formatter, mut part: &str) -> fmt::Result {
+    const ESCAPES: [(&str, &str); 12] = [
+        ("$LT$", "<"),
+        ("$GT$", ">"),
+        ("$RF$", "&"),
+        ("$BP$", "*"),
+        ("$C$", ","),
+        ("$SP$", "@"),
+        ("$LP$", "("),
+        ("$RP$", ")"),
+        ("$u20$", " "),
+        ("$u27$", "'"),
+        ("$u7b$", "{"),
+        ("$u7d$", "}"),
+    ];
+    while !part.is_empty() {
+        if let Some(rest) = part.strip_prefix("..") {
+            f.write_str("::")?;
+            part = rest;
+        } else if let Some((from, to)) = ESCAPES.iter().find(|(from, _)| part.starts_with(from)) {
+            f.write_str(to)?;
+            part = &part[from.len()..];
+        } else {
+            let next = part[1..].find(['$', '.']).map_or(part.len(), |i| i + 1);
+            f.write_str(&part[..next])?;
+            part = &part[next..];
+        }
+    }
+    Ok(())
 }
 
 /// `false` for unmapped, user-accessible, or unknown because the page tables
@@ -224,10 +359,16 @@ pub fn init() {
             crate::println!("crash: record area on disk {index}");
             if let Some(previous) = take_previous() {
                 crate::println!("the previous boot panicked:{previous}");
+                PREVIOUS.call_once(|| previous);
             }
             return;
         }
     }
+}
+
+/// The record the previous boot left, if [`init`] found one.
+pub fn previous() -> Option<&'static str> {
+    PREVIOUS.get().map(String::as_str)
 }
 
 /// Read the saved record, if there is one, and clear it.

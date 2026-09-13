@@ -17,6 +17,8 @@ const DEBUG_EXIT_PORT: u16 = 0xf4;
 pub enum ExitCode {
     Success = 0x10,
     Failed = 0x11,
+    /// Asks `xtask runner` to boot the same kernel once more.
+    Reboot = 0x12,
 }
 
 /// Terminate the virtual machine.
