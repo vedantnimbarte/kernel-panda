@@ -10,43 +10,51 @@
 //! when a thread is resumed it returns out of its own handler and `iret`s back
 //! to whatever it was doing.
 //!
-//! ## What is per-CPU and what is shared
+//! ## Who owns what
 //!
-//! One lock and one thread table. Everything about *where* a thread runs is
-//! per-CPU: its ready queues, which thread is current, the remaining slice, the
-//! idle thread -- two processors cannot share an idle thread any more than they
-//! can share a stack.
+//! Every processor has its own lock, over its own ready queues, the thread it
+//! is running, and the thread it is switching away from. Every thread is
+//! *owned* by exactly one processor, recorded in the thread itself, and the
+//! thread's scheduling state -- whether it is ready, running or blocked, its
+//! saved stack pointer, whether a CPU is standing on its stack -- may only be
+//! read or changed under its owner's lock.
 //!
-//! A thread goes back on the queue of the processor that last ran it, so it
-//! tends to return to a core whose caches still know about it. A core with
-//! nothing of its own to run steals from the busiest queue rather than idling
-//! next to a backlog, which is what keeps the split from turning into four
-//! independent schedulers with wildly different amounts of work.
+//! A context switch therefore takes one lock: this processor's. It used to take
+//! one lock shared by every processor, so four cores switching a hundred times a
+//! second each queued on the same word -- and under emulation, where a vCPU
+//! spinning for a lock can be descheduled by the host while holding another,
+//! that queue was where the machine spent its time.
 //!
-//! The timer handler is deliberately kept out of the lock. It runs on every core
-//! on every tick, and in the common case all it does is decrement a per-CPU
-//! atomic and compare a deadline -- it only takes the lock when a slice actually
-//! expires or a sleeper is actually due. Before that, every core queued on the
-//! same lock a hundred times a second for the privilege of subtracting one.
+//! Ownership only moves while a thread is off every CPU, and only under the
+//! locks of both processors involved, taken in index order so that two moves in
+//! opposite directions cannot deadlock. That happens when a thread is woken
+//! (it moves to the waker's processor, which is usually the one it will talk to
+//! next) and when an idle processor steals from a busy one. Anything that finds
+//! a thread by id takes the owner's lock and then checks the owner has not
+//! changed underneath it, following the thread if it has.
+//!
+//! The thread table itself is a separate lock, consulted to turn an id into a
+//! thread. Nothing on the switch path touches it.
 //!
 //! The lock is released before the context switch, because holding a spinlock
-//! across one leaves it held by a thread that is no longer running. On a single
-//! core that was safe by accident: nothing else could observe the gap. With more
-//! than one it is not, so an outgoing thread is deliberately *not* returned to
-//! the ready queue until its registers are saved -- otherwise another CPU could
-//! pick it up and start running a thread whose context is still in our
-//! registers. The incoming context does that enqueue, once the switch is done.
+//! across one leaves it held by a thread that is no longer running. An outgoing
+//! thread is deliberately *not* returned to the ready queue until its registers
+//! are saved -- otherwise another CPU could pick it up and start running a
+//! thread whose context is still in our registers. The incoming context does
+//! that enqueue, once the switch is done.
 
 pub mod context;
 pub mod thread;
 
-use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::memory::kstack::KernelStack;
 use crate::smp::{cpu_index, MAX_CPUS};
-use crate::sync::{without_interrupts, IrqMutex};
+use crate::sync::{without_interrupts, Mutex, MutexGuard};
 
 pub use thread::{Priority, State, Thread, ThreadId};
 
@@ -61,18 +69,13 @@ const STARVATION_GUARD: u32 = 8;
 
 const BOOT_THREAD: ThreadId = ThreadId(0);
 
-/// Interrupt-masking, because the timer handler schedules: a plain spinlock
-/// would let a tick land on the CPU already holding it.
-static SCHEDULER: IrqMutex<Option<Scheduler>> = IrqMutex::new(None);
-
 /// Ticks left in each processor's slice.
 ///
-/// Outside the lock on purpose. Every core reaches the timer handler on every
+/// Outside every lock on purpose. Every core reaches the timer handler on every
 /// tick, and this is all the handler needs to know in the overwhelming majority
-/// of them; taking the scheduler lock to subtract one put four cores in a queue
-/// a hundred times a second for no reason. It is advisory -- the authoritative
-/// reset happens under the lock at the switch -- so a lost race costs at most one
-/// early or late preemption, which round-robin cannot tell from a normal one.
+/// of them. It is advisory -- the authoritative reset happens at the switch -- so
+/// a lost race costs at most one early or late preemption, which round-robin
+/// cannot tell from a normal one.
 static SLICE: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(TIME_SLICE_TICKS) }; MAX_CPUS];
 
 /// The earliest deadline any sleeper is waiting for, or `u64::MAX` when none.
@@ -84,6 +87,272 @@ static SLICE: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(TIME_SLICE_TICKS) 
 /// permanently.
 static NEXT_WAKE: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// The thread each processor is running, as its id plus one, or zero.
+///
+/// Lock-free because every system call and every IPC operation asks. It is
+/// written under the processor's lock at each switch and only ever read by the
+/// thread it names, with interrupts masked so it cannot migrate between reading
+/// its processor index and reading this.
+static CURRENT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+/// Threads queued on each processor. A hint for stealing, which reads it
+/// without the victim's lock to decide whether taking that lock is worth it.
+static QUEUED: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+static INITIALISED: AtomicBool = AtomicBool::new(false);
+
+/// A thread, as the scheduler holds it.
+///
+/// Shared by reference count, so a thread found by id stays valid while the
+/// finder takes its owner's lock -- even if it finishes meanwhile. The kernel
+/// stack is not freed by the last reference going away but taken out and freed
+/// explicitly, away from every lock, once no processor is standing on it; what
+/// outlives that is a small control block.
+struct Slot {
+    id: ThreadId,
+    name: &'static str,
+    /// The processor whose lock guards `thread`.
+    owner: AtomicUsize,
+    thread: UnsafeCell<Thread>,
+}
+
+// SAFETY: `thread` is only reached through `Slot::get`, whose contract is that
+// the owner's lock is held -- so one processor at a time.
+unsafe impl Send for Slot {}
+// SAFETY: as above.
+unsafe impl Sync for Slot {}
+
+type ThreadRef = Arc<Slot>;
+
+impl Slot {
+    /// The thread's scheduling state.
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the lock of the processor `owner` names, and keeps
+    /// holding it for as long as the reference lives.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self) -> &mut Thread {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { &mut *self.thread.get() }
+    }
+}
+
+/// One processor's share of the scheduler.
+struct Cpu {
+    /// Runnable threads this processor owns, oldest first, one queue per
+    /// priority.
+    ready: [VecDeque<ThreadRef>; Priority::COUNT],
+    current: Option<ThreadRef>,
+    /// The fallback when nothing else is runnable. Never queued, never moved.
+    idle: Option<ThreadRef>,
+    /// The thread this processor most recently switched away from, released by
+    /// the incoming context once the switch has actually completed.
+    ///
+    /// It serves two purposes at once. A still-runnable thread may not be
+    /// offered to another processor until its registers are saved, and a
+    /// *finished* one may not be freed until this CPU has left its stack --
+    /// between releasing the lock and the `mov rsp` inside `context_switch`, the
+    /// outgoing thread is no longer `current` but is still the stack this CPU is
+    /// standing on.
+    pending: Option<ThreadRef>,
+    /// Switches served strictly by priority since the last time a lower queue
+    /// was given a turn.
+    ///
+    /// Strict priority starves: a `High` thread that never blocks means nothing
+    /// below it ever runs again. Every `STARVATION_GUARD` switches, the choice
+    /// deliberately comes from somewhere other than the top.
+    priority_streak: u32,
+    /// Which of the lower queues gets the next turn. Alternates rather than
+    /// always picking the lowest, which skipped the middle: with `High` and
+    /// `Low` both busy, every guarded turn went to `Low` and a `Normal` thread
+    /// never ran again.
+    boost_level: usize,
+    /// Stacks of finished threads, freed once this lock is released: freeing
+    /// one unmaps it, takes the paging locks and broadcasts a shootdown.
+    graveyard: Vec<KernelStack>,
+    /// Finished threads to take out of the thread table, likewise once this
+    /// lock is released.
+    reaped: Vec<ThreadId>,
+}
+
+impl Cpu {
+    const fn new() -> Self {
+        Self {
+            ready: [const { VecDeque::new() }; Priority::COUNT],
+            current: None,
+            idle: None,
+            pending: None,
+            priority_streak: 0,
+            boost_level: 0,
+            graveyard: Vec::new(),
+            reaped: Vec::new(),
+        }
+    }
+}
+
+static CPUS: [Mutex<Cpu>; MAX_CPUS] = [const { Mutex::new(Cpu::new()) }; MAX_CPUS];
+
+/// Every thread that has not been reaped, indexed by id. Ids are never reused,
+/// so a stale id reads as `None` rather than silently addressing someone else.
+static THREADS: Mutex<Vec<Option<ThreadRef>>> = Mutex::new(Vec::new());
+
+/// Sleeping threads and the tick each is due to wake on.
+///
+/// Unsorted, because it is scanned only when `NEXT_WAKE` says something is
+/// due, and it is short. Lock order: a processor's lock may be held when this
+/// is taken, never the other way round.
+static SLEEPERS: Mutex<Vec<(ThreadId, u64)>> = Mutex::new(Vec::new());
+
+type CpuGuard = MutexGuard<'static, Cpu>;
+
+fn lookup(id: ThreadId) -> Option<ThreadRef> {
+    without_interrupts(|| THREADS.lock().get(id.0).cloned().flatten())
+}
+
+/// Lock the processor that owns `slot`, following the thread if it moves
+/// while the lock is being taken. Interrupts must be masked.
+fn lock_owner(slot: &Slot) -> CpuGuard {
+    loop {
+        let owner = slot.owner.load(Ordering::Acquire);
+        let guard = CPUS[owner].lock();
+        // Ownership only changes under the owner's lock, so having that lock and
+        // still being named is final.
+        if slot.owner.load(Ordering::Acquire) == owner {
+            return guard;
+        }
+    }
+}
+
+/// Lock two processors, lower index first, whichever order they are named in.
+/// Returns `a`'s guard and, if they differ, `b`'s. Interrupts must be masked,
+/// so that neither guard re-enables them while the other is still held.
+fn lock_pair(a: usize, b: usize) -> (CpuGuard, Option<CpuGuard>) {
+    if a == b {
+        (CPUS[a].lock(), None)
+    } else if a < b {
+        let first = CPUS[a].lock();
+        (first, Some(CPUS[b].lock()))
+    } else {
+        let first = CPUS[b].lock();
+        (CPUS[a].lock(), Some(first))
+    }
+}
+
+fn renew_slice(cpu: usize) {
+    if let Some(slice) = SLICE.get(cpu) {
+        slice.store(TIME_SLICE_TICKS, Ordering::Relaxed);
+    }
+}
+
+/// Put a thread `cpu` owns on its queue for its priority.
+fn enqueue(me: &mut Cpu, cpu: usize, slot: ThreadRef) {
+    // SAFETY: the caller holds `cpu`'s lock and `cpu` owns the thread.
+    let level = unsafe { slot.get() }.priority.index();
+    me.ready[level].push_back(slot);
+    QUEUED[cpu].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Take the next genuinely runnable thread from one processor's queues, trying
+/// priority levels in `order`.
+///
+/// A queued thread that is not `Ready`, or that a processor is still standing
+/// on, is discarded rather than returned. The invariant is that neither can
+/// happen, but running such a thread would put two CPUs on one stack, and
+/// `flush_pending` queues a thread again when its switch really completes.
+fn pop_from(me: &mut Cpu, cpu: usize, order: [usize; Priority::COUNT]) -> Option<ThreadRef> {
+    for level in order {
+        while let Some(slot) = me.ready[level].pop_front() {
+            QUEUED[cpu].fetch_sub(1, Ordering::Relaxed);
+            // SAFETY: queued on `cpu`, so owned by it, and the caller holds its
+            // lock.
+            let thread = unsafe { slot.get() };
+            if thread.state == State::Ready && !thread.on_cpu {
+                return Some(slot);
+            }
+        }
+    }
+    None
+}
+
+/// The next thread for this processor, honouring the starvation guard.
+fn pop_runnable(me: &mut Cpu, cpu: usize) -> Option<ThreadRef> {
+    let boosting = me.priority_streak >= STARVATION_GUARD;
+
+    // Normally highest first. On a guarded turn the boosted level goes first,
+    // with the rest behind it so the CPU is never left idle because one queue
+    // happened to be empty.
+    let order: [usize; Priority::COUNT] = match (boosting, me.boost_level) {
+        (false, _) => [2, 1, 0],
+        (true, 0) => [0, 1, 2],
+        (true, _) => [1, 0, 2],
+    };
+
+    let found = pop_from(me, cpu, order)?;
+    if boosting {
+        me.priority_streak = 0;
+        me.boost_level ^= 1;
+    } else {
+        me.priority_streak = me.priority_streak.saturating_add(1);
+    }
+    Some(found)
+}
+
+/// Move one runnable thread from the busiest other processor to this one.
+///
+/// Stealing is what keeps per-CPU queues from becoming four independent
+/// schedulers. Without it a core that has emptied its own queue runs its idle
+/// thread next to another core's backlog. Interrupts must be masked.
+fn steal(cpu: usize) {
+    let Some(victim) = (0..MAX_CPUS)
+        .filter(|&other| other != cpu)
+        .max_by_key(|&other| QUEUED[other].load(Ordering::Relaxed))
+        .filter(|&other| QUEUED[other].load(Ordering::Relaxed) > 0)
+    else {
+        return;
+    };
+
+    let (mut me, theirs) = lock_pair(cpu, victim);
+    let Some(mut theirs) = theirs else {
+        return;
+    };
+    // Someone else may have filled this queue or emptied theirs meanwhile.
+    if QUEUED[cpu].load(Ordering::Relaxed) > 0 {
+        return;
+    }
+    if let Some(slot) = pop_from(&mut theirs, victim, [2, 1, 0]) {
+        // Both locks are held and the thread is on neither CPU.
+        slot.owner.store(cpu, Ordering::Release);
+        enqueue(&mut me, cpu, slot);
+    }
+}
+
+/// Release the thread this processor switched away from: the switch is
+/// complete, so it is safe both to run elsewhere and to free.
+fn flush_pending(me: &mut Cpu, cpu: usize) {
+    let Some(slot) = me.pending.take() else {
+        return;
+    };
+    // SAFETY: the thread was `cpu`'s current, so `cpu` owns it; a thread that is
+    // on a CPU is never moved. The caller holds `cpu`'s lock.
+    let thread = unsafe { slot.get() };
+    thread.on_cpu = false;
+
+    let is_idle = me.idle.as_ref().is_some_and(|idle| Arc::ptr_eq(idle, &slot));
+    match thread.state {
+        // Back onto this processor's own queue: it just ran here, so this is the
+        // core whose caches still hold its working set.
+        State::Ready if !is_idle => enqueue(me, cpu, slot),
+        State::Finished => {
+            if let Some(stack) = thread.take_stack() {
+                me.graveyard.push(stack);
+            }
+            me.reaped.push(slot.id);
+        }
+        _ => {}
+    }
+}
+
 /// What a context switch needs, decided under the lock and acted on after it is
 /// released.
 struct Switch {
@@ -93,434 +362,114 @@ struct Switch {
     space: Option<crate::memory::paging::AddressSpace>,
 }
 
-struct Scheduler {
-    /// Indexed by `ThreadId`. A `None` slot is a thread that has finished and
-    /// been reaped; ids are never reused, so a stale id reads as `None` rather
-    /// than silently addressing someone else.
-    threads: Vec<Option<Box<Thread>>>,
-    /// Runnable threads, oldest first: one set of priority queues per processor.
-    ///
-    /// A thread is filed on the queue of the core that last ran it, so it tends
-    /// to come back to caches that still know about it. Idle threads are
-    /// deliberately never in here -- they are each CPU's fallback, not
-    /// participants.
-    ready: [[VecDeque<ThreadId>; Priority::COUNT]; MAX_CPUS],
+fn prepare_switch(me: &mut Cpu, cpu: usize) -> Option<Switch> {
+    let current = me.current.clone()?;
+    let idle = me.idle.clone()?;
 
-    /// Switches served strictly by priority since the last time a lower queue
-    /// was given a turn, per processor.
-    ///
-    /// Strict priority starves: a `High` thread that never blocks means nothing
-    /// below it ever runs again. Every `STARVATION_GUARD` switches, the choice
-    /// deliberately comes from somewhere other than the top.
-    priority_streak: [u32; MAX_CPUS],
-
-    /// Which of the lower queues gets the next turn, per processor.
-    ///
-    /// Alternates rather than always picking the lowest. "Lowest occupied"
-    /// looks like the obvious answer and quietly skips the middle: with `High`
-    /// and `Low` both busy, every guarded turn went to `Low` and a `Normal`
-    /// thread never ran again. Alternating means each of the two is tried first
-    /// every other turn, so no level waits longer than `2 * STARVATION_GUARD`
-    /// switches.
-    ///
-    /// It is not a fair-share scheduler and does not pretend to be -- it is the
-    /// minimum that keeps a priority from meaning "never".
-    boost_level: [usize; MAX_CPUS],
-
-    /// Sleeping threads and the tick each is due to wake on.
-    ///
-    /// Unsorted, because it is scanned only when `NEXT_WAKE` says something is
-    /// due, and it is short. A timer wheel would be the answer at a thousand
-    /// sleepers; at a handful it would be machinery for its own sake.
-    sleepers: Vec<(ThreadId, u64)>,
-
-    /// Which thread each processor is running.
-    current: [Option<ThreadId>; MAX_CPUS],
-    /// Each processor's fallback when nothing else is runnable.
-    idle: [Option<ThreadId>; MAX_CPUS],
-    /// The thread this CPU most recently switched away from, cleared by the
-    /// incoming context once the switch has actually completed.
-    ///
-    /// It serves two purposes at once. A still-runnable thread may not be
-    /// offered to another processor until its registers are saved, and a
-    /// *finished* one may not be freed until this CPU has left its stack --
-    /// between releasing the scheduler lock and the `mov rsp` inside
-    /// `context_switch`, the outgoing thread is no longer `current` anywhere but
-    /// is still the stack this CPU is standing on.
-    pending: [Option<ThreadId>; MAX_CPUS],
-
-    /// Finished threads waiting to be dropped.
-    ///
-    /// Dropping one unmaps its stack, which takes the page-table and frame
-    /// locks and broadcasts a TLB shootdown. None of that can happen here --
-    /// `reap` runs inside the timer interrupt with this lock held, so it would
-    /// be taking the paging locks underneath the scheduler lock in one path and
-    /// above it in another. They are handed out and dropped after the lock is
-    /// released instead.
-    ///
-    /// The `Box` is not redundant: `prepare_switch` hands out a raw pointer into
-    /// the live thread's `stack_pointer`, so a thread's address has to stay put.
-    /// Unboxing into the vector would move it.
-    #[allow(clippy::vec_box)]
-    graveyard: Vec<Box<Thread>>,
-
-    /// Threads that have set themselves `Finished` and are waiting to be freed.
-    ///
-    /// `reap` used to scan the whole thread table looking for them, on every
-    /// context switch, with the lock held. That is an O(threads) walk on the
-    /// hottest path in the kernel to find, almost always, nothing. Exits are
-    /// rare, so the exiting thread records itself here and reaping becomes
-    /// proportional to the number of threads that actually died.
-    finished: Vec<ThreadId>,
-}
-
-impl Scheduler {
-    fn thread(&self, id: ThreadId) -> &Thread {
-        self.threads[id.0]
-            .as_deref()
-            .expect("scheduler referenced a reaped thread")
-    }
-
-    fn thread_mut(&mut self, id: ThreadId) -> &mut Thread {
-        self.threads[id.0]
-            .as_deref_mut()
-            .expect("scheduler referenced a reaped thread")
-    }
-
-    fn thread_opt(&self, id: ThreadId) -> Option<&Thread> {
-        self.threads.get(id.0).and_then(|slot| slot.as_deref())
-    }
-
-    fn thread_opt_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
-        self.threads.get_mut(id.0).and_then(|slot| slot.as_deref_mut())
-    }
-
-    /// Free threads that have run to completion.
-    ///
-    /// Never one that any processor is still standing on. `on_cpu` covers both
-    /// "running right now" and "being switched away from", and it is the second
-    /// that matters: a thread stops being `current` under the lock, but the CPU
-    /// does not leave its stack until `context_switch` runs, well after the lock
-    /// is released. Freeing it in that window unmaps the stack out from under a
-    /// live processor. Checking only this CPU's `current` was correct while
-    /// there was only one CPU.
-    fn reap(&mut self) {
-        if self.finished.is_empty() {
-            return;
-        }
-
-        let candidates = core::mem::take(&mut self.finished);
-        for id in candidates {
-            let ready_to_free = matches!(
-                self.thread_opt(id),
-                Some(t) if t.state == State::Finished && !t.on_cpu
-            );
-
-            if !ready_to_free {
-                // Still being switched away from. Put it back and look again
-                // next time; the CPU leaving its stack is a handful of
-                // instructions away.
-                if matches!(self.thread_opt(id), Some(t) if t.state == State::Finished) {
-                    self.finished.push(id);
-                }
-                continue;
+    let next = match pop_runnable(me, cpu) {
+        Some(slot) => slot,
+        None => {
+            // Nobody else wants the CPU. Keep running rather than bouncing to
+            // idle and straight back.
+            // SAFETY: current on `cpu`, whose lock is held.
+            let running = unsafe { current.get() }.state == State::Running;
+            if !Arc::ptr_eq(&current, &idle) && running {
+                renew_slice(cpu);
+                return None;
             }
-
-            if let Some(thread) = self.threads[id.0].take() {
-                self.graveyard.push(thread);
-            }
+            idle
         }
-    }
+    };
 
-    /// Hand over the finished threads so the caller can drop them once the
-    /// scheduler lock is released.
-    #[allow(clippy::vec_box)]
-    fn take_graveyard(&mut self) -> Vec<Box<Thread>> {
-        core::mem::take(&mut self.graveyard)
-    }
-
-    /// Put a runnable thread on `cpu`'s queue for its priority.
-    fn enqueue_on(&mut self, cpu: usize, id: ThreadId) {
-        let level = self.thread(id).priority.index();
-        self.ready[cpu.min(MAX_CPUS - 1)][level].push_back(id);
-    }
-
-    /// Whether a queued id still names something worth running.
-    ///
-    /// A queued thread that is still `on_cpu` fails this and is discarded rather
-    /// than returned. The invariant is that this cannot happen -- nothing
-    /// enqueues a thread a processor is standing on -- but if it ever did,
-    /// running it would put two CPUs on one stack. Discarding is safe because
-    /// `flush_pending` enqueues the thread again when the switch completes.
-    fn is_runnable(&self, id: ThreadId) -> bool {
-        matches!(self.thread_opt(id), Some(t) if t.state == State::Ready && !t.on_cpu)
-    }
-
-    /// Take the next runnable thread from one processor's queues, trying the
-    /// priority levels in `order`.
-    fn pop_from(&mut self, cpu: usize, order: [usize; Priority::COUNT]) -> Option<ThreadId> {
-        for level in order {
-            while let Some(id) = self.ready[cpu][level].pop_front() {
-                if self.is_runnable(id) {
-                    return Some(id);
-                }
-            }
-        }
-        None
-    }
-
-    /// Runnable threads waiting on one processor's queues.
-    ///
-    /// Counts entries, not verified threads: an id belonging to a thread that
-    /// has since finished inflates it slightly, and the only cost of that is
-    /// picking a marginally wrong victim to steal from.
-    fn queued_on(&self, cpu: usize) -> usize {
-        self.ready[cpu].iter().map(|queue| queue.len()).sum()
-    }
-
-    /// Take the next genuinely runnable thread for `cpu`: its own queues first,
-    /// then the busiest other processor's.
-    ///
-    /// Stealing is what keeps per-CPU queues from becoming four independent
-    /// schedulers. Without it a core that happens to have emptied its own queue
-    /// runs its idle thread next to another core's backlog, and the split makes
-    /// throughput worse rather than better.
-    fn pop_runnable(&mut self, cpu: usize) -> Option<ThreadId> {
-        let boosting = self.priority_streak[cpu] >= STARVATION_GUARD;
-
-        // Normally highest first. On a guarded turn the boosted level goes
-        // first, with the rest behind it so the CPU is never left idle because
-        // one queue happened to be empty.
-        let order: [usize; Priority::COUNT] = match (boosting, self.boost_level[cpu]) {
-            (false, _) => [2, 1, 0],
-            (true, 0) => [0, 1, 2],
-            (true, _) => [1, 0, 2],
-        };
-
-        let found = self.pop_from(cpu, order).or_else(|| {
-            // Steal from whoever has the most, so one busy core is drained
-            // rather than a queue of one being passed around.
-            let victim = (0..MAX_CPUS)
-                .filter(|&other| other != cpu)
-                .max_by_key(|&other| self.queued_on(other))
-                .filter(|&other| self.queued_on(other) > 0)?;
-            self.pop_from(victim, order)
-        })?;
-
-        if boosting {
-            self.priority_streak[cpu] = 0;
-            // Alternate, so `Low` and `Normal` take it in turns. Always picking
-            // the lowest occupied queue is what let the middle one starve.
-            self.boost_level[cpu] ^= 1;
-        } else {
-            self.priority_streak[cpu] = self.priority_streak[cpu].saturating_add(1);
-        }
-        Some(found)
-    }
-
-    /// Make a blocked thread runnable again.
-    ///
-    /// Shared by every wake path -- IPC, a lapsed sleep, a thread being joined
-    /// finishing -- because the `on_cpu` rule is easy to get right once and easy
-    /// to forget everywhere else.
-    ///
-    /// The woken thread is filed on the queue of whichever processor is doing
-    /// the waking. That is usually the one it will talk to next, and a wrong
-    /// guess costs nothing: a core with an empty queue steals.
-    fn wake(&mut self, id: ThreadId) {
-        let cpu = cpu_index();
-        self.wake_onto(cpu, id);
-    }
-
-    fn wake_onto(&mut self, cpu: usize, id: ThreadId) {
-        let Some(thread) = self.threads.get_mut(id.0).and_then(|slot| slot.as_deref_mut()) else {
-            return;
-        };
-        if thread.state != State::Blocked {
-            // Not parked yet. It registered with its waker, released that lock
-            // and has not reached `block_current` -- a window this cannot close
-            // by waiting, because the thread is on another processor. Leaving
-            // now would drop the wake and park it forever, so it is recorded
-            // and the thread's own attempt to block consumes it.
-            //
-            // Only meaningful for a live thread; a Finished one is not going to
-            // block again.
-            if thread.state != State::Finished {
-                thread.wake_pending = true;
-            }
-            return;
-        }
-        thread.state = State::Ready;
-
-        // A wake can land while the thread is still leaving its processor: it
-        // set itself Blocked, and the CPU running it has released the scheduler
-        // lock but not yet reached `context_switch`. Queueing it here would let
-        // another core resume it from a saved stack pointer that has not been
-        // written yet -- a second CPU on a live stack, which reads as a wild
-        // jump or a fault on a null rsp. `flush_pending` queues it once the
-        // switch is genuinely done.
-        if !thread.on_cpu {
-            self.enqueue_on(cpu, id);
-        }
-    }
-
-    /// Wake every sleeper whose deadline has passed, and republish the next one.
-    fn wake_due_sleepers(&mut self, cpu: usize, now: u64) {
-        let mut due = Vec::new();
-        let mut earliest = u64::MAX;
-
-        self.sleepers.retain(|&(id, deadline)| {
-            if deadline <= now {
-                due.push(id);
-                false
-            } else {
-                earliest = earliest.min(deadline);
-                true
-            }
-        });
-
-        // Only ever moved later from in here, and only with the lock held, so a
-        // sleeper added concurrently cannot have its earlier deadline erased --
-        // `sleep_ticks` publishes the minimum, and it took the lock to get on
-        // the list in the first place.
-        NEXT_WAKE.store(earliest, Ordering::Release);
-
-        for id in due {
-            self.wake_onto(cpu, id);
-        }
-    }
-
-    /// Release the thread this CPU switched away from: the switch is complete,
-    /// so it is safe both to run elsewhere and to free.
-    ///
-    /// Only a runnable, non-idle thread rejoins the queue. Idle threads belong
-    /// to their processor and are never queued; finished ones are left for
-    /// `reap`, which can now see them.
-    fn flush_pending(&mut self, cpu: usize) {
-        let Some(id) = self.pending[cpu].take() else {
-            return;
-        };
-        let Some(thread) = self.threads.get_mut(id.0).and_then(|s| s.as_deref_mut()) else {
-            return;
-        };
-        thread.on_cpu = false;
-        let state = thread.state;
-
-        // Back onto this processor's own queue: it just ran here, so this is the
-        // core whose caches still hold its working set.
-        if state == State::Ready && !self.idle.contains(&Some(id)) {
-            self.enqueue_on(cpu, id);
-        }
-    }
-
-    fn prepare_switch(&mut self, cpu: usize) -> Option<Switch> {
-        let current = self.current[cpu]?;
-        let idle = self.idle[cpu]?;
-
-        let next = match self.pop_runnable(cpu) {
-            Some(id) => id,
-            None => {
-                // Nobody else wants the CPU. Keep running rather than bouncing
-                // to idle and straight back.
-                if current != idle && self.thread(current).state == State::Running {
-                    renew_slice(cpu);
-                    return None;
-                }
-                idle
-            }
-        };
-
-        if next == current {
-            renew_slice(cpu);
-            return None;
-        }
-
-        // Retire the outgoing thread. A thread that finished or blocked keeps
-        // that state; only a still-running one becomes runnable again.
-        let outgoing = self.thread_mut(current);
-        if outgoing.state == State::Running {
-            outgoing.state = State::Ready;
-        }
-
-        // Held back, whatever its state. A runnable thread must not be picked up
-        // elsewhere while its registers are still live in this CPU, and a
-        // finished one must not be freed while this CPU is still on its stack.
-        // The incoming context releases it once the switch has completed.
-        self.pending[cpu] = Some(current);
-
-        let save_to: *mut u64 = &mut self.thread_mut(current).stack_pointer;
-
-        let incoming = self.thread_mut(next);
-        incoming.state = State::Running;
-        // This CPU is committed to it from here, even though it does not
-        // actually arrive until `context_switch`.
-        incoming.on_cpu = true;
-        let load_from = incoming.stack_pointer;
-        let kernel_stack_top = incoming.kernel_stack_top;
-        let space = incoming.address_space;
-
-        self.current[cpu] = Some(next);
+    if Arc::ptr_eq(&next, &current) {
         renew_slice(cpu);
-
-        Some(Switch {
-            save_to,
-            load_from,
-            kernel_stack_top,
-            space,
-        })
+        return None;
     }
+
+    // Retire the outgoing thread. A thread that finished or blocked keeps that
+    // state; only a still-running one becomes runnable again.
+    // SAFETY: as above.
+    let outgoing = unsafe { current.get() };
+    if outgoing.state == State::Running {
+        outgoing.state = State::Ready;
+    }
+    // The `Arc` in `pending` keeps this address alive through the switch.
+    let save_to: *mut u64 = &mut outgoing.stack_pointer;
+
+    // SAFETY: popped from `cpu`'s own queue, or its idle thread, so `cpu` owns it.
+    let incoming = unsafe { next.get() };
+    incoming.state = State::Running;
+    // This CPU is committed to it from here, even though it does not actually
+    // arrive until `context_switch`.
+    incoming.on_cpu = true;
+    let switch = Switch {
+        save_to,
+        load_from: incoming.stack_pointer,
+        kernel_stack_top: incoming.kernel_stack_top,
+        space: incoming.address_space,
+    };
+
+    // Held back, whatever its state; see `Cpu::pending`.
+    me.pending = Some(current);
+    CURRENT[cpu].store(next.id.0 + 1, Ordering::Release);
+    me.current = Some(next);
+    renew_slice(cpu);
+    Some(switch)
 }
 
-/// Give a processor a fresh quantum.
-fn renew_slice(cpu: usize) {
-    if let Some(slice) = SLICE.get(cpu) {
-        slice.store(TIME_SLICE_TICKS, Ordering::Relaxed);
+/// Free what `flush_pending` set aside. Call with no scheduler lock held.
+fn bury(stacks: Vec<KernelStack>, reaped: Vec<ThreadId>) {
+    drop(stacks);
+    if reaped.is_empty() {
+        return;
+    }
+    let mut threads = THREADS.lock();
+    for id in reaped {
+        if let Some(entry) = threads.get_mut(id.0) {
+            *entry = None;
+        }
     }
 }
 
 /// Set up the scheduler around the context that is already running.
 ///
-/// Must be called after the heap is up (threads and their stacks are heap
-/// allocated) and before interrupts are enabled, so that no tick can arrive
-/// mid-construction.
+/// Must be called after the heap is up (thread control blocks and their stacks
+/// are heap allocated) and before interrupts are enabled, so that no tick can
+/// arrive mid-construction.
 pub fn init() {
     without_interrupts(|| {
-        let mut guard = SCHEDULER.lock();
-        if guard.is_some() {
+        if INITIALISED.load(Ordering::Acquire) {
             return;
         }
 
         // Thread 0 is whatever is executing right now, on the boot processor.
-        let boot = Box::new(Thread::adopt_running(BOOT_THREAD, "boot"));
-
+        let boot = new_slot(Thread::adopt_running(BOOT_THREAD, "boot"), 0);
         // The boot processor's idle thread. It has to be separate from the boot
         // thread: idle is by definition the last choice, so if the boot thread
         // were also idle, any CPU-bound worker would starve it permanently.
-        let idle = Box::new(Thread::new(
-            ThreadId(1),
-            "idle",
-            idle_loop,
-            Priority::Low,
-            trampoline,
-        ));
+        let idle = new_slot(
+            Thread::new(ThreadId(1), "idle", idle_loop, Priority::Low, trampoline),
+            0,
+        );
 
-        let mut scheduler = Scheduler {
-            threads: alloc::vec![Some(boot), Some(idle)],
-            ready: [const { [const { VecDeque::new() }; Priority::COUNT] }; MAX_CPUS],
-            priority_streak: [0; MAX_CPUS],
-            boost_level: [0; MAX_CPUS],
-            sleepers: Vec::new(),
-            current: [None; MAX_CPUS],
-            idle: [None; MAX_CPUS],
-            pending: [None; MAX_CPUS],
-            graveyard: Vec::new(),
-            finished: Vec::new(),
-        };
-        scheduler.current[0] = Some(BOOT_THREAD);
-        scheduler.idle[0] = Some(ThreadId(1));
+        *THREADS.lock() = alloc::vec![Some(boot.clone()), Some(idle.clone())];
 
-        *guard = Some(scheduler);
+        let mut me = CPUS[0].lock();
+        me.current = Some(boot);
+        me.idle = Some(idle);
+        CURRENT[0].store(BOOT_THREAD.0 + 1, Ordering::Release);
+
+        INITIALISED.store(true, Ordering::Release);
     });
+}
+
+fn new_slot(thread: Thread, owner: usize) -> ThreadRef {
+    Arc::new(Slot {
+        id: thread.id,
+        name: thread.name,
+        owner: AtomicUsize::new(owner),
+        thread: UnsafeCell::new(thread),
+    })
 }
 
 /// Register a processor that has just come up.
@@ -528,16 +477,24 @@ pub fn init() {
 /// The context it is already running on becomes that CPU's idle thread, the
 /// same way the boot thread was adopted rather than created.
 pub fn adopt_secondary_cpu() {
-    let cpu = cpu_index();
-    with(|scheduler| {
-        if scheduler.idle[cpu].is_some() {
+    without_interrupts(|| {
+        let cpu = cpu_index();
+        if CPUS[cpu].lock().idle.is_some() {
             return;
         }
-        let id = ThreadId(scheduler.threads.len());
-        let idle = Box::new(Thread::adopt_running(id, "idle-ap"));
-        scheduler.threads.push(Some(idle));
-        scheduler.idle[cpu] = Some(id);
-        scheduler.current[cpu] = Some(id);
+
+        let idle = {
+            let mut threads = THREADS.lock();
+            let id = ThreadId(threads.len());
+            let slot = new_slot(Thread::adopt_running(id, "idle-ap"), cpu);
+            threads.push(Some(slot.clone()));
+            slot
+        };
+
+        let mut me = CPUS[cpu].lock();
+        CURRENT[cpu].store(idle.id.0 + 1, Ordering::Release);
+        me.current = Some(idle.clone());
+        me.idle = Some(idle);
         renew_slice(cpu);
     });
 }
@@ -554,16 +511,48 @@ pub fn spawn_with_priority(
     entry: fn(),
     priority: Priority,
 ) -> Option<ThreadId> {
-    with(|scheduler| {
-        let id = ThreadId(scheduler.threads.len());
-        let thread = Box::new(Thread::new(id, name, entry, priority, trampoline));
+    if !INITIALISED.load(Ordering::Acquire) {
+        return None;
+    }
 
-        scheduler.threads.push(Some(thread));
+    without_interrupts(|| {
         // On the spawner's queue. A new thread has no cache footprint anywhere
         // yet, and the core that made it is as good a guess as any -- an idle
         // core will steal it within a switch if this one is busy.
-        scheduler.enqueue_on(cpu_index(), id);
-        id
+        let cpu = cpu_index();
+        let slot = {
+            let mut threads = THREADS.lock();
+            let id = ThreadId(threads.len());
+            let slot = new_slot(Thread::new(id, name, entry, priority, trampoline), cpu);
+            threads.push(Some(slot.clone()));
+            slot
+        };
+        let id = slot.id;
+        enqueue(&mut CPUS[cpu].lock(), cpu, slot);
+        Some(id)
+    })
+}
+
+/// Run `f` on a thread's scheduling state under its owner's lock, or return
+/// `None` if the thread is gone.
+fn with_thread<R>(id: ThreadId, f: impl FnOnce(&mut Thread) -> R) -> Option<R> {
+    let slot = lookup(id)?;
+    without_interrupts(|| {
+        let _owner = lock_owner(&slot);
+        // SAFETY: the owner's lock is held for the life of the reference.
+        Some(f(unsafe { slot.get() }))
+    })
+}
+
+/// Run `f` on the current thread under this processor's lock.
+fn with_current<R>(f: impl FnOnce(&mut Thread, &ThreadRef) -> R) -> Option<R> {
+    without_interrupts(|| {
+        let cpu = cpu_index();
+        let me = CPUS[cpu].lock();
+        let current = me.current.clone()?;
+        // SAFETY: the current thread is owned by this processor, whose lock is
+        // held for the life of the reference.
+        Some(f(unsafe { current.get() }, &current))
     })
 }
 
@@ -571,39 +560,42 @@ pub fn spawn_with_priority(
 ///
 /// Takes effect at its next switch: a thread already in a queue stays there
 /// until it is picked up, and is filed by its new priority when it next goes
-/// back. Re-filing it immediately would mean finding and removing it from a
-/// queue, and the delay is at most one quantum.
+/// back. The delay is at most one quantum.
 pub fn set_priority(id: ThreadId, priority: Priority) {
-    with(|scheduler| {
-        if let Some(thread) = scheduler.threads.get_mut(id.0).and_then(|s| s.as_deref_mut()) {
-            thread.priority = priority;
-        }
-    });
+    with_thread(id, |thread| thread.priority = priority);
 }
 
 /// A thread's priority, if it still exists.
 pub fn priority_of(id: ThreadId) -> Option<Priority> {
-    with(|scheduler| scheduler.thread_opt(id).map(|thread| thread.priority)).flatten()
+    with_thread(id, |thread| thread.priority)
 }
 
 /// Hand the CPU to the next runnable thread, if there is one.
 pub fn schedule() {
     without_interrupts(|| {
+        if !INITIALISED.load(Ordering::Acquire) {
+            return;
+        }
         let cpu = cpu_index();
 
-        let (switch, dead) = {
-            let mut guard = SCHEDULER.lock();
-            let Some(scheduler) = guard.as_mut() else {
-                return;
-            };
-            scheduler.flush_pending(cpu);
-            scheduler.reap();
-            (scheduler.prepare_switch(cpu), scheduler.take_graveyard())
+        if QUEUED[cpu].load(Ordering::Relaxed) == 0 {
+            steal(cpu);
+        }
+
+        let (switch, stacks, reaped) = {
+            let mut me = CPUS[cpu].lock();
+            flush_pending(&mut me, cpu);
+            let switch = prepare_switch(&mut me, cpu);
+            (
+                switch,
+                core::mem::take(&mut me.graveyard),
+                core::mem::take(&mut me.reaped),
+            )
         };
 
-        // Outside the scheduler lock: this unmaps stacks, returns frames and
-        // may broadcast a shootdown, none of which may happen underneath it.
-        drop(dead);
+        // Outside the lock: this unmaps stacks, returns frames and may broadcast
+        // a shootdown, none of which may happen underneath it.
+        bury(stacks, reaped);
 
         let Some(switch) = switch else {
             return;
@@ -627,16 +619,16 @@ pub fn schedule() {
         // contains every kernel mapping -- or the kernel's own.
         unsafe { target.activate() };
 
-        // SAFETY: `save_to` points into a `Box<Thread>` whose address is stable,
-        // and nothing can free it here: `reap` runs under the lock just
-        // released, and it refuses to free a thread current on any CPU.
+        // SAFETY: `save_to` points into the outgoing thread's control block,
+        // which `pending` keeps alive, and nothing else writes it: the thread is
+        // on this CPU, so no other processor may take it.
         unsafe { context::context_switch(switch.save_to, switch.load_from) };
 
         // Reached as the *incoming* thread. The thread this processor switched
         // away from now has its registers saved, so it can safely be offered to
         // another CPU.
         let cpu = cpu_index();
-        with(|scheduler| scheduler.flush_pending(cpu));
+        flush_pending(&mut CPUS[cpu].lock(), cpu);
     });
 }
 
@@ -655,13 +647,7 @@ pub fn yield_now() {
 /// to the punch and there is something to collect, so the caller should go back
 /// and look rather than assuming it was woken for nothing.
 pub fn block_current() -> bool {
-    let parked = with(|scheduler| {
-        let cpu = cpu_index();
-        let Some(id) = scheduler.current[cpu] else {
-            return false;
-        };
-
-        let thread = scheduler.thread_mut(id);
+    let parked = with_current(|thread, _| {
         if core::mem::take(&mut thread.wake_pending) {
             // Woken between registering and getting here. Parking now would
             // wait for a wake that has already been delivered.
@@ -680,8 +666,54 @@ pub fn block_current() -> bool {
 
 /// Return a blocked thread to the ready queue. Does nothing if it is not
 /// blocked, so a duplicate wake is harmless.
+///
+/// The thread moves to the waker's processor, which is usually the one it will
+/// talk to next -- unless a processor is still standing on its stack, in which
+/// case it stays put and `flush_pending` queues it when the switch completes.
 pub fn unblock(id: ThreadId) {
-    with(|scheduler| scheduler.wake(id));
+    let Some(slot) = lookup(id) else {
+        return;
+    };
+
+    without_interrupts(|| {
+        let waker = cpu_index();
+        loop {
+            let owner = slot.owner.load(Ordering::Acquire);
+            let (mut here, there) = lock_pair(waker, owner);
+            if slot.owner.load(Ordering::Acquire) != owner {
+                continue;
+            }
+
+            // SAFETY: the owner's lock is one of the two held.
+            let thread = unsafe { slot.get() };
+            if thread.state != State::Blocked {
+                // Not parked yet. It registered with its waker, released that
+                // lock and has not reached `block_current` -- a window this
+                // cannot close by waiting, because the thread is on another
+                // processor. Leaving now would drop the wake and park it
+                // forever, so it is recorded and the thread's own attempt to
+                // block consumes it. A finished thread is not going to block.
+                if thread.state != State::Finished {
+                    thread.wake_pending = true;
+                }
+                return;
+            }
+            thread.state = State::Ready;
+
+            // A wake can land while the thread is still leaving its processor:
+            // it set itself Blocked, and the CPU running it has released the
+            // lock but not yet reached `context_switch`. Queueing it here would
+            // let another core resume it from a saved stack pointer that has not
+            // been written yet. `flush_pending` queues it once the switch is
+            // genuinely done.
+            if !thread.on_cpu {
+                slot.owner.store(waker, Ordering::Release);
+                enqueue(&mut here, waker, slot.clone());
+            }
+            drop(there);
+            return;
+        }
+    });
 }
 
 /// Park the current thread for at least `ticks` timer interrupts.
@@ -697,23 +729,16 @@ pub fn sleep_ticks(ticks: u64) {
         return;
     }
 
-    let parked = with(|scheduler| {
-        let cpu = cpu_index();
-        let Some(id) = scheduler.current[cpu] else {
-            return false;
-        };
-
+    let parked = with_current(|thread, slot| {
         let deadline = crate::time::ticks().saturating_add(ticks);
-        let thread = scheduler.thread_mut(id);
-        // Registering and parking happen under one lock here, so there is no
-        // gap for a wake to fall into. Any pending one is stale.
+        // Parked before it is listed, both under this processor's lock, so a
+        // wake cannot find it listed and still running.
         thread.wake_pending = false;
         thread.state = State::Blocked;
-        scheduler.sleepers.push((id, deadline));
+        SLEEPERS.lock().push((slot.id, deadline));
 
-        // Published under the lock, so it cannot race with the recomputation in
-        // `wake_due_sleepers`. Only ever moved earlier here: an existing sooner
-        // deadline must not be pushed back.
+        // Only ever moved earlier here: an existing sooner deadline must not be
+        // pushed back.
         NEXT_WAKE.fetch_min(deadline, Ordering::AcqRel);
         true
     })
@@ -739,42 +764,77 @@ pub fn sleep_ms(ms: u64) {
     sleep_ticks(ms.saturating_mul(hz).div_ceil(1000));
 }
 
+/// Wake every sleeper whose deadline has passed, and republish the next one.
+fn wake_due_sleepers(now: u64) {
+    let due = without_interrupts(|| {
+        let mut sleepers = SLEEPERS.lock();
+        let mut due = Vec::new();
+        let mut earliest = u64::MAX;
+        sleepers.retain(|&(id, deadline)| {
+            if deadline <= now {
+                due.push(id);
+                false
+            } else {
+                earliest = earliest.min(deadline);
+                true
+            }
+        });
+        // Under the list's lock, which a sleeper adding itself also takes, so an
+        // earlier deadline published concurrently cannot be erased.
+        NEXT_WAKE.store(earliest, Ordering::Release);
+        due
+    });
+
+    for id in due {
+        unblock(id);
+    }
+}
+
 /// Wait until `id` has finished. Returns immediately if it already has, or if
 /// no such thread exists.
 ///
-/// The registration and the block happen under one acquisition of the scheduler
-/// lock, which is what makes this safe against the thread finishing in between:
-/// `exit_current` takes the joiner list under the same lock, so it either sees
-/// this waiter and wakes it, or has already finished and this returns without
-/// parking.
+/// Registration and the block happen under the locks of both threads' owners,
+/// which is what makes this safe against the thread finishing in between:
+/// `exit_current` takes the joiner list under its own owner's lock, so it either
+/// sees this waiter and wakes it, or has already finished and this returns
+/// without parking.
 ///
 /// Joining oneself would park forever and is refused.
 pub fn join(id: ThreadId) {
-    let parked = with(|scheduler| {
+    let Some(target) = lookup(id) else {
+        return;
+    };
+
+    let parked = without_interrupts(|| {
         let cpu = cpu_index();
-        let Some(me) = scheduler.current[cpu] else {
+        let Some(me) = CPUS[cpu].lock().current.clone() else {
             return false;
         };
-        if me == id {
+        if Arc::ptr_eq(&me, &target) {
             return false;
         }
 
-        // Gone, or on its way out with its joiner list already taken.
-        match scheduler.thread_opt(id) {
-            None => return false,
-            Some(thread) if thread.state == State::Finished => return false,
-            _ => {}
-        }
+        loop {
+            let owner = target.owner.load(Ordering::Acquire);
+            let _locks = lock_pair(cpu, owner);
+            if target.owner.load(Ordering::Acquire) != owner {
+                continue;
+            }
 
-        scheduler.thread_mut(id).joiners.push(me);
-        let waiter = scheduler.thread_mut(me);
-        // As in `sleep_ticks`: registration and parking share one acquisition
-        // of the lock, so nothing can slip between them.
-        waiter.wake_pending = false;
-        waiter.state = State::Blocked;
-        true
-    })
-    .unwrap_or(false);
+            // SAFETY: the target's owner's lock is held.
+            let waited_for = unsafe { target.get() };
+            if waited_for.state == State::Finished {
+                return false;
+            }
+            waited_for.joiners.push(me.id);
+
+            // SAFETY: `me` is current here, so owned by `cpu`, whose lock is held.
+            let waiter = unsafe { me.get() };
+            waiter.wake_pending = false;
+            waiter.state = State::Blocked;
+            return true;
+        }
+    });
 
     if parked {
         schedule();
@@ -787,30 +847,28 @@ pub fn exit_current() -> ! {
     let id = current_id().expect("exit_current outside a thread");
 
     // Release resources while the thread is still running and holds no
-    // scheduler lock. `reap` cannot do this: it runs inside the timer interrupt
-    // with the scheduler locked, and freeing memory there would deadlock
-    // against a thread already inside the allocator.
+    // scheduler lock. Freeing memory from inside the scheduler would take the
+    // allocator's lock underneath a processor's.
     crate::release_thread_resources(id);
 
-    with(|scheduler| {
-        scheduler.thread_mut(id).state = State::Finished;
-        // Recorded rather than searched for. `reap` runs on every switch, and
-        // scanning the whole thread table each time to find the rare thread
-        // that has died is the wrong shape entirely.
-        scheduler.finished.push(id);
+    without_interrupts(|| {
+        // Finished and the joiner list taken in one acquisition, so a `join`
+        // either got onto the list first or sees `Finished` and does not park.
+        let joiners = with_current(|thread, _| {
+            thread.state = State::Finished;
+            core::mem::take(&mut thread.joiners)
+        })
+        .unwrap_or_default();
 
-        // Take the list before waking anyone: this thread is about to be
-        // reaped, and the list goes with it. Waking under the same lock that
-        // set `Finished` is what closes the race with a `join` arriving now --
-        // it either got in before this and is on the list, or it sees
-        // `Finished` and does not park at all.
-        let joiners = core::mem::take(&mut scheduler.thread_mut(id).joiners);
+        // After the lock, because waking takes other processors' locks -- but
+        // with interrupts still masked. A tick in between would switch this
+        // thread away for good, and the wakes would never be sent.
         for joiner in joiners {
-            scheduler.wake(joiner);
+            unblock(joiner);
         }
-    });
 
-    schedule();
+        schedule();
+    });
 
     unreachable!("a finished thread was scheduled again")
 }
@@ -821,10 +879,8 @@ pub fn on_timer_tick() {
     let cpu = cpu_index();
     let now = crate::time::ticks();
 
-    // Neither of these touches the scheduler lock. This runs on every core on
-    // every tick, and both answers are almost always "no" -- queueing four cores
-    // on one lock a hundred times a second to find that out was the single
-    // busiest thing the scheduler did.
+    // Neither of these touches a lock. This runs on every core on every tick,
+    // and both answers are almost always "no".
     let sleeper_due = now >= NEXT_WAKE.load(Ordering::Acquire);
     let slice_expired = match SLICE.get(cpu) {
         // A saturating update rather than a decrement, so a slice already at
@@ -838,7 +894,7 @@ pub fn on_timer_tick() {
     };
 
     if sleeper_due {
-        with(|scheduler| scheduler.wake_due_sleepers(cpu, now));
+        wake_due_sleepers(now);
     }
 
     if slice_expired {
@@ -847,92 +903,68 @@ pub fn on_timer_tick() {
 }
 
 pub fn is_initialised() -> bool {
-    SCHEDULER.lock().is_some()
+    INITIALISED.load(Ordering::Acquire)
 }
 
 pub fn current_id() -> Option<ThreadId> {
-    with(|scheduler| scheduler.current[cpu_index()]).flatten()
+    without_interrupts(|| match CURRENT[cpu_index()].load(Ordering::Acquire) {
+        0 => None,
+        biased => Some(ThreadId(biased - 1)),
+    })
 }
 
 pub fn current_name() -> Option<&'static str> {
-    with(|scheduler| {
-        scheduler.current[cpu_index()].map(|id| scheduler.thread(id).name)
-    })
-    .flatten()
+    with_current(|_, slot| slot.name)
 }
 
-/// [`current_name`], but `None` rather than waiting for the scheduler lock. For
-/// the panic path, which may have been reached from inside the scheduler.
+/// [`current_name`], but `None` rather than waiting for this processor's lock.
+/// For the panic path, which may have been reached from inside the scheduler.
 pub fn try_current_name() -> Option<&'static str> {
-    let guard = SCHEDULER.try_lock()?;
-    let scheduler = guard.as_ref()?;
-    scheduler.current[cpu_index()].map(|id| scheduler.thread(id).name)
+    let me = CPUS[cpu_index()].try_lock()?;
+    me.current.as_ref().map(|slot| slot.name)
 }
 
 /// Threads that exist and have not been reaped.
 pub fn live_thread_count() -> usize {
-    with(|scheduler| scheduler.threads.iter().filter(|slot| slot.is_some()).count()).unwrap_or(0)
+    without_interrupts(|| THREADS.lock().iter().filter(|slot| slot.is_some()).count())
 }
 
 /// Give a thread its own page tables.
 pub fn set_address_space(id: ThreadId, space: crate::memory::paging::AddressSpace) {
-    with(|scheduler| {
-        scheduler.thread_mut(id).address_space = Some(space);
-    });
+    with_thread(id, |thread| thread.address_space = Some(space));
 }
 
 /// Detach a thread's page tables from it, so no later switch to the thread
 /// loads them. The first step in freeing them.
 pub fn take_address_space(id: ThreadId) -> Option<crate::memory::paging::AddressSpace> {
-    with(|scheduler| scheduler.thread_opt_mut(id).and_then(|thread| thread.address_space.take()))
-        .flatten()
+    with_thread(id, |thread| thread.address_space.take()).flatten()
 }
 
 /// A thread's page tables, if it has its own.
 pub fn address_space_of(id: ThreadId) -> Option<crate::memory::paging::AddressSpace> {
-    with(|scheduler| scheduler.thread_opt(id).and_then(|thread| thread.address_space)).flatten()
+    with_thread(id, |thread| thread.address_space).flatten()
 }
 
 /// Top of the current thread's kernel stack, or 0 for a thread that owns none.
 pub fn current_kernel_stack_top() -> u64 {
-    with(|scheduler| {
-        scheduler.current[cpu_index()]
-            .map(|id| scheduler.thread(id).kernel_stack_top)
-            .unwrap_or(0)
-    })
-    .unwrap_or(0)
+    with_current(|thread, _| thread.kernel_stack_top).unwrap_or(0)
 }
 
 /// The unmapped page below a thread's stack, and its lowest mapped address.
 ///
 /// Diagnostic, and used by the test that checks the guard is really there.
 pub fn stack_bounds_of(id: ThreadId) -> Option<(u64, u64)> {
-    with(|scheduler| {
-        scheduler.thread_opt(id).and_then(|thread| {
-            Some((thread.guard_page()?, thread.stack_bottom()?))
-        })
-    })
-    .flatten()
+    with_thread(id, |thread| Some((thread.guard_page()?, thread.stack_bottom()?))).flatten()
 }
 
 /// Whether a thread still exists. False once it has finished and been reaped.
 pub fn is_alive(id: ThreadId) -> bool {
-    with(|scheduler| scheduler.thread_opt(id).is_some()).unwrap_or(false)
+    lookup(id).is_some()
 }
 
 /// Whether a thread is currently blocked. Diagnostic, and used by tests.
 pub fn is_blocked(id: ThreadId) -> bool {
-    with(|scheduler| {
-        matches!(
-            scheduler.thread_opt(id),
-            Some(thread) if thread.state == State::Blocked
-        )
-    })
-    .unwrap_or(false)
-}
-
-fn with<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
-    without_interrupts(|| SCHEDULER.lock().as_mut().map(f))
+    with_thread(id, |thread| thread.state == State::Blocked).unwrap_or(false)
 }
 
 /// Where every new thread begins.
@@ -941,16 +973,17 @@ fn with<R>(f: impl FnOnce(&mut Scheduler) -> R) -> Option<R> {
 /// why it takes no arguments -- the switch zeroes the register file on the way
 /// in. The entry point is fetched from the thread control block instead.
 unsafe extern "C" fn trampoline() -> ! {
-    // Whatever this processor switched away from can now be handed on.
-    let cpu = cpu_index();
-    with(|scheduler| scheduler.flush_pending(cpu));
-
-    // Interrupts are still disabled here, inherited from the switch. Read the
-    // entry point first, so the scheduler lock is never held with interrupts on.
-    let entry = with(|scheduler| {
-        scheduler.current[cpu_index()].and_then(|id| scheduler.thread(id).entry)
-    })
-    .flatten();
+    // Whatever this processor switched away from can now be handed on. The
+    // entry point is read under the same lock, with interrupts still disabled
+    // from the switch.
+    let entry = {
+        let cpu = cpu_index();
+        let mut me = CPUS[cpu].lock();
+        flush_pending(&mut me, cpu);
+        // SAFETY: the current thread is owned by this processor, whose lock is
+        // held.
+        me.current.as_ref().and_then(|slot| unsafe { slot.get() }.entry)
+    };
 
     // Now let the timer reach this thread, or it would run to completion
     // un-preemptible.

@@ -544,8 +544,23 @@ reset happens under the lock at the switch — so a lost race costs at most one
 early or late preemption, which round-robin cannot distinguish from a normal one.
 
 Reaping used to walk the entire thread table on every context switch, looking for
-the rare thread that had died. An exiting thread now records itself, so the walk
-is proportional to the number of threads that actually finished.
+the rare thread that had died. A finished thread is now set aside by the
+processor that switched away from it, at the moment it leaves the stack.
+
+**A context switch takes one processor's lock, not everyone's.** Each processor
+has its own lock over its ready queues and the thread it is running, and every
+thread is owned by exactly one processor: its scheduling state is read and
+changed only under that processor's lock. Ownership moves only while the thread
+is on no CPU — when it is woken, to the waker's processor, or when an idle
+processor steals it — and only under both processors' locks, taken in index
+order. Anything that finds a thread by id locks the owner and then checks the
+owner has not changed, following the thread if it has. The id-to-thread table is
+a separate lock that the switch path never touches, and `current_id`, which
+every system call asks, is a lock-free per-CPU read.
+
+It was one lock before, taken by every switch on every core. Under emulation a
+virtual CPU spinning for it can be descheduled by the host while another holds
+it, and that queue was where a loaded host made the whole machine crawl.
 
 **Three priorities, and a guard against the obvious consequence.** Strict
 priority starves: a `High` thread that never blocks means nothing below it runs
@@ -574,8 +589,9 @@ the timer handler — which runs on every core on every tick — compares two
 integers in the common case and walks the list only when something is actually
 due.
 
-`join` registers the waiter and blocks under a single acquisition of the
-scheduler lock, and `exit_current` takes the waiter list under that same lock.
+`join` registers the waiter and blocks under the lock of the processor that owns
+the thread being waited for, and `exit_current` takes the waiter list under
+that same lock.
 That is what makes the race unrepresentable: a join either gets in before the
 thread finishes and is woken, or sees `Finished` and does not park at all. The
 list lives on the thread being waited *for*, so finishing is one look-up rather
@@ -751,11 +767,6 @@ naming it is a message only the kernel can send.
   a `Low` one that asked first. That is bounded by a critical section rather than
   by a scheduling decision — see the note on priority inversion below — so it is
   a fairness cost, not a liveness one.
-* The thread table is still one lock. The timer tick no longer takes it and the
-  run queues are per-CPU, but a context *switch* does. Removing that means each
-  thread being owned by exactly one processor's queue, with migration
-  transferring ownership under both locks in index order — a real ownership model
-  rather than a data-structure change.
 * One user program is still hand-written assembly: the W^X test, which plants
   two bytes of machine code on its own stack and jumps to them. That is not
   something Rust will express, and it is the right tool for that one job.

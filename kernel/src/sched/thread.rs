@@ -127,6 +127,12 @@ impl Thread {
         self.stack.as_ref().map(|stack| stack.guard_page())
     }
 
+    /// Hand over the kernel stack, so it can be freed away from any lock while
+    /// the thread's control block lives on for whoever still holds a reference.
+    pub fn take_stack(&mut self) -> Option<KernelStack> {
+        self.stack.take()
+    }
+
     /// Lowest mapped address of this thread's stack, if it owns one.
     pub fn stack_bottom(&self) -> Option<u64> {
         self.stack.as_ref().map(|stack| stack.bottom())
