@@ -551,7 +551,7 @@ fn centre() -> (u64, u64) {
 }
 
 fn input_event(tag: u64, words: [u64; 4]) -> Message {
-    Message { tag, words, sender: 0 }
+    Message { tag, words, sender: 0, sender_user: 0 }
 }
 
 /// A pointer event from the kernel, which the compositor believes.

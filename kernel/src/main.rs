@@ -134,6 +134,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 tag: 0x100 + n,
                 words: [n * 10, 0, 0, 0],
                 sender: 0,
+                sender_user: 0,
             },
         )
         .expect("send failed");
@@ -189,6 +190,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             tag: INPUT_SOURCE,
             words: [input.0 as u64, 0, 0, 0],
             sender: 0,
+            sender_user: 0,
         },
     )
     .expect("could not name the input daemon");
@@ -365,6 +367,7 @@ fn net_demo(me: sched::ThreadId) {
         tag: 1,
         words: [GATEWAY, reply.0, 1, 0],
         sender: 0,
+        sender_user: 0,
     };
     ipc::send(me, control, ping).expect("send failed");
 

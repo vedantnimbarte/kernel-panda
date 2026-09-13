@@ -511,6 +511,24 @@ pub fn spawn_with_priority(
     entry: fn(),
     priority: Priority,
 ) -> Option<ThreadId> {
+    spawn_inner(name, entry, priority, None)
+}
+
+/// Create a runnable thread that runs as `user` rather than as its spawner.
+///
+/// The user is set before the thread can be picked up by any processor, so
+/// there is no moment in which it runs as anyone else. Assigning a user after
+/// `spawn` leaves such a moment, on a machine with more than one core.
+pub fn spawn_as(name: &'static str, entry: fn(), user: crate::users::UserId) -> Option<ThreadId> {
+    spawn_inner(name, entry, Priority::Normal, Some(user))
+}
+
+fn spawn_inner(
+    name: &'static str,
+    entry: fn(),
+    priority: Priority,
+    user: Option<crate::users::UserId>,
+) -> Option<ThreadId> {
     if !INITIALISED.load(Ordering::Acquire) {
         return None;
     }
@@ -528,6 +546,12 @@ pub fn spawn_with_priority(
             slot
         };
         let id = slot.id;
+        // Before it can run: a thread is its spawner's user from its first
+        // instruction.
+        match user {
+            Some(user) => crate::users::assign(id, user),
+            None => crate::users::inherit(current_id(), id),
+        }
         enqueue(&mut CPUS[cpu].lock(), cpu, slot);
         Some(id)
     })

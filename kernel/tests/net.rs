@@ -199,6 +199,7 @@ fn stack_pings_the_gateway() {
         tag: TAG_PING,
         words: [packed(GATEWAY_IP), reply.0, 0xC0FFEE, 0],
         sender: 0,
+        sender_user: 0,
     };
     ipc::send(me(), control, request).expect("send failed");
 

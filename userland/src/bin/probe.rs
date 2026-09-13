@@ -23,6 +23,8 @@ pub const MODE_RING_SEND: u64 = 7;
 pub const MODE_RING_RECEIVE: u64 = 8;
 pub const MODE_RING_FORGE_MESSAGE: u64 = 9;
 pub const MODE_RING_MOVE_HEAD: u64 = 10;
+pub const MODE_WHOAMI: u64 = 11;
+pub const MODE_PERMISSIONS: u64 = 12;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -128,6 +130,7 @@ extern "C" fn main(parameters: u64) {
                 tag: 0xDE,
                 words: [read as u64, written as u64, bound as u64, sent as u64],
                 sender: 0,
+                sender_user: 0,
             };
             user::ipc_send(parameters.endpoint, &report);
         }
@@ -137,7 +140,7 @@ extern "C" fn main(parameters: u64) {
         // failure is reported as a length of zero with the step that failed.
         MODE_TFTP => {
             let failed = |step: u64| -> ! {
-                let report = user::Message { tag: 0x7F7F, words: [0, step, 0, 0], sender: 0 };
+                let report = user::Message { tag: 0x7F7F, words: [0, step, 0, 0], sender: 0, sender_user: 0 };
                 user::ipc_send(parameters.report, &report);
                 user::exit(1)
             };
@@ -167,7 +170,7 @@ extern "C" fn main(parameters: u64) {
             const LOCAL_PORT: u64 = 1069;
             let server = user::net::address(10, 0, 2, 2);
             let send = |tag: u64, words: [u64; 4]| {
-                user::ipc_send(parameters.endpoint, &user::Message { tag, words, sender: 0 });
+                user::ipc_send(parameters.endpoint, &user::Message { tag, words, sender: 0, sender_user: 0 });
             };
             send(user::net::TAG_UDP_BIND, [LOCAL_PORT, reply, receive, 0]);
 
@@ -211,7 +214,7 @@ extern "C" fn main(parameters: u64) {
             for (index, byte) in data.iter().take(24).enumerate() {
                 words[1 + index / 8] |= (*byte as u64) << (8 * (index % 8));
             }
-            user::ipc_send(parameters.report, &user::Message { tag: 0x7F7F, words, sender: 0 });
+            user::ipc_send(parameters.report, &user::Message { tag: 0x7F7F, words, sender: 0, sender_user: 0 });
         }
 
         // The two ends of a ring. `endpoint` is the ring, `daemon` the message
@@ -223,7 +226,7 @@ extern "C" fn main(parameters: u64) {
         MODE_RING_SEND | MODE_RING_RECEIVE => {
             use user::ring::{Ring, Side};
             let report = |words: [u64; 4]| {
-                user::ipc_send(parameters.report, &user::Message { tag: 0x2170, words, sender: 0 });
+                user::ipc_send(parameters.report, &user::Message { tag: 0x2170, words, sender: 0, sender_user: 0 });
             };
             let side = if parameters.mode == MODE_RING_SEND { Side::Sender } else { Side::Receiver };
             let ring = match Ring::map(parameters.endpoint, side) {
@@ -281,15 +284,37 @@ extern "C" fn main(parameters: u64) {
             // SAFETY: deliberately not safe; the page is read-only and this must
             // fault before the report below.
             unsafe { core::ptr::write_volatile((ring.base() + offset) as *mut u32, 0xBAD) };
-            user::ipc_send(parameters.report, &user::Message { tag: 0xBAD, words: [0; 4], sender: 0 });
+            user::ipc_send(parameters.report, &user::Message { tag: 0xBAD, words: [0; 4], sender: 0, sender_user: 0 });
+        }
+
+        // Report the user this process runs as, to `endpoint`.
+        MODE_WHOAMI => {
+            let words = [user::user_id() as u64, 0, 0, 0];
+            user::ipc_send(parameters.endpoint, &user::Message { tag: 0x0410, words, sender: 0, sender_user: 0 });
+        }
+
+        // File permissions as an unprivileged user, through the real system
+        // calls. The system has made `/shared`, writable by anyone. Reports:
+        // creating at the root, creating in `/shared`, the new file's owner and
+        // mode, and changing the mode of `/shared`, which is not this user's.
+        MODE_PERMISSIONS => {
+            let at_root = user::file_create("/mine");
+            let in_shared = user::file_create("/shared/mine");
+            // Owner read and write only.
+            let private = user::file_chmod("/shared/mine", 0b0011);
+            let owner = user::file_owner("/shared/mine");
+            let not_mine = user::file_chmod("/shared", 0b1111);
+            let words = [at_root as u64, in_shared as u64 | (private as u64) << 32, owner as u64, not_mine as u64];
+            user::ipc_send(parameters.endpoint, &user::Message { tag: 0x0412, words, sender: 0, sender_user: 0 });
         }
 
         MODE_IPC => {
             let message = user::Message {
                 tag: 0xCAFE,
                 words: [0xBEEF, 0, 0, 0],
-                // A lie, so the kernel can be seen to overwrite it.
+                // Lies, so the kernel can be seen to overwrite them.
                 sender: 999,
+                sender_user: 999,
             };
             let result = user::ipc_send(parameters.endpoint, &message);
             user::exit(result as u64);

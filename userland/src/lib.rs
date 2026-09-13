@@ -42,6 +42,9 @@ pub mod nr {
     pub const RING_MAP: u64 = 28;
     pub const RING_WAIT: u64 = 29;
     pub const RING_WAKE: u64 = 30;
+    pub const GET_USER: u64 = 31;
+    pub const FILE_OWNER: u64 = 32;
+    pub const FILE_CHMOD: u64 = 33;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -53,6 +56,8 @@ pub struct Message {
     pub words: [u64; 4],
     /// Written by the kernel; whatever a sender puts here is discarded.
     pub sender: u64,
+    /// The sender's user, written by the kernel the same way.
+    pub sender_user: u64,
 }
 
 /// Buffer geometry, shared with the kernel.
@@ -492,6 +497,25 @@ pub fn file_stat(path: &str, size: &mut u64) -> i64 {
         size as *mut u64 as u64,
     )
 }
+
+/// The user this process runs as.
+pub fn user_id() -> i64 {
+    syscall(nr::GET_USER, 0, 0, 0)
+}
+
+/// A node's owner and permission bits, as `owner << 16 | mode`.
+pub fn file_owner(path: &str) -> i64 {
+    syscall(nr::FILE_OWNER, path.as_ptr() as u64, path.len() as u64, 0)
+}
+
+/// Change a node's permission bits: bit 0 owner read, 1 owner write, 2 others
+/// read, 3 others write. Its owner only.
+pub fn file_chmod(path: &str, mode: u16) -> i64 {
+    syscall(nr::FILE_CHMOD, path.as_ptr() as u64, path.len() as u64, mode as u64)
+}
+
+/// Returned when the caller's user may not do that to a file.
+pub const PERMISSION_DENIED: i64 = -15;
 
 /// Newline-separated names into `buffer`. Returns the bytes written.
 pub fn dir_list(path: &str, buffer: &mut [u8]) -> i64 {

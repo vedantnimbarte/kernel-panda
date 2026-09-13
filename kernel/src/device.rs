@@ -135,6 +135,7 @@ pub fn on_interrupt(irq: u8) {
         tag: TAG_IRQ,
         words: [irq as u64, 0, 0, 0],
         sender: 0,
+        sender_user: 0,
     };
     // A full queue is not a lost interrupt; see the module notes.
     let _ = ipc::notify(EndpointId(endpoint), notification);

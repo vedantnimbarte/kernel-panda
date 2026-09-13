@@ -363,6 +363,7 @@ impl Compositor {
             tag: input::TAG_KEY,
             words,
             sender: 0,
+            sender_user: 0,
         };
         // A client that stopped listening loses the key, not the compositor.
         user::ipc_send(endpoint, &message);

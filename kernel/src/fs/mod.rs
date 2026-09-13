@@ -48,6 +48,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::block::{BlockDevice, BlockError, SECTOR_SIZE};
+use crate::users::{UserId, SYSTEM};
 use crate::sync::Mutex;
 
 /// Bytes per filesystem block. One sector, so a block write is a sector write
@@ -60,7 +61,27 @@ pub const MAGIC: u64 = 0x5061_6E64_6146_5301;
 
 /// On-disk format version. Refusing an unknown one is better than reading a
 /// future layout as if it were this one.
-pub const VERSION: u32 = 1;
+///
+/// 2 added an owner and permission bits to every inode, in bytes version 1 left
+/// zero. A version 1 disk would read as everything owned by the system and
+/// closed to everyone, so it is refused rather than half-understood.
+pub const VERSION: u32 = 2;
+
+/// Who may do what to a file or directory: read and write, for its owner and
+/// for everyone else. For a directory, read is looking names up in it and
+/// listing it, and write is adding or removing names.
+///
+/// There is deliberately no superuser bit and no bypass: the system's own user
+/// is held to these like any other. See `crate::users`.
+pub const OWNER_READ: u16 = 1 << 0;
+pub const OWNER_WRITE: u16 = 1 << 1;
+pub const OTHERS_READ: u16 = 1 << 2;
+pub const OTHERS_WRITE: u16 = 1 << 3;
+const ALL_PERMISSIONS: u16 = OWNER_READ | OWNER_WRITE | OTHERS_READ | OTHERS_WRITE;
+
+/// What a new file or directory gets: its owner may change it, anyone may read
+/// it.
+pub const DEFAULT_MODE: u16 = OWNER_READ | OWNER_WRITE | OTHERS_READ;
 
 /// Blocks a single file can hold, as direct pointers from its inode.
 ///
@@ -95,6 +116,8 @@ pub enum FsError {
     WrongType,
     /// A directory with entries cannot be removed.
     NotEmpty,
+    /// The caller's user may not do this.
+    Denied,
     /// The device reported a failure.
     Device(BlockError),
     /// The structure on disk does not make sense.
@@ -143,6 +166,8 @@ struct SuperBlock {
 #[derive(Clone, Copy)]
 struct Inode {
     kind: u32,
+    owner: UserId,
+    mode: u16,
     /// Bytes for a file; entries for a directory.
     size: u64,
     blocks_used: u32,
@@ -167,6 +192,24 @@ const ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / core::mem::size_of::<DirEntry>();
 /// Takes the block holding that component's inode if it exists, and returns the
 /// block that should replace it -- or `None` to remove the name entirely. The
 /// caller rewrites the path above it either way.
+/// Who is making a change, and whether it adds or removes a name -- which needs
+/// write permission on the directory holding it.
+#[derive(Clone, Copy)]
+struct Access {
+    user: Option<UserId>,
+    changes_parent: bool,
+}
+
+impl Access {
+    fn changing_parent(user: Option<UserId>) -> Self {
+        Self { user, changes_parent: true }
+    }
+
+    fn within_parent(user: Option<UserId>) -> Self {
+        Self { user, changes_parent: false }
+    }
+}
+
 type Action<'a> =
     &'a mut dyn FnMut(&FileSystem, &mut State, Option<u64>) -> Result<Option<u64>, FsError>;
 
@@ -237,8 +280,10 @@ impl Inode {
     fn encode(&self) -> Vec<u8> {
         let mut block = vec![0u8; BLOCK_SIZE];
         block[0..4].copy_from_slice(&self.kind.to_le_bytes());
+        block[4..8].copy_from_slice(&self.owner.to_le_bytes());
         block[8..16].copy_from_slice(&self.size.to_le_bytes());
         block[16..20].copy_from_slice(&self.blocks_used.to_le_bytes());
+        block[20..22].copy_from_slice(&self.mode.to_le_bytes());
         for (index, pointer) in self.direct.iter().enumerate() {
             let at = 24 + index * 8;
             block[at..at + 8].copy_from_slice(&pointer.to_le_bytes());
@@ -261,12 +306,29 @@ impl Inode {
 
         Ok(Self {
             kind,
+            owner: u32::from_le_bytes(block[4..8].try_into().map_err(|_| FsError::Corrupt)?),
+            mode: u16::from_le_bytes(block[20..22].try_into().map_err(|_| FsError::Corrupt)?) & ALL_PERMISSIONS,
             size: u64::from_le_bytes(block[8..16].try_into().map_err(|_| FsError::Corrupt)?),
             blocks_used: u32::from_le_bytes(
                 block[16..20].try_into().map_err(|_| FsError::Corrupt)?,
             ),
             direct,
         })
+    }
+
+    /// Whether `user` may read (or write) this node. `None` is the kernel
+    /// acting on its own account, which permissions do not bind.
+    fn permits(&self, user: Option<UserId>, write: bool) -> bool {
+        let Some(user) = user else {
+            return true;
+        };
+        let bit = match (user == self.owner, write) {
+            (true, false) => OWNER_READ,
+            (true, true) => OWNER_WRITE,
+            (false, false) => OTHERS_READ,
+            (false, true) => OTHERS_WRITE,
+        };
+        self.mode & bit != 0
     }
 
     fn node_kind(&self) -> NodeKind {
@@ -480,13 +542,20 @@ impl FileSystem {
     /// Walk a path from the root.
     ///
     /// Returns the block holding the final component's inode.
-    fn resolve(&self, state: &State, path: &str) -> Result<u64, FsError> {
+    ///
+    /// Looking a name up in a directory needs read permission on it, so a
+    /// private directory hides what is in it even from someone who knows the
+    /// name.
+    fn resolve(&self, state: &State, path: &str, user: Option<UserId>) -> Result<u64, FsError> {
         let mut current = state.superblock.root_inode;
 
         for component in path.split('/').filter(|part| !part.is_empty()) {
             let inode = self.read_inode(current)?;
             if inode.node_kind() != NodeKind::Directory {
                 return Err(FsError::WrongType);
+            }
+            if !inode.permits(user, false) {
+                return Err(FsError::Denied);
             }
             current = self
                 .find_entry(&inode, component)?
@@ -539,6 +608,7 @@ impl FileSystem {
         state: &mut State,
         directory_block: u64,
         components: &[&str],
+        access: Access,
         action: Action<'_>,
         garbage: &mut Vec<u64>,
     ) -> Result<u64, FsError> {
@@ -546,16 +616,23 @@ impl FileSystem {
         if directory.node_kind() != NodeKind::Directory {
             return Err(FsError::WrongType);
         }
+        if !directory.permits(access.user, false) {
+            return Err(FsError::Denied);
+        }
 
         let (name, rest) = components.split_first().ok_or(FsError::BadName)?;
         let existing = self.find_entry(&directory, name)?;
 
         let replacement = if rest.is_empty() {
+            // Adding or removing a name is a change to this directory.
+            if access.changes_parent && !directory.permits(access.user, true) {
+                return Err(FsError::Denied);
+            }
             // The change itself happens here.
             action(self, state, existing)?
         } else {
             let child = existing.ok_or(FsError::NotFound)?;
-            Some(self.rewrite(state, child, rest, action, garbage)?)
+            Some(self.rewrite(state, child, rest, access, action, garbage)?)
         };
 
         // Rewrite this directory's contents with the entry updated, into blocks
@@ -629,6 +706,7 @@ impl FileSystem {
     fn transact(
         &self,
         path: &str,
+        access: Access,
         mut action: impl FnMut(&FileSystem, &mut State, Option<u64>) -> Result<Option<u64>, FsError>,
     ) -> Result<(), FsError> {
         let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
@@ -645,6 +723,7 @@ impl FileSystem {
                 &mut state,
                 root,
                 &components,
+                access,
                 &mut action,
                 &mut garbage,
             )?;
@@ -667,16 +746,24 @@ impl FileSystem {
 
     /// Create a file or directory at `path`.
     pub fn create(&self, path: &str, kind: NodeKind) -> Result<(), FsError> {
+        self.create_as(path, kind, None)
+    }
+
+    /// As [`Self::create`], for `user`: it needs write permission on the
+    /// directory the name goes in, and owns what it creates.
+    pub fn create_as(&self, path: &str, kind: NodeKind, user: Option<UserId>) -> Result<(), FsError> {
         let (_, name) = split_path(path)?;
         check_name(name)?;
 
-        self.transact(path, move |fs, state, existing| {
+        self.transact(path, Access::changing_parent(user), move |fs, state, existing| {
             if existing.is_some() {
                 return Err(FsError::Exists);
             }
 
             let mut inode = Inode {
                 kind: if kind == NodeKind::Directory { 1 } else { 0 },
+                owner: user.unwrap_or(SYSTEM),
+                mode: DEFAULT_MODE,
                 size: 0,
                 blocks_used: 0,
                 direct: [0; DIRECT_BLOCKS],
@@ -703,15 +790,24 @@ impl FileSystem {
     /// ones are released only once the commit that stops referring to them has
     /// landed. A crash halfway leaves the previous contents entirely intact.
     pub fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        self.write_file_as(path, data, None)
+    }
+
+    /// As [`Self::write_file`], for `user`, who needs write permission on the
+    /// file.
+    pub fn write_file_as(&self, path: &str, data: &[u8], user: Option<UserId>) -> Result<(), FsError> {
         if data.len().div_ceil(BLOCK_SIZE) > DIRECT_BLOCKS {
             return Err(FsError::TooLarge);
         }
 
-        self.transact(path, move |fs, state, existing| {
+        self.transact(path, Access::within_parent(user), move |fs, state, existing| {
             let inode_block = existing.ok_or(FsError::NotFound)?;
             let mut inode = fs.read_inode(inode_block)?;
             if inode.node_kind() != NodeKind::File {
                 return Err(FsError::WrongType);
+            }
+            if !inode.permits(user, true) {
+                return Err(FsError::Denied);
             }
 
             // Fresh blocks for the contents; the old ones stay live until the
@@ -746,12 +842,20 @@ impl FileSystem {
 
     /// Read a whole file.
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        self.read_file_as(path, None)
+    }
+
+    /// As [`Self::read_file`], for `user`, who needs read permission on it.
+    pub fn read_file_as(&self, path: &str, user: Option<UserId>) -> Result<Vec<u8>, FsError> {
         crate::sync::without_interrupts(|| {
             let state = self.state.lock();
-            let inode_block = self.resolve(&state, path)?;
+            let inode_block = self.resolve(&state, path, user)?;
             let inode = self.read_inode(inode_block)?;
             if inode.node_kind() != NodeKind::File {
                 return Err(FsError::WrongType);
+            }
+            if !inode.permits(user, false) {
+                return Err(FsError::Denied);
             }
 
             let mut out = Vec::with_capacity(inode.size as usize);
@@ -768,12 +872,20 @@ impl FileSystem {
 
     /// Names in a directory.
     pub fn list(&self, path: &str) -> Result<Vec<String>, FsError> {
+        self.list_as(path, None)
+    }
+
+    /// As [`Self::list`], for `user`, who needs read permission on it.
+    pub fn list_as(&self, path: &str, user: Option<UserId>) -> Result<Vec<String>, FsError> {
         crate::sync::without_interrupts(|| {
             let state = self.state.lock();
-            let inode_block = self.resolve(&state, path)?;
+            let inode_block = self.resolve(&state, path, user)?;
             let inode = self.read_inode(inode_block)?;
             if inode.node_kind() != NodeKind::Directory {
                 return Err(FsError::WrongType);
+            }
+            if !inode.permits(user, false) {
+                return Err(FsError::Denied);
             }
 
             let mut names = Vec::new();
@@ -796,10 +908,17 @@ impl FileSystem {
 
     /// Remove a file, or an empty directory.
     pub fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.remove_as(path, None)
+    }
+
+    /// As [`Self::remove`], for `user`, who needs write permission on the
+    /// directory holding the name. As on Unix without the sticky bit, that is
+    /// all: whoever may change a directory may remove what is in it.
+    pub fn remove_as(&self, path: &str, user: Option<UserId>) -> Result<(), FsError> {
         let (_, name) = split_path(path)?;
         check_name(name)?;
 
-        self.transact(path, move |fs, state, existing| {
+        self.transact(path, Access::changing_parent(user), move |fs, state, existing| {
             let target_block = existing.ok_or(FsError::NotFound)?;
             let target = fs.read_inode(target_block)?;
 
@@ -823,11 +942,49 @@ impl FileSystem {
 
     /// Whether a path exists, and what it is.
     pub fn stat(&self, path: &str) -> Result<(NodeKind, u64), FsError> {
+        self.stat_as(path, None)
+    }
+
+    /// As [`Self::stat`], for `user`, who needs only to be able to reach it.
+    pub fn stat_as(&self, path: &str, user: Option<UserId>) -> Result<(NodeKind, u64), FsError> {
         crate::sync::without_interrupts(|| {
             let state = self.state.lock();
-            let inode_block = self.resolve(&state, path)?;
+            let inode_block = self.resolve(&state, path, user)?;
             let inode = self.read_inode(inode_block)?;
             Ok((inode.node_kind(), inode.size))
+        })
+    }
+
+    /// Who owns a node, and its permission bits.
+    pub fn owner_as(&self, path: &str, user: Option<UserId>) -> Result<(UserId, u16), FsError> {
+        crate::sync::without_interrupts(|| {
+            let state = self.state.lock();
+            let inode_block = self.resolve(&state, path, user)?;
+            let inode = self.read_inode(inode_block)?;
+            Ok((inode.owner, inode.mode))
+        })
+    }
+
+    /// Change a node's permission bits. Only its owner may; there is no way to
+    /// change who the owner is, so a file cannot be given away to make it
+    /// somebody else's problem.
+    pub fn set_mode_as(&self, path: &str, mode: u16, user: Option<UserId>) -> Result<(), FsError> {
+        if mode & !ALL_PERMISSIONS != 0 {
+            return Err(FsError::BadName);
+        }
+        self.transact(path, Access::within_parent(user), move |fs, state, existing| {
+            let inode_block = existing.ok_or(FsError::NotFound)?;
+            let mut inode = fs.read_inode(inode_block)?;
+            if user.is_some_and(|user| user != inode.owner) {
+                return Err(FsError::Denied);
+            }
+            inode.mode = mode;
+            // Copy-on-write like any other change: the old inode is released
+            // once the commit that stops naming it has landed.
+            state.retire(inode_block);
+            let new_block = state.allocate()?;
+            fs.write_block(new_block, &inode.encode())?;
+            Ok(Some(new_block))
         })
     }
 

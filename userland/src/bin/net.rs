@@ -313,6 +313,7 @@ impl Stack {
                         tag: net::TAG_PONG,
                         words: [ping.token, source as u64, 0, 0],
                         sender: 0,
+                        sender_user: 0,
                     };
                     user::ipc_send(ping.reply, &pong);
                     ping.sequence = 0;
@@ -343,6 +344,7 @@ impl Stack {
             tag: net::TAG_DATAGRAM,
             words: [take as u64, source as u64, source_port as u64, port as u64],
             sender: 0,
+            sender_user: 0,
         };
         user::ipc_send(binding.reply, &announcement);
     }

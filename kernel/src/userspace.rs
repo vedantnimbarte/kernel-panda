@@ -199,6 +199,8 @@ pub mod probe {
     pub const RING_RECEIVE: u64 = 8;
     pub const RING_FORGE_MESSAGE: u64 = 9;
     pub const RING_MOVE_HEAD: u64 = 10;
+    pub const WHOAMI: u64 = 11;
+    pub const PERMISSIONS: u64 = 12;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

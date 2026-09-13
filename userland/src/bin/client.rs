@@ -69,6 +69,7 @@ extern "C" fn main(parameters: u64) {
             tag: user::input::TAG_LISTEN,
             words: [parameters.listen, 0, 0, 0],
             sender: 0,
+            sender_user: 0,
         };
         user::ipc_send(parameters.endpoint, &listen);
     }
@@ -77,6 +78,7 @@ extern "C" fn main(parameters: u64) {
         tag: TAG_PRESENT,
         words: [buffer, parameters.x, parameters.y, parameters.z],
         sender: 0,
+        sender_user: 0,
     };
     user::ipc_send(parameters.endpoint, &message);
 
@@ -92,6 +94,7 @@ extern "C" fn main(parameters: u64) {
             tag: TAG_PRESENT,
             words: [buffer, parameters.move_to_x, parameters.y, parameters.z],
             sender: 0,
+            sender_user: 0,
         };
         user::ipc_send(parameters.endpoint, &moved);
     }

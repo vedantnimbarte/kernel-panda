@@ -213,6 +213,7 @@ fn on_receive() {
             tag: TAG_RECEIVED,
             words: [0; 4],
             sender: 0,
+            sender_user: 0,
         };
         // A full queue already holds a notification, and each sends the stack
         // to take every frame there is.

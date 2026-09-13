@@ -51,8 +51,12 @@ pub fn format(device: Arc<dyn BlockDevice>) -> Result<FileSystem, FsError> {
 
     device.write(bitmap_start, &bitmap)?;
 
+    // The system's, readable by everyone and changed by the system alone. Anyone
+    // else's files go in directories the system makes for them.
     let root = Inode {
         kind: 1,
+        owner: super::SYSTEM,
+        mode: super::DEFAULT_MODE,
         size: 0,
         blocks_used: 0,
         direct: [0; DIRECT_BLOCKS],

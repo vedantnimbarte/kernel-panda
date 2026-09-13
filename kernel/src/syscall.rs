@@ -43,6 +43,9 @@ pub mod numbers {
     pub const RING_MAP: u64 = 28;
     pub const RING_WAIT: u64 = 29;
     pub const RING_WAKE: u64 = 30;
+    pub const GET_USER: u64 = 31;
+    pub const FILE_OWNER: u64 = 32;
+    pub const FILE_CHMOD: u64 = 33;
 }
 
 /// Returned in RAX as a negative value.
@@ -79,6 +82,8 @@ pub enum Error {
     WrongType = -13,
     /// A directory that still holds entries cannot be removed.
     NotEmpty = -14,
+    /// The caller's user may not do this to that file or directory.
+    PermissionDenied = -15,
 }
 
 impl From<crate::fs::FsError> for Error {
@@ -90,6 +95,7 @@ impl From<crate::fs::FsError> for Error {
             FsError::Full | FsError::TooLarge => Error::NoSpace,
             FsError::WrongType => Error::WrongType,
             FsError::NotEmpty => Error::NotEmpty,
+            FsError::Denied => Error::PermissionDenied,
             FsError::BadName => Error::InvalidArgument,
             // A device fault or a structure that does not make sense are not
             // things a program can act on differently, and reporting the
@@ -183,6 +189,9 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::RING_MAP => crate::ring::sys_map(frame.rdi, frame.rsi),
         numbers::RING_WAIT => crate::ring::sys_wait(frame.rdi),
         numbers::RING_WAKE => crate::ring::sys_wake(frame.rdi),
+        numbers::GET_USER => crate::users::sys_current(),
+        numbers::FILE_OWNER => sys_file_owner(frame.rdi, frame.rsi),
+        numbers::FILE_CHMOD => sys_file_chmod(frame.rdi, frame.rsi, frame.rdx),
         _ => Err(Error::UnknownCall),
     };
 
@@ -240,6 +249,27 @@ fn filesystem() -> Result<alloc::sync::Arc<crate::fs::FileSystem>, Error> {
     crate::fs::root().ok_or(Error::NoFileSystem)
 }
 
+/// The user file operations run as: the caller's. Never `None` from here --
+/// only the kernel acting on its own account skips the permission checks.
+fn caller() -> Option<crate::users::UserId> {
+    Some(sched::current_id().map_or(crate::users::SYSTEM, crate::users::of))
+}
+
+/// A node's owner and permission bits, as `owner << 16 | mode`.
+fn sys_file_owner(path: u64, path_len: u64) -> SyscallResult {
+    let path = read_user_path(path, path_len)?;
+    let (owner, mode) = filesystem()?.owner_as(&path, caller())?;
+    Ok((owner as i64) << 16 | mode as i64)
+}
+
+/// Change a node's permission bits. Its owner only.
+fn sys_file_chmod(path: u64, path_len: u64, mode: u64) -> SyscallResult {
+    let path = read_user_path(path, path_len)?;
+    let mode = u16::try_from(mode).map_err(|_| Error::InvalidArgument)?;
+    filesystem()?.set_mode_as(&path, mode, caller())?;
+    Ok(0)
+}
+
 /// Read a whole file into a user buffer. Returns the bytes written.
 fn sys_file_read(path: u64, path_len: u64, buffer: u64, capacity: u64) -> SyscallResult {
     if capacity > MAX_FILE_IO {
@@ -251,7 +281,7 @@ fn sys_file_read(path: u64, path_len: u64, buffer: u64, capacity: u64) -> Syscal
     }
 
     let fs = filesystem()?;
-    let contents = fs.read_file(&path)?;
+    let contents = fs.read_file_as(&path, caller())?;
 
     // The file is read into kernel memory first and only then copied out, so
     // the disk read does not happen with the SMAP window open.
@@ -285,7 +315,7 @@ fn sys_file_write(path: u64, path_len: u64, buffer: u64, length: u64) -> Syscall
         }
     });
 
-    filesystem()?.write_file(&path, &data)?;
+    filesystem()?.write_file_as(&path, &data, caller())?;
     Ok(length as i64)
 }
 
@@ -297,13 +327,13 @@ fn sys_file_create(path: u64, path_len: u64, directory: u64) -> SyscallResult {
     } else {
         crate::fs::NodeKind::File
     };
-    filesystem()?.create(&path, kind)?;
+    filesystem()?.create_as(&path, kind, caller())?;
     Ok(0)
 }
 
 fn sys_file_remove(path: u64, path_len: u64) -> SyscallResult {
     let path = read_user_path(path, path_len)?;
-    filesystem()?.remove(&path)?;
+    filesystem()?.remove_as(&path, caller())?;
     Ok(0)
 }
 
@@ -314,7 +344,7 @@ fn sys_file_stat(path: u64, path_len: u64, out: u64) -> SyscallResult {
         return Err(Error::BadPointer);
     }
 
-    let (kind, size) = filesystem()?.stat(&path)?;
+    let (kind, size) = filesystem()?.stat_as(&path, caller())?;
     crate::arch::x86_64::with_user_access(|| {
         // SAFETY: eight bytes validated as present, user-accessible and
         // writable. Unaligned because nothing obliges user space to align it.
@@ -338,7 +368,7 @@ fn sys_file_list(path: u64, path_len: u64, buffer: u64, capacity: u64) -> Syscal
         return Err(Error::BadPointer);
     }
 
-    let names = filesystem()?.list(&path)?;
+    let names = filesystem()?.list_as(&path, caller())?;
     let mut out = alloc::vec::Vec::new();
     for name in names {
         out.extend_from_slice(name.as_bytes());

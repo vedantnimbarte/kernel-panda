@@ -200,6 +200,7 @@ impl Decoder {
             tag,
             words,
             sender: 0,
+            sender_user: 0,
         };
         user::ipc_send(self.consumer, &message);
     }

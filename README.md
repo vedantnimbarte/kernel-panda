@@ -17,17 +17,17 @@ stack running as an unprivileged process.
 | | |
 |---|---|
 | Memory | Bitmap frame allocator, four-level paging, per-process address spaces, kernel heap |
-| Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas |
+| Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas, per-process users with no superuser |
 | Scheduling | Preemptive, three priorities, per-CPU run queues with work stealing, sleep and join |
 | Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
 | IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities, and shared message rings that cost no system call per message |
 | Devices | Local APIC and I/O APIC, PCIe with ECAM and MSI-X, AHCI, NVMe and virtio-blk storage, virtio-net, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
 | Networking | ARP, IPv4, ICMP echo and UDP in a Ring 3 daemon; the kernel only moves Ethernet frames |
-| Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
+| Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 201 cases across 25 boot-and-assert test kernels, run on four cores
+**Testing:** 206 cases across 26 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -150,6 +150,7 @@ kernel-panda/
     │   ├── acpi.rs    MADT and MCFG: processors, I/O APICs, the PCIe window
     │   ├── quota.rs   per-process resource limits
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
+    │   ├── users.rs      which user each thread runs as
     │   ├── syscall.rs    the entire Ring 3 surface
     │   ├── ipc.rs        endpoints, capabilities, blocking receive
     │   ├── ring.rs       message rings two processes share
@@ -843,6 +844,36 @@ it a receiver that kept up slept after every message, and the first run spent
 38,000 system calls on 50,000 of them. The wake path is tested by making each
 side in turn wait on a deliberately slow partner.
 
+**Capabilities decide what a process can reach; users decide who it is.** Every
+thread runs as a user, a number. It starts as its spawner's, and only kernel
+code says otherwise — `sched::spawn_as` sets it before the thread can be picked
+up by any processor, so there is no moment in which a thread runs as someone it
+is not. No system call changes a thread's user: a process cannot promote itself
+or pass itself off as another.
+
+Every message carries its sender's user next to its thread, both stamped by the
+kernel on the way through, so a server can decide by user without trusting what
+a client wrote.
+
+Every file and directory has an owner and four bits: read and write, for the
+owner and for everyone else. Reading or writing a file needs that bit on it;
+adding or removing a name needs write on the directory; looking a name up needs
+read on every directory along the path, so a private directory hides what is in
+it even from someone who knows the name. Only an owner changes the bits, and
+nothing changes an owner.
+
+There is no superuser. User 0 is the system's own user — it owns the root, which
+everyone may read and only it may write — and it is refused a private file like
+anyone else, which a test checks. What the system can do beyond its own files
+comes from capabilities it holds, the same as every other process; one number
+that bypasses every check is the kind of ambient authority the rest of this
+kernel exists to avoid. Kernel code acting on its own account is not a user at
+all and is not checked.
+
+The owner and bits live in bytes the inode format had left zero, which made
+this format version 2; a version 1 disk is refused rather than read as
+everything owned by the system and closed to all.
+
 ## Known limits
 
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
@@ -858,6 +889,9 @@ side in turn wait on a deliberately slow partner.
   sequence is not decoded. An interrupt line stays routed after its driver
   exits; every ISA line is edge-triggered, so the cost is one ignored interrupt
   per event, not a storm.
+* Permissions are read and write for an owner and for everyone else: no groups,
+  no access lists, and no sticky directories, so whoever may write a directory
+  may remove anything in it.
 * A ring has exactly one sender and one receiver, fixed 64-byte slots, and at
   most 4,096 of them. A side spins for 2,000 attempts before sleeping, which is
   a guess tuned under emulation rather than a measurement on hardware.
@@ -880,9 +914,8 @@ The gaps that matter, so nobody has to discover them by trying:
 
 * **TCP, DHCP, DNS, IPv6.** The stack speaks ARP, IPv4, ICMP echo and UDP, with
   its address given at start-up.
-* **Users and permissions.** Every Ring 3 process is equally unprivileged and
-  equally anonymous. Capabilities bound what a process can reach; nothing binds
-  *who* it is.
+* **Logging in.** A process runs as whichever user its spawner chose; there are
+  no accounts, no passwords, and no way for a person to become a user.
 * **A libc or a toolchain for third-party software.** Programs are built in this
   repository's `userland` workspace against its own syscall wrappers.
 * **An IOMMU.** Without one, a Ring 3 driver handed a DMA-capable device is not

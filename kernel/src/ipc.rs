@@ -56,6 +56,9 @@ pub struct Message {
     /// Stamped by the kernel on the way through. A sender cannot forge it, so a
     /// receiver can trust it for authentication.
     pub sender: u64,
+    /// The user the sender runs as, stamped the same way. [`KERNEL_SENDER`]
+    /// when the kernel sent it.
+    pub sender_user: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -283,6 +286,7 @@ fn deliver(sender: Option<ThreadId>, endpoint: EndpointId, mut message: Message)
         }
 
         message.sender = sender.map_or(KERNEL_SENDER, |sender| sender.0 as u64);
+        message.sender_user = sender.map_or(KERNEL_SENDER, |sender| crate::users::of(sender) as u64);
         queue.queue.push_back(message);
 
         Ok(queue.waiting.pop_front())

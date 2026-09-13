@@ -70,6 +70,7 @@ fn a_round_trip_preserves_the_payload() {
             tag: 0xABCD,
             words: [1, 2, 3, 4],
             sender: 0,
+            sender_user: 0,
         },
     )
     .expect("send failed");
@@ -92,6 +93,7 @@ fn the_kernel_stamps_the_real_sender() {
             // A lie. The kernel must overwrite it, or a receiver cannot use the
             // field for authentication.
             sender: 0xDEAD_BEEF,
+            sender_user: 0,
         },
     )
     .expect("send failed");
@@ -116,6 +118,7 @@ fn messages_come_back_in_order() {
                 tag: n,
                 words: [n; 4],
                 sender: 0,
+                sender_user: 0,
             },
         )
         .expect("send failed");
@@ -331,6 +334,7 @@ fn observing_sender() {
             tag: 0x77,
             words: [7, 0, 0, 0],
             sender: 0,
+            sender_user: 0,
         },
     )
     .expect("send failed");
