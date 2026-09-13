@@ -38,7 +38,7 @@ pub mod pci;
 pub mod quota;
 pub mod ring;
 pub mod sched;
-pub mod sha256;
+pub use panda_sha256 as sha256;
 pub mod smp;
 pub mod sync;
 pub mod syscall;

@@ -35,6 +35,14 @@ bump-allocator = []
 bootloader_api = "0.11"
 x86_64 = "0.15"
 spin = { version = "0.9", default-features = false, features = ["once", "lazy"] }
+# In-repo, not a dependency in the sense above: split out only so the profile
+# below can optimise it.
+panda-sha256 = { path = "sha256" }
+
+# Password hashing is thousands of rounds by design, and unoptimised it made a
+# debug build's login take seconds.
+[profile.dev.package.panda-sha256]
+opt-level = 3
 
 # Test targets keep cargo's default `harness = true`. That is what makes cargo
 # pass `--test` to rustc, which is in turn what activates `custom_test_frameworks`

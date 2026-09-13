@@ -1,0 +1,11 @@
+[package]
+name = "panda-sha256"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SHA-256, HMAC and PBKDF2 for Kernel Panda's password hashes"
+
+[lib]
+test = false
+bench = false
+doctest = false

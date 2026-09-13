@@ -31,9 +31,14 @@ name = "panda-kernel"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
+ "panda-sha256",
  "spin",
  "x86_64",
 ]
+
+[[package]]
+name = "panda-sha256"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"

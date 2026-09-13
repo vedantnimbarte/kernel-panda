@@ -3,6 +3,11 @@
 //!
 //! In-house for the same reason as everything else in the image. It is short,
 //! and tested against the published vectors.
+//!
+//! A crate of its own only so debug builds can optimise it: unoptimised, one
+//! login's 10,000 rounds took seconds under emulation.
+
+#![no_std]
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
