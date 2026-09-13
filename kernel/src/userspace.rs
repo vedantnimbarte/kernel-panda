@@ -1,4 +1,4 @@
-//! User-space address regions, program loading, and the drop into Ring 3.
+﻿//! User-space address regions, program loading, and the drop into Ring 3.
 //!
 //! ## Isolation
 //!
@@ -44,7 +44,9 @@ const PAGE_SIZE: u64 = 4096;
 const CODE_OFFSET: u64 = 0;
 const DATA_OFFSET: u64 = 0x1000;
 const STACK_BOTTOM_OFFSET: u64 = 0x1_0000;
-const STACK_PAGES: u64 = 4;
+/// 64 KiB. The network daemon keeps whole frames on its stack, several deep on
+/// the way from a packet arriving to one going out, and 16 KiB overflowed.
+const STACK_PAGES: u64 = 16;
 
 /// Where shared graphics buffers start being mapped, well clear of the stack.
 pub const BUFFER_AREA_OFFSET: u64 = 0x10_0000;
