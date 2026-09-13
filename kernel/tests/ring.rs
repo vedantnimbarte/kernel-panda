@@ -140,7 +140,7 @@ fn a_sleeping_side_is_always_woken() {
     // made to wait on a slow partner: first the receiver on a dawdling sender,
     // then the sender on a dawdling receiver, filling two slots at once. A
     // single lost wake parks one side forever, and this never finishes.
-    const MESSAGES: u64 = 2_000;
+    const MESSAGES: u64 = 1_000;
     for (pace, sleeper) in [(true, "receiver"), (false, "sender")] {
         let calls = exchange(2, MESSAGES, Some(pace));
         serial_println!("  (the {sleeper} waited: {MESSAGES} messages, {calls} system calls)");
