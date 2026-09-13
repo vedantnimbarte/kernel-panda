@@ -442,42 +442,65 @@ fn a_bad_path_from_ring3_is_refused() {
 fn the_allocator_never_hands_out_metadata() {
     // A filesystem whose allocator can return the superblock or the bitmap will
     // eventually destroy itself, and the failure lands far from the cause.
-    let (_, fs) = fresh();
+    //
+    // A small filesystem, so it genuinely fills. This used to write up to 400
+    // files into the whole 16 MiB partition, which never filled it -- and since
+    // every create rewrites the root directory, it cost tens of thousands of
+    // block writes and ran up against the harness timeout. At 1,024 blocks the
+    // disk is full after about a hundred files.
+    let disk = scratch();
+    let entry = partition::write_single_partition_gpt(&*disk, PANDA_TYPE)
+        .expect("could not write a partition table");
+    let small = partition::Partition { sectors: 1024, ..entry };
+    let view: Arc<dyn BlockDevice> =
+        Arc::new(PartitionDevice::new(disk, &small).expect("could not open the partition"));
+    let fs = format::format(view).expect("could not format");
 
-    // Fill the disk, then check the structures are still readable.
-    let mut created = 0;
-    loop {
-        let name = alloc::format!("/f{created}");
-        if fs.create(&name, NodeKind::File).is_err() {
-            break;
+    // Fill it. The last create may succeed and its write then fail for want of
+    // space, leaving an empty file behind; that is copy-on-write keeping the
+    // file as it was, not corruption, and it is checked for below.
+    let mut written = 0;
+    let mut left_empty = false;
+    let stopped_by = loop {
+        let name = alloc::format!("/f{written}");
+        if let Err(error) = fs.create(&name, NodeKind::File) {
+            break error;
         }
-        if fs.write_file(&name, &vec![0xABu8; SECTOR_SIZE * 8]).is_err() {
-            break;
+        if let Err(error) = fs.write_file(&name, &vec![0xABu8; SECTOR_SIZE * 8]) {
+            left_empty = true;
+            break error;
         }
-        created += 1;
-        if created > 400 {
-            break;
-        }
-    }
+        written += 1;
+    };
 
-    serial_println!("  ({created} files before the disk filled)");
-    assert!(created > 0, "not a single file could be written");
+    serial_println!("  ({written} files before the disk filled)");
+    assert_eq!(stopped_by, FsError::Full, "filling stopped for the wrong reason");
+    assert!(written > 0, "not a single file could be written");
 
     // Everything must still be there and readable: if a data block had been
     // allocated over the bitmap or an inode, this is where it shows.
     let names = fs.list("/").expect("the root became unreadable as the disk filled");
+    let created = written + left_empty as usize;
     assert_eq!(
         names.len(),
         created,
         "the root lists {} entries against the {created} created",
         names.len()
     );
-    for index in 0..created {
+    for index in 0..written {
         let name = alloc::format!("/f{index}");
         let data = fs.read_file(&name).expect("a file became unreadable");
         assert!(
-            data.iter().all(|byte| *byte == 0xAB),
+            data.len() == SECTOR_SIZE * 8 && data.iter().all(|byte| *byte == 0xAB),
             "{name} came back with contents it was never given"
+        );
+    }
+    if left_empty {
+        let name = alloc::format!("/f{written}");
+        assert_eq!(
+            fs.read_file(&name).expect("the last file became unreadable").len(),
+            0,
+            "a write that failed for want of space changed the file anyway"
         );
     }
 }
