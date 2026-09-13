@@ -380,11 +380,13 @@ pixels behind; and having cleared, it has to redraw *every* surface intersecting
 the cleared region, not just the newest. Both directions are tested, because
 each one alone passes a plausible-looking wrong implementation.
 
-Damage is a list of up to eight regions, not one bounding box. A surface that
-moves damages where it was and where it went, and one rectangle covering both
+Damage is a grid of 32-pixel tiles, not one bounding box. A surface that moves
+damages where it was and where it went, and one rectangle covering both
 recomposes everything in between — for a surface crossing the screen, the
-screen. When the list fills, the pair whose merged box wastes least is combined,
-so it degrades toward the old behaviour rather than failing.
+screen. It was a list of eight regions before, merging the least wasteful pair
+when full; a bitmap cannot fill, so there is no degraded mode to reason about,
+at the cost of rounding each update out to whole tiles. Each row's adjacent
+damaged tiles are composed as one run.
 
 Tearing *is* observed, not argued: a thread on another core samples one pixel
 while that area is recomposed repeatedly, and checks it never catches the
@@ -749,9 +751,6 @@ naming it is a message only the kernel can send.
 * One user program is still hand-written assembly: the W^X test, which plants
   two bytes of machine code on its own stack and jumps to them. That is not
   something Rust will express, and it is the right tool for that one job.
-* The compositor tracks eight damage regions. Beyond that it merges the least
-  wasteful pair, degrading toward a single bounding box — which is the right
-  failure mode, but a workload with many small scattered updates will hit it.
 * A 24-bit pixel reaches the screen as three separate byte writes, so the display
   can latch a half-written pixel during the flush. Invisible in practice at these
   sizes, and not something double buffering addresses; fixing it means writing

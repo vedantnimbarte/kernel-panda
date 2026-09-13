@@ -8,10 +8,10 @@
 //! * **Z-order.** Surfaces are kept in a table and composed back to front, so
 //!   what ends up on top is decided by the surface's depth rather than by which
 //!   client happened to send its message last.
-//! * **Damage.** Only the regions that actually changed are recomposed and
-//!   copied out, tracked as a list rather than one bounding box. A client
-//!   updating a corner of the screen should not cost a full-screen redraw, and
-//!   at 1024x768x3 a full redraw is over two megabytes.
+//! * **Damage.** Only the tiles of the screen that actually changed are
+//!   recomposed and copied out. A client updating a corner of the screen should
+//!   not cost a full-screen redraw, and at 1024x768x3 a full redraw is over two
+//!   megabytes.
 //! * **Double buffering.** Composition happens in an off-screen buffer and
 //!   reaches the display in a single copy. Drawing surfaces straight into the
 //!   scanout means the display controller can read the screen halfway through
@@ -103,179 +103,92 @@ struct Rect {
 }
 
 impl Rect {
-    const EMPTY: Rect = Rect {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-
     fn is_empty(&self) -> bool {
         self.right <= self.left || self.bottom <= self.top
     }
 
-    /// The smallest rectangle containing both.
-    fn union(self, other: Rect) -> Rect {
-        if self.is_empty() {
-            return other;
-        }
-        if other.is_empty() {
-            return self;
-        }
-        Rect {
-            left: min(self.left, other.left),
-            top: min(self.top, other.top),
-            right: max(self.right, other.right),
-            bottom: max(self.bottom, other.bottom),
-        }
-    }
-
     fn intersect(self, other: Rect) -> Rect {
         Rect {
-            left: max(self.left, other.left),
-            top: max(self.top, other.top),
-            right: min(self.right, other.right),
-            bottom: min(self.bottom, other.bottom),
-        }
-    }
-
-    fn overlaps(self, other: Rect) -> bool {
-        !self.intersect(other).is_empty()
-    }
-
-    fn area(self) -> u64 {
-        if self.is_empty() {
-            0
-        } else {
-            (self.right - self.left) * (self.bottom - self.top)
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
         }
     }
 }
 
-/// Damaged regions, kept apart rather than merged into one bounding box.
+/// Damage, as a grid of screen tiles.
 ///
-/// A single accumulated rectangle is simple and wrong in a specific way: a
-/// surface that moves across the screen damages where it was and where it went,
-/// and one rectangle covering both means recomposing everything in between. For
-/// a surface crossing the screen that is the screen.
+/// A single accumulated rectangle is wrong in a specific way: a surface that
+/// moves across the screen damages where it was and where it went, and one
+/// rectangle covering both recomposes everything in between. A list of
+/// rectangles fixes that until it fills, and then has to merge -- so a workload
+/// of many small scattered updates, a cursor over a busy screen, degraded back
+/// toward the bounding box.
 ///
-/// A fixed array rather than a list, because there is no allocator here. When it
-/// is full, the two regions whose merged box wastes the least are combined --
-/// so it degrades toward the single-rectangle behaviour under pressure rather
-/// than failing.
-const MAX_DAMAGE: usize = 8;
+/// A bitmap cannot fill. Damage is rounded out to whole tiles, which costs at
+/// most a tile's width of recomposition at each edge, and any number of
+/// scattered updates costs exactly the tiles they touch. Fixed size, because
+/// there is no allocator here: one 128-bit row per tile row.
+const TILE_COLUMNS: u64 = 128;
+const TILE_ROWS: usize = 80;
 
 struct Damage {
-    regions: [Rect; MAX_DAMAGE],
-    count: usize,
+    rows: [u128; TILE_ROWS],
+    /// Tile edge in pixels. 32, or larger on a screen too big for the grid.
+    tile: u64,
 }
 
 impl Damage {
-    const fn new() -> Self {
+    fn new(width: u64, height: u64) -> Self {
+        let tile = 32
+            .max(width.div_ceil(TILE_COLUMNS))
+            .max(height.div_ceil(TILE_ROWS as u64));
         Self {
-            regions: [Rect::EMPTY; MAX_DAMAGE],
-            count: 0,
+            rows: [0; TILE_ROWS],
+            tile,
         }
     }
 
-    fn clear(&mut self) {
-        self.count = 0;
-    }
-
     fn is_empty(&self) -> bool {
-        self.count == 0
+        self.rows.iter().all(|row| *row == 0)
     }
 
     fn add(&mut self, area: Rect) {
         if area.is_empty() {
             return;
         }
+        let last_column = TILE_COLUMNS - 1;
+        let first = (area.left / self.tile).min(last_column);
+        let last = ((area.right - 1) / self.tile).min(last_column);
+        // Bits `first..=last`, built without shifting a u128 by 128.
+        let span = (u128::MAX >> (last_column - (last - first))) << first;
 
-        // Merge into anything it already touches. Two overlapping regions would
-        // composite the shared part twice -- correct, but paid for twice.
-        for index in 0..self.count {
-            if self.regions[index].overlaps(area) {
-                self.regions[index] = self.regions[index].union(area);
-                self.coalesce(index);
-                return;
-            }
-        }
-
-        if self.count < MAX_DAMAGE {
-            self.regions[self.count] = area;
-            self.count += 1;
-            return;
-        }
-
-        // Full. Merge whichever pairing wastes the least -- the merged box
-        // minus the two areas it replaces -- so what gets joined is whatever
-        // was already close together.
-        let mut best = (0usize, 1usize);
-        let mut best_waste = u64::MAX;
-        for a in 0..self.count {
-            for b in (a + 1)..self.count {
-                let merged = self.regions[a].union(self.regions[b]);
-                let waste = merged
-                    .area()
-                    .saturating_sub(self.regions[a].area() + self.regions[b].area());
-                if waste < best_waste {
-                    best_waste = waste;
-                    best = (a, b);
-                }
-            }
-        }
-
-        let (a, b) = best;
-        self.regions[a] = self.regions[a].union(self.regions[b]);
-        self.regions[b] = self.regions[self.count - 1];
-        self.count -= 1;
-        self.regions[self.count] = area;
-        self.count += 1;
-    }
-
-    /// Absorb any other region the one at `index` now overlaps.
-    ///
-    /// Growing a region can make it touch a neighbour it did not before.
-    fn coalesce(&mut self, index: usize) {
-        let mut index = index;
-        let mut other = 0;
-        while other < self.count {
-            if other == index || !self.regions[index].overlaps(self.regions[other]) {
-                other += 1;
-                continue;
-            }
-
-            self.regions[index] = self.regions[index].union(self.regions[other]);
-
-            // Swap-remove `other`. If the region being grown was the one moved
-            // down to fill the gap, it now lives at `other` -- following the
-            // stale index would grow whatever landed there instead.
-            let last = self.count - 1;
-            self.regions[other] = self.regions[last];
-            self.count -= 1;
-            if index == last {
-                index = other;
-            }
-
-            // Start again: the union may now reach something already passed.
-            other = 0;
+        let top = (area.top / self.tile) as usize;
+        let bottom = ((area.bottom - 1) / self.tile) as usize;
+        for row in top.min(TILE_ROWS - 1)..=bottom.min(TILE_ROWS - 1) {
+            self.rows[row] |= span;
         }
     }
-}
 
-fn min(a: u64, b: u64) -> u64 {
-    if a < b {
-        a
-    } else {
-        b
-    }
-}
-
-fn max(a: u64, b: u64) -> u64 {
-    if a > b {
-        a
-    } else {
-        b
+    /// Clear the grid, handing each horizontal run of damaged tiles to `each`
+    /// as one rectangle. Adjacent tiles in a row are composed together rather
+    /// than one at a time.
+    fn drain(&mut self, mut each: impl FnMut(Rect)) {
+        let rows = core::mem::replace(&mut self.rows, [0; TILE_ROWS]);
+        for (row, mut remaining) in rows.into_iter().enumerate() {
+            while remaining != 0 {
+                let start = remaining.trailing_zeros() as u64;
+                let length = (remaining >> start).trailing_ones() as u64;
+                each(Rect {
+                    left: start * self.tile,
+                    top: row as u64 * self.tile,
+                    right: (start + length) * self.tile,
+                    bottom: (row as u64 + 1) * self.tile,
+                });
+                remaining &= !((u128::MAX >> (TILE_COLUMNS - length)) << start);
+            }
+        }
     }
 }
 
@@ -358,17 +271,12 @@ impl Compositor {
         let mut order = [0usize; MAX_SURFACES];
         let count = self.sorted_by_depth(&mut order);
 
-        // Taken before composing: the regions are independent of each other, and
-        // iterating them while `self` is borrowed for the blits is what the
-        // borrow checker would otherwise object to.
-        let regions = self.damage.regions;
-        let region_count = self.damage.count;
-        self.damage.clear();
-
-        for region in regions.iter().take(region_count) {
+        // Drained into a local first: composing borrows `self` for the blits.
+        let mut damage = core::mem::replace(&mut self.damage, Damage::new(0, 0));
+        damage.drain(|region| {
             let area = region.intersect(screen);
             if area.is_empty() {
-                continue;
+                return;
             }
 
             // Clear first, so a surface that shrank or moved does not leave its
@@ -385,7 +293,8 @@ impl Compositor {
             self.draw_cursor(area);
 
             self.flush(area);
-        }
+        });
+        self.damage = damage;
     }
 
     fn cursor_rect(&self) -> Rect {
@@ -629,7 +538,7 @@ extern "C" fn main(endpoint: u64) {
         back_base: back_base as u64,
         screen,
         surfaces: [Surface::EMPTY; MAX_SURFACES],
-        damage: Damage::new(),
+        damage: Damage::new(screen.width as u64, screen.height as u64),
         cursor_x: screen.width as u64 / 2,
         cursor_y: screen.height as u64 / 2,
         cursor_visible: false,
