@@ -27,7 +27,7 @@ stack running as an unprivileged process.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 195 cases across 24 boot-and-assert test kernels, run on four cores
+**Testing:** 196 cases across 24 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
