@@ -406,6 +406,32 @@ pub unsafe fn map_to_frame(
     })
 }
 
+/// Remove `count` consecutive kernel mappings starting at `first`, without
+/// freeing the frames they pointed at. Pages that were not mapped are skipped.
+///
+/// For device windows. One shootdown for the whole range rather than one per
+/// page: each is a round trip to every other processor, and a megabyte of
+/// configuration space is 256 of them.
+pub fn unmap_kernel_range(first: Page<Size4KiB>, count: u64) {
+    let space = kernel_space();
+    let mut detached = alloc::vec::Vec::new();
+
+    for index in 0..count {
+        let page = first + index;
+        let unmapped = with_space(&space, |mapper| {
+            mapper.unmap(page).map(|(_, flush)| flush.flush()).is_ok()
+        });
+        if unmapped {
+            detached.push(reclaim_tables_for(&space, page));
+        }
+    }
+
+    shoot_down_all_if_shared(&space);
+    for tables in detached {
+        tables.free();
+    }
+}
+
 /// Remove a mapping and return the frame it pointed at, without freeing it.
 pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
     let space = AddressSpace::active();

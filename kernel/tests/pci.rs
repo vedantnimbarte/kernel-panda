@@ -111,9 +111,11 @@ fn extended_configuration_space_is_reachable() {
         pci::read_config_ecam(far, 0x00).is_some(),
         "the highest described bus ({last}) is out of reach"
     );
+    // Mapped, or the read above would have fallen through to `None` -- but not
+    // necessarily one more than before, since a full set evicts to make room.
     assert!(
-        pci::mapped_bus_count() > mapped,
-        "reaching the highest bus mapped nothing"
+        pci::mapped_bus_count() <= pci::MAX_MAPPED_BUSES,
+        "reaching the highest bus pushed the mapped set past its bound"
     );
 
     for device in &devices {
@@ -222,4 +224,75 @@ fn the_framebuffer_lives_inside_the_display_bar() {
         framebuffer::buffer_len() as u64 <= size,
         "the framebuffer is larger than the BAR that is supposed to contain it"
     );
+}
+
+#[test_case]
+fn walking_every_bus_keeps_the_mapped_set_bounded() {
+    let Some((first, last)) = pci::ecam_bus_range() else {
+        panda_kernel::serial_println!("  (skipped: no ECAM on this machine)");
+        return;
+    };
+    let root = Address::new(first, 0, 0);
+    let identity = pci::read_config_legacy(root, 0x00);
+
+    // Past offset 0xFF, so every bus has to be mapped to answer.
+    for bus in first..=last {
+        pci::read_config_ecam(Address::new(bus, 0, 0), 0x100);
+        assert!(
+            pci::mapped_bus_count() <= pci::MAX_MAPPED_BUSES,
+            "{} buses mapped after reaching bus {bus}; nothing is being evicted",
+            pci::mapped_bus_count()
+        );
+    }
+
+    // The root bus went out and has to come back correctly.
+    assert_eq!(
+        pci::read_config_ecam(root, 0x00),
+        Some(identity),
+        "the root bus read wrongly after being evicted and mapped again"
+    );
+}
+
+static CHURN_DONE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Reach for buses all over the window, forcing evictions, on whichever
+/// processor this lands on.
+fn churn_buses() {
+    let (first, last) = pci::ecam_bus_range().expect("no ECAM");
+    let span = (last - first) as usize + 1;
+    for step in 0..400usize {
+        let bus = first + ((step * 37) % span) as u8;
+        pci::read_config_ecam(Address::new(bus, 0, 0), 0x104);
+    }
+    CHURN_DONE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[test_case]
+fn a_bus_is_never_unmapped_under_a_reader() {
+    use core::sync::atomic::Ordering;
+    use panda_kernel::sched;
+
+    let Some((first, _)) = pci::ecam_bus_range() else {
+        panda_kernel::serial_println!("  (skipped: no ECAM on this machine)");
+        return;
+    };
+
+    // Three threads churn the mapped set from other processors while this one
+    // keeps reading the root bus. An eviction racing a read would fault here
+    // or there, and a stale translation would read the wrong register.
+    CHURN_DONE.store(0, Ordering::Relaxed);
+    for _ in 0..3 {
+        sched::spawn("bus-churn", churn_buses).expect("spawn failed");
+    }
+
+    let root = Address::new(first, 0, 0);
+    let identity = pci::read_config_legacy(root, 0x00);
+    while CHURN_DONE.load(Ordering::Relaxed) < 3 {
+        assert_eq!(
+            pci::read_config_ecam(root, 0x00),
+            Some(identity),
+            "the root bus read wrongly while other processors churned the window"
+        );
+    }
+    assert!(pci::mapped_bus_count() <= pci::MAX_MAPPED_BUSES);
 }

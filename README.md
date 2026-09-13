@@ -413,7 +413,16 @@ which works everywhere and reaches only the first 256 bytes of each function —
 its selector has nowhere to put a wider offset. Everything PCI Express added
 lives above that: MSI-X, AER, link control. ECAM makes bus, device and function
 into address bits of a window named by the ACPI MCFG table, so there is no
-latch, no pair of accesses to keep together, no lock, and 4 KiB per function.
+latch, no pair of accesses to keep together, and 4 KiB per function.
+
+The window is mapped a bus at a time, on first use past offset 0xFF, and at most
+eight buses stay mapped; beyond that the least recently used is unmapped. That
+is the one lock ECAM needs. Each bus counts the accesses in flight and only an
+idle one is evicted, because a caller reads through a raw address and unmapping
+underneath it is a page fault. The unmap itself — 256 pages and one shootdown —
+happens after the lock is released, since waiting for other processors to
+acknowledge while holding a lock with interrupts masked waits on the very
+processors spinning for it.
 
 The two are views of the same registers, so they must agree about the low 256
 bytes. `both_views_of_configuration_space_agree` checks that rather than
@@ -748,9 +757,6 @@ naming it is a message only the kernel can send.
   sizes, and not something double buffering addresses; fixing it means writing
   whole aligned words, which means the scanout and the back buffer agreeing on a
   32-bit format.
-* ECAM maps a bus the first time something reads above offset 0xFF on it, and
-  never unmaps. A workload touching every bus ends up with the whole window
-  mapped, which is what the eager version did to begin with.
 * The keyboard layout is US, caps lock is not tracked, and the Pause key's E1
   sequence is not decoded. An interrupt line stays routed after its driver
   exits; every ISA line is edge-triggered, so the cost is one ignored interrupt
