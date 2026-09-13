@@ -10,8 +10,8 @@ A bare-metal microkernel written from scratch in `no_std` Rust, targeting
 It boots on bare metal or under QEMU, brings up every processor, and runs
 preemptively scheduled threads in their own address spaces. Drivers and the
 display server live in Ring 3 and talk through capability-mediated IPC. It has
-persistent storage: an AHCI driver, GPT partitioning, and a copy-on-write
-filesystem that survives a power cut. It is on the network, with the protocol
+persistent storage: SATA, NVMe and virtio-blk drivers, GPT partitioning, and a
+copy-on-write filesystem that survives a power cut. It is on the network, with the protocol
 stack running as an unprivileged process.
 
 | | |
@@ -22,12 +22,12 @@ stack running as an unprivileged process.
 | Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
 | IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities |
-| Devices | Local APIC and I/O APIC, PCIe with ECAM and MSI-X, AHCI storage, virtio-net, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
+| Devices | Local APIC and I/O APIC, PCIe with ECAM and MSI-X, AHCI, NVMe and virtio-blk storage, virtio-net, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
 | Networking | ARP, IPv4, ICMP echo and UDP in a Ring 3 daemon; the kernel only moves Ethernet frames |
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 190 cases across 23 boot-and-assert test kernels, run on four cores
+**Testing:** 195 cases across 24 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -142,7 +142,7 @@ kernel-panda/
     │   ├── memory/    memory map, frame allocator, page tables, heap, kernel stacks, DMA regions
     │   ├── allocator/ bump and linked-list `GlobalAlloc` implementations
     │   ├── sched/     threads, context switch, priorities, per-CPU run queues
-    │   ├── block/     block layer, AHCI driver, GPT and MBR partitioning
+    │   ├── block/     block layer, AHCI, NVMe and virtio-blk drivers, GPT and MBR partitioning
     │   ├── fs/        copy-on-write filesystem and its formatter
     │   ├── crash.rs   the panic handler: stop, report, save, find next boot
     │   ├── device.rs  I/O port and interrupt-line grants for Ring 3 drivers
@@ -154,6 +154,7 @@ kernel-panda/
     │   ├── ipc.rs        endpoints, capabilities, blocking receive
     │   ├── pci.rs        bus enumeration, BAR decoding, ECAM, MSI-X
     │   ├── net.rs        the virtio-net driver and the frame-moving syscalls
+    │   ├── virtio.rs     virtio's legacy PCI interface and virtqueues, shared
     │   └── gbm.rs        shared graphics buffers and the scanout
     └── tests/       one standalone boot-and-assert kernel per file
 ```
@@ -791,6 +792,26 @@ path is checked byte for byte with nothing outside the emulator. The first
 driver offered its buffers in the descriptor table rather than the ring after
 it; QEMU's trace of a queue notified and never popped is what found it.
 
+**A disk behind SATA, NVMe or virtio looks the same from above.** The block layer
+asks for sectors by number, and each driver answers through the same interface,
+including the lock-free write the panic path needs. The three share a shape on
+purpose: completion is polled and one request is in flight at a time, because
+every call into a disk here is synchronous and an interrupt announcing an answer
+the caller is already waiting for buys nothing. Each copies through a bounce
+buffer of two pages, which is also as far as NVMe's second PRP reaches without a
+list.
+
+NVMe is two pairs of rings: the admin queue, through which the driver learns the
+namespace's size and creates the other, and one I/O queue. virtio-blk is one
+virtqueue carrying three-descriptor requests — header, data, one byte of
+outcome — on the same virtqueue code the network driver uses.
+
+The test harness attaches a disk of each kind at a distinct size, and
+`tests/storage.rs` runs the same cases on both new ones, down to formatting a
+filesystem and reading a file back after a remount. The first NVMe driver put a
+submission queue's completion-queue id where its flags go; QEMU's trace, reading
+"invalid cqid=0", found it faster than the specification did.
+
 ## Known limits
 
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
@@ -806,6 +827,10 @@ it; QEMU's trace of a queue notified and never popped is what found it.
   sequence is not decoded. An interrupt line stays routed after its driver
   exits; every ISA line is edge-triggered, so the cost is one ignored interrupt
   per event, not a storm.
+* Disks are polled, one request at a time, through a two-page bounce buffer.
+  NVMe namespaces must use 512-byte blocks; one formatted with 4 KiB blocks is
+  refused rather than misaddressed. virtio devices are driven through the legacy
+  interface only.
 * The network card has one transmit buffer, so frames go out one at a time. The
   daemon holds two frames while an address resolves and drops the rest, keeps
   one datagram per bound port, does not reassemble fragments, and neither sends

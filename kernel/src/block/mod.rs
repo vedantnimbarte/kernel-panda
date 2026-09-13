@@ -29,7 +29,9 @@
 //! is meant to move out.
 
 pub mod ahci;
+pub mod nvme;
 pub mod partition;
+pub mod virtio_blk;
 
 use alloc::vec::Vec;
 
@@ -124,8 +126,13 @@ static DEVICES: crate::sync::Mutex<Vec<alloc::sync::Arc<dyn BlockDevice>>> =
 ///
 /// Call once, during boot, after PCI and paging are up.
 pub unsafe fn init() {
+    // SATA, NVMe and virtio: the three interfaces a disk is likely to sit
+    // behind, on a desk or under a hypervisor.
     // SAFETY: forwarded from this function's contract.
-    let found = unsafe { ahci::probe() };
+    let mut found = unsafe { ahci::probe() };
+    // SAFETY: as above.
+    found.extend(unsafe { nvme::probe() });
+    found.extend(virtio_blk::probe());
     if found.is_empty() {
         return;
     }

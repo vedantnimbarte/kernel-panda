@@ -43,6 +43,7 @@ pub mod syscall;
 pub mod testing;
 pub mod time;
 pub mod userspace;
+pub mod virtio;
 
 /// Boot-time requests handed to the bootloader.
 ///

@@ -292,16 +292,16 @@ fn make_images(kernel: &Path, verbose_boot: bool) -> Result<Images, String> {
 // QEMU
 // ---------------------------------------------------------------------------
 
-/// Bytes of scratch disk handed to the guest.
+/// Bytes of each scratch disk handed to the guest.
 ///
-/// Small on purpose: it is created fresh for every QEMU launch, and every test
-/// kernel launches its own, so the cost is paid nineteen times a run.
+/// Small on purpose: they are created fresh for every QEMU launch, and every
+/// test kernel launches its own. Different sizes, because size is how a test
+/// tells the SATA, NVMe and virtio disks apart without trusting enumeration
+/// order.
 const SCRATCH_DISK_BYTES: u64 = 16 * 1024 * 1024;
+const NVME_DISK_BYTES: u64 = 32 * 1024 * 1024;
+const VIRTIO_DISK_BYTES: u64 = 24 * 1024 * 1024;
 
-/// Create an empty raw disk image for the guest to write to.
-///
-/// Zero-filled rather than left as whatever was on disk, so a test reading a
-/// sector it never wrote sees a defined value.
 /// Contents of the file the TFTP server hands out. A network test compares
 /// against this, so it is fixed here rather than generated.
 const TFTP_FILE_CONTENTS: &str = "hello from the host, over TFTP\n";
@@ -315,17 +315,18 @@ fn tftp_root() -> Result<PathBuf, String> {
     Ok(directory)
 }
 
-fn scratch_disk() -> Result<PathBuf, String> {
-    let path = workspace_root()
-        .join("target")
-        .join("images")
-        .join("scratch.img");
+/// Create an empty raw disk image for the guest to write to.
+///
+/// Zero-filled rather than left as whatever was on disk, so a test reading a
+/// sector it never wrote sees a defined value.
+fn scratch_disk(name: &str, bytes: u64) -> Result<PathBuf, String> {
+    let path = workspace_root().join("target").join("images").join(name);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("could not create {parent:?}: {e}"))?;
     }
 
     let file = fs::File::create(&path).map_err(|e| format!("could not create {path:?}: {e}"))?;
-    file.set_len(SCRATCH_DISK_BYTES)
+    file.set_len(bytes)
         .map_err(|e| format!("could not size {path:?}: {e}"))?;
     Ok(path)
 }
@@ -370,10 +371,22 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, Str
     // its first port. Adding a second controller instead of using the one that
     // is there gives the firmware two things to boot from and it picks the empty
     // one. This hangs on the second port of the existing controller.
-    let disk = scratch_disk()?;
+    let disk = scratch_disk("scratch.img", SCRATCH_DISK_BYTES)?;
     cmd.arg("-drive")
         .arg(format!("id=panda-disk,if=none,format=raw,file={}", qpath(&disk)));
     cmd.args(["-device", "ide-hd,drive=panda-disk,bus=ide.1"]);
+
+    // The same again behind the two other interfaces a disk is likely to have:
+    // an NVMe controller, as on nearly any machine built this decade, and
+    // virtio-blk, as under nearly any hypervisor.
+    let nvme = scratch_disk("nvme.img", NVME_DISK_BYTES)?;
+    cmd.arg("-drive")
+        .arg(format!("id=panda-nvme,if=none,format=raw,file={}", qpath(&nvme)));
+    cmd.args(["-device", "nvme,drive=panda-nvme,serial=panda-nvme"]);
+    let virtio = scratch_disk("virtio.img", VIRTIO_DISK_BYTES)?;
+    cmd.arg("-drive")
+        .arg(format!("id=panda-virtio,if=none,format=raw,file={}", qpath(&virtio)));
+    cmd.args(["-device", "virtio-blk-pci,drive=panda-virtio"]);
 
     // A network card on QEMU's user-mode network: the guest is 10.0.2.15, the
     // gateway 10.0.2.2 answers pings, and a TFTP server on it serves one known
