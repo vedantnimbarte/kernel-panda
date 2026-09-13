@@ -19,13 +19,13 @@ filesystem that survives a power cut.
 | Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas |
 | Scheduling | Preemptive, three priorities, per-CPU run queues with work stealing, sleep and join |
 | Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
-| User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls |
+| User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
 | IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities |
-| Devices | Local APIC and I/O APIC, PCIe with ECAM, AHCI storage, framebuffer, 16550 serial |
+| Devices | Local APIC and I/O APIC, PCIe with ECAM, AHCI storage, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
-| Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order and damage tracking |
+| Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 170+ cases across 21 boot-and-assert test kernels, run on four cores
+**Testing:** 180+ cases across 22 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -129,7 +129,7 @@ kernel-panda/
 ├── xtask/           host-side build driver: images, QEMU, test runner
 ├── userland/        Ring 3 programs in Rust (its own cargo workspace)
 │   ├── src/lib.rs   syscall wrappers, entry macro, panic handler
-│   └── src/bin/     shell, compositor, input daemon, client, test probe
+│   └── src/bin/     shell, compositor, input daemon (the PS/2 driver), client, test probe
 └── kernel/          the kernel itself (its own cargo workspace)
     ├── src/
     │   ├── console/   16550 UART, framebuffer text console, 8x8 font
@@ -140,6 +140,7 @@ kernel-panda/
     │   ├── block/     block layer, AHCI driver, GPT and MBR partitioning
     │   ├── fs/        copy-on-write filesystem and its formatter
     │   ├── crash.rs   the panic handler: stop, report, save, find next boot
+    │   ├── device.rs  I/O port and interrupt-line grants for Ring 3 drivers
     │   ├── smp.rs     starting the other processors, per-CPU identity
     │   ├── acpi.rs    MADT and MCFG: processors, I/O APICs, the PCIe window
     │   ├── quota.rs   per-process resource limits
@@ -694,6 +695,35 @@ lock is held the record is not written at all: going ahead would overwrite the
 bounce buffer a command already in flight is about to be DMA'd from. The next
 boot prints the record and clears it.
 
+**The PS/2 driver is a Ring 3 process, and is actually contained by it.** The
+disk driver cannot be, because a DMA engine ignores page tables; a keyboard
+controller does no DMA, so a process that can reach exactly ports 0x60 and 0x64
+and hear exactly lines 1 and 12 can do nothing worse than lie about keys. Those
+grants are given by whoever spawns the driver, never requested.
+
+Ports are reached through a system call rather than the TSS I/O bitmap. The
+bitmap would let the driver use `in` and `out` directly, but it is per
+processor, and every switch between two processes with different grants would
+have to rewrite it on whichever processor the switch landed. The call checks
+the grant in one place, for the price of a trap per byte — nothing, at the rate
+a keyboard produces them.
+
+An interrupt becomes a message stamped with a sender id no thread can have. The
+kernel never touches the device; it notifies the endpoint the driver bound and
+acknowledges the APIC. A notification dropped on a full queue loses nothing: a
+full queue means notifications are already waiting, and each one sends the
+driver to drain the controller completely.
+
+The tests put bytes in through the controller itself, with its "write output
+buffer" commands, so every case goes through the real interrupt line, the grant
+checks and the decoder.
+
+**The compositor believes input from one thread.** Every client holds `SEND` on
+the compositor's endpoint, so a compositor that acted on any key event would let
+one client type into another's window. Key and pointer events count only from
+the kernel, or from the thread the kernel has named as the input daemon — and
+naming it is a message only the kernel can send.
+
 ## Known limits
 
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
@@ -721,6 +751,10 @@ boot prints the record and clears it.
 * ECAM maps a bus the first time something reads above offset 0xFF on it, and
   never unmaps. A workload touching every bus ends up with the whole window
   mapped, which is what the eager version did to begin with.
+* The keyboard layout is US, caps lock is not tracked, and the Pause key's E1
+  sequence is not decoded. An interrupt line stays routed after its driver
+  exits; every ISA line is edge-triggered, so the cost is one ignored interrupt
+  per event, not a storm.
 * Nothing outside the tests creates a crash partition yet, so on an ordinary
   boot a panic is reported to the console and not saved. Backtraces are raw
   return addresses: subtract the load base, `0x10000000000`, and look them up

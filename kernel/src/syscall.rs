@@ -32,6 +32,9 @@ pub mod numbers {
     pub const FILE_REMOVE: u64 = 17;
     pub const FILE_STAT: u64 = 18;
     pub const FILE_LIST: u64 = 19;
+    pub const PORT_READ: u64 = 20;
+    pub const PORT_WRITE: u64 = 21;
+    pub const IRQ_BIND: u64 = 22;
 }
 
 /// Returned in RAX as a negative value.
@@ -161,6 +164,9 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::FILE_REMOVE => sys_file_remove(frame.rdi, frame.rsi),
         numbers::FILE_STAT => sys_file_stat(frame.rdi, frame.rsi, frame.rdx),
         numbers::FILE_LIST => sys_file_list(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        numbers::PORT_READ => crate::device::sys_port_read(frame.rdi),
+        numbers::PORT_WRITE => crate::device::sys_port_write(frame.rdi, frame.rsi),
+        numbers::IRQ_BIND => crate::device::sys_irq_bind(frame.rdi, frame.rsi),
         _ => Err(Error::UnknownCall),
     };
 

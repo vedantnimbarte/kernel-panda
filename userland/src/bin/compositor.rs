@@ -17,15 +17,21 @@
 //!   scanout means the display controller can read the screen halfway through
 //!   -- with overlapping surfaces that is a visible flicker of whatever was
 //!   underneath.
+//!
+//! It also owns the pointer. A cursor is drawn over everything, a click raises
+//! and focuses the surface under it, and key events go to the focused client
+//! and nobody else. Key and pointer events are believed only from the input
+//! daemon the kernel named, or from the kernel itself: every client holds
+//! `SEND` on this endpoint, and one that could post key events could type into
+//! another client's window.
 
 #![no_std]
 #![no_main]
 
-use panda_user as user;
+use panda_user::{self as user, input};
 
 user::entry!(main);
 
-const TAG_SHUTDOWN: u64 = 0;
 const TAG_PRESENT: u64 = 2;
 
 /// Surfaces the compositor will track at once. Fixed, because there is no
@@ -46,6 +52,8 @@ struct Surface {
     stride: u64,
     /// Higher is nearer the viewer.
     z: u64,
+    /// The thread that presented it, as the kernel stamped it.
+    owner: u64,
 }
 
 impl Surface {
@@ -58,8 +66,32 @@ impl Surface {
         height: 0,
         stride: 0,
         z: 0,
+        owner: 0,
     };
 }
+
+/// The pointer, 11 by 16. `X` is outline, `#` is fill, anything else shows
+/// what is underneath.
+const CURSOR: [&[u8; 11]; 16] = [
+    b"X..........",
+    b"XX.........",
+    b"X#X........",
+    b"X##X.......",
+    b"X###X......",
+    b"X####X.....",
+    b"X#####X....",
+    b"X######X...",
+    b"X#######X..",
+    b"X########X.",
+    b"X#####XXXXX",
+    b"X##X##X....",
+    b"X#X.X##X...",
+    b"XX..X##X...",
+    b"X....X##X..",
+    b".....XXXX..",
+];
+const CURSOR_WIDTH: u64 = 11;
+const CURSOR_HEIGHT: u64 = 16;
 
 /// A half-open rectangle. `right <= left` means empty.
 #[derive(Clone, Copy)]
@@ -254,6 +286,19 @@ struct Compositor {
     screen: user::BufferInfo,
     surfaces: [Surface; MAX_SURFACES],
     damage: Damage,
+    /// Tip of the pointer.
+    cursor_x: u64,
+    cursor_y: u64,
+    /// Hidden until the first pointer event: a machine with no mouse should not
+    /// have an arrow parked in the middle of the screen.
+    cursor_visible: bool,
+    buttons: u64,
+    /// The thread whose key and pointer events are believed, besides the kernel.
+    input_source: Option<u64>,
+    /// The thread whose surface was last clicked.
+    focus: Option<u64>,
+    /// `(thread, endpoint)`: where a client wants its key events.
+    listeners: [(u64, u64); MAX_SURFACES],
 }
 
 impl Compositor {
@@ -337,8 +382,118 @@ impl Compositor {
                 let surface = self.surfaces[index];
                 self.blit(&surface, area);
             }
+            self.draw_cursor(area);
 
             self.flush(area);
+        }
+    }
+
+    fn cursor_rect(&self) -> Rect {
+        Rect {
+            left: self.cursor_x,
+            top: self.cursor_y,
+            right: self.cursor_x + CURSOR_WIDTH,
+            bottom: self.cursor_y + CURSOR_HEIGHT,
+        }
+    }
+
+    /// Move the pointer, and act on a left button that has just gone down.
+    fn pointer(&mut self, dx: i64, dy: i64, buttons: u64) {
+        if self.cursor_visible {
+            self.damage.add(self.cursor_rect());
+        }
+        let screen = self.screen_rect();
+        self.cursor_x = (self.cursor_x as i64 + dx).clamp(0, screen.right as i64 - 1) as u64;
+        self.cursor_y = (self.cursor_y as i64 + dy).clamp(0, screen.bottom as i64 - 1) as u64;
+        self.cursor_visible = true;
+        self.damage.add(self.cursor_rect());
+
+        let pressed = buttons & !self.buttons;
+        self.buttons = buttons;
+        if pressed & 1 != 0 {
+            self.raise_at(self.cursor_x, self.cursor_y);
+        }
+    }
+
+    /// Bring the topmost surface under a point to the front and give its owner
+    /// the keyboard. A click on nothing takes the keyboard away from everyone.
+    fn raise_at(&mut self, x: u64, y: u64) {
+        let mut order = [0usize; MAX_SURFACES];
+        let count = self.sorted_by_depth(&mut order);
+
+        let hit = order[..count].iter().rev().copied().find(|&index| {
+            let bounds = bounds_of(&self.surfaces[index]);
+            (bounds.left..bounds.right).contains(&x) && (bounds.top..bounds.bottom).contains(&y)
+        });
+        let Some(index) = hit else {
+            self.focus = None;
+            return;
+        };
+
+        let top = order[count - 1];
+        if top != index {
+            self.surfaces[index].z = self.surfaces[top].z + 1;
+            self.damage.add(bounds_of(&self.surfaces[index]));
+        }
+        self.focus = Some(self.surfaces[index].owner);
+    }
+
+    /// Hand a key event to whoever has focus, if they asked for keys.
+    fn key(&self, words: [u64; 4]) {
+        let Some(focus) = self.focus else {
+            return;
+        };
+        let Some(&(_, endpoint)) = self
+            .listeners
+            .iter()
+            .find(|(owner, endpoint)| *owner == focus && *endpoint != 0)
+        else {
+            return;
+        };
+        let message = user::Message {
+            tag: input::TAG_KEY,
+            words,
+            sender: 0,
+        };
+        // A client that stopped listening loses the key, not the compositor.
+        user::ipc_send(endpoint, &message);
+    }
+
+    /// Record where `owner` wants its keys, replacing any earlier choice.
+    fn listen(&mut self, owner: u64, endpoint: u64) {
+        let slot = self
+            .listeners
+            .iter()
+            .position(|(existing, _)| *existing == owner)
+            .or_else(|| self.listeners.iter().position(|(_, endpoint)| *endpoint == 0));
+        match slot {
+            Some(index) => self.listeners[index] = (owner, endpoint),
+            None => {
+                user::write("  [compositor] listener table full\n");
+            }
+        }
+    }
+
+    fn draw_cursor(&self, area: Rect) {
+        if !self.cursor_visible {
+            return;
+        }
+        let visible = self.cursor_rect().intersect(area);
+        let depth = self.depth();
+        let stride = self.screen.stride as u64;
+
+        for y in visible.top..visible.bottom {
+            for x in visible.left..visible.right {
+                let value = match CURSOR[(y - self.cursor_y) as usize][(x - self.cursor_x) as usize] {
+                    b'X' => 0x00,
+                    b'#' => 0xFF,
+                    _ => continue,
+                };
+                let pixel = self.back_base + y * stride + x * depth;
+                // SAFETY: `visible` is inside `area`, which the caller clipped
+                // to the screen, and the back buffer is the screen's size.
+                unsafe { core::ptr::write_bytes(pixel as *mut u8, value, depth as usize) };
+            }
         }
     }
 
@@ -475,6 +630,13 @@ extern "C" fn main(endpoint: u64) {
         screen,
         surfaces: [Surface::EMPTY; MAX_SURFACES],
         damage: Damage::new(),
+        cursor_x: screen.width as u64 / 2,
+        cursor_y: screen.height as u64 / 2,
+        cursor_visible: false,
+        buttons: 0,
+        input_source: None,
+        focus: None,
+        listeners: [(0, 0); MAX_SURFACES],
     };
 
     loop {
@@ -483,23 +645,40 @@ extern "C" fn main(endpoint: u64) {
             user::exit(1);
         }
 
+        let from_kernel = message.sender == user::KERNEL_SENDER;
+        let from_input = from_kernel || compositor.input_source == Some(message.sender);
+
         match message.tag {
-            TAG_SHUTDOWN => user::exit(0),
+            input::TAG_INPUT_SOURCE if from_kernel => {
+                compositor.input_source = Some(message.words[0]);
+            }
+            input::TAG_SHUTDOWN if from_input => user::exit(0),
+            input::TAG_POINTER if from_input => {
+                compositor.pointer(
+                    message.words[0] as i64,
+                    message.words[1] as i64,
+                    message.words[2],
+                );
+                compositor.compose();
+            }
+            input::TAG_KEY if from_input => compositor.key(message.words),
+            input::TAG_LISTEN => compositor.listen(message.sender, message.words[0]),
             TAG_PRESENT => {
-                if let Some(surface) = adopt(message.words[0], message.words[1], message.words[2], message.words[3]) {
+                let [buffer, x, y, z] = message.words;
+                if let Some(surface) = adopt(buffer, x, y, z, message.sender) {
                     compositor.track(surface);
                     compositor.compose();
                 }
             }
-            // Key events and anything else are ignored rather than treated as
-            // an error -- the input daemon shares this endpoint.
+            // Anything else, including input from someone who is not the input
+            // daemon, is ignored rather than treated as an error.
             _ => {}
         }
     }
 }
 
 /// Map a client's buffer and describe it, or `None` if it cannot be reached.
-fn adopt(buffer: u64, x: u64, y: u64, z: u64) -> Option<Surface> {
+fn adopt(buffer: u64, x: u64, y: u64, z: u64, owner: u64) -> Option<Surface> {
     let base = user::buffer_map(buffer);
     if base < 0 {
         return None;
@@ -519,5 +698,6 @@ fn adopt(buffer: u64, x: u64, y: u64, z: u64) -> Option<Surface> {
         height: info.height as u64,
         stride: info.stride as u64,
         z,
+        owner,
     })
 }

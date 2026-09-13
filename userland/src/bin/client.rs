@@ -33,6 +33,9 @@ struct Parameters {
     /// distant regions -- the hole it left and the place it went. Every other
     /// case damages one area at a time.
     move_to_x: u64,
+    /// If non-zero, an endpoint the compositor may send this client's key
+    /// events to. Whoever spawned the client has already granted it `SEND`.
+    listen: u64,
 }
 
 const TAG_PRESENT: u64 = 2;
@@ -59,6 +62,15 @@ extern "C" fn main(parameters: u64) {
     if user::buffer_share(buffer, parameters.compositor) < 0 {
         user::write("  [client] could not share with the compositor\n");
         user::exit(1);
+    }
+
+    if parameters.listen != 0 {
+        let listen = user::Message {
+            tag: user::input::TAG_LISTEN,
+            words: [parameters.listen, 0, 0, 0],
+            sender: 0,
+        };
+        user::ipc_send(parameters.endpoint, &listen);
     }
 
     let message = user::Message {

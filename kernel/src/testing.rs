@@ -93,3 +93,36 @@ pub fn panic_handler(info: &PanicInfo) -> ! {
     serial_println!("{info}");
     qemu::exit(ExitCode::Failed)
 }
+
+/// Have the PS/2 controller deliver `byte` as though a device had sent it.
+///
+/// Commands 0xD2 and 0xD3 place a byte in the controller's output buffer as if
+/// it came from the keyboard or the mouse, and raise that device's interrupt.
+/// Everything past the controller -- the line, the kernel's notification, the
+/// Ring 3 driver's decoding -- is then the real path. Waits for the driver to
+/// take the byte, so a second injection cannot overwrite the first.
+///
+/// Test support, and how the boot demo presses a key with nobody at the keyboard.
+pub fn inject_ps2(from_mouse: bool, byte: u8) -> bool {
+    use x86_64::instructions::port::Port;
+
+    const SPINS: usize = 50_000_000;
+    let mut data = Port::<u8>::new(0x60);
+    let mut command = Port::<u8>::new(0x64);
+
+    // SAFETY: reading the controller's status has no side effects.
+    let status = |port: &mut Port<u8>| unsafe { port.read() };
+    let wait = |port: &mut Port<u8>, mask: u8| (0..SPINS).any(|_| status(port) & mask == 0);
+
+    if !wait(&mut command, 0x02) {
+        return false;
+    }
+    // SAFETY: a controller command with no effect but to fill the output buffer.
+    unsafe { command.write(if from_mouse { 0xD3 } else { 0xD2 }) };
+    if !wait(&mut command, 0x02) {
+        return false;
+    }
+    // SAFETY: the byte the command above asked for.
+    unsafe { data.write(byte) };
+    wait(&mut command, 0x01)
+}

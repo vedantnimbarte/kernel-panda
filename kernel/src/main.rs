@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use panda_kernel::arch::x86_64::apic;
 use panda_kernel::ipc::EndpointId;
 use panda_kernel::{
-    arch::x86_64::halt_loop, console, gbm, ipc, memory, pci, println, sched, sync, syscall, time,
+    arch::x86_64::halt_loop, console, device, gbm, ipc, memory, pci, println, sched, sync, syscall, time,
     userspace, BOOTLOADER_CONFIG,
 };
 
@@ -174,11 +174,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     println!("  compositor mapped the scanout buffer and is waiting for surfaces");
 
+    // The input daemon is the PS/2 driver. It gets the controller's ports and
+    // interrupt lines, and the compositor is told -- by the kernel, which no
+    // client can impersonate -- that its key and pointer events are real.
     let input = sync::without_interrupts(|| {
         let id = sched::spawn("input", input_daemon_thread).expect("scheduler not running");
         ipc::grant(me, id, display, ipc::Rights::SEND).expect("grant failed");
+        device::grant_ps2_controller(id);
         id
     });
+    ipc::notify(
+        display,
+        ipc::Message {
+            tag: INPUT_SOURCE,
+            words: [input.0 as u64, 0, 0, 0],
+            sender: 0,
+        },
+    )
+    .expect("could not name the input daemon");
 
     // Blue, green and red, side by side. The colour is written low byte first
     // and the display is BGR, so 0x0000FF lands as blue.
@@ -208,9 +221,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("  presented a {name} surface at ({x}, {y})");
     }
 
-    // Escape reaches the input daemon, which forwards a shutdown to the
-    // compositor. Nothing in Ring 0 tells either of them to stop.
-    console::input::inject(0x1b);
+    // Escape, pressed through the keyboard controller, reaches the input daemon
+    // as an interrupt; it forwards a shutdown to the compositor. Nothing in
+    // Ring 0 tells either of them to stop.
+    while sched::is_alive(input) && !sched::is_blocked(input) {
+        sched::yield_now();
+    }
+    panda_kernel::testing::inject_ps2(false, 0x01);
     while sched::is_alive(input) || sched::is_alive(compositor) {
         sched::yield_now();
     }
@@ -307,6 +324,9 @@ fn ring3_ipc() {
 }
 
 static DISPLAY_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+
+/// `input::TAG_INPUT_SOURCE` in the user library.
+const INPUT_SOURCE: u64 = 5;
 static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
 
 fn compositor_thread() {

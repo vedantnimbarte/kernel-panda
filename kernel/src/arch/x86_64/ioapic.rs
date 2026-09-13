@@ -172,12 +172,12 @@ pub fn serial_is_routed() -> bool {
 /// masked stays asserted, and the first unmask delivers an interrupt for a byte
 /// that was consumed long ago.
 pub fn route_serial(topology: &crate::acpi::Topology, apic_id: u8) -> Result<(), IoApicError> {
-    let (gsi, flags) = topology.resolve_irq(crate::console::uart::COM1_IRQ);
-    let (chip, pin) = topology
-        .pin_for_gsi(gsi, inputs_of)
-        .ok_or(IoApicError::NoSuchPin)?;
-
-    route(chip, pin, crate::arch::x86_64::apic::SERIAL_VECTOR, apic_id, flags)?;
+    route_isa(
+        topology,
+        crate::console::uart::COM1_IRQ,
+        crate::arch::x86_64::apic::SERIAL_VECTOR,
+        apic_id,
+    )?;
     crate::console::uart::enable_receive_interrupt();
     SERIAL_ROUTED.store(true, Ordering::Release);
 
@@ -186,6 +186,22 @@ pub fn route_serial(topology: &crate::acpi::Topology, apic_id: u8) -> Result<(),
     // been and gone.
     crate::console::input::poll();
     Ok(())
+}
+
+/// Route ISA line `irq` to `vector` on `apic_id`, through whatever override the
+/// firmware gave for it. Which pin, and on which chip, is the firmware's answer
+/// rather than the line number: QEMU's timer is IRQ 0 and pin 2.
+pub fn route_isa(
+    topology: &crate::acpi::Topology,
+    irq: u8,
+    vector: u8,
+    apic_id: u8,
+) -> Result<(), IoApicError> {
+    let (gsi, flags) = topology.resolve_irq(irq);
+    let (chip, pin) = topology
+        .pin_for_gsi(gsi, inputs_of)
+        .ok_or(IoApicError::NoSuchPin)?;
+    route(chip, pin, vector, apic_id, flags)
 }
 
 /// How many input pins the first chip has. Diagnostic, and used by tests.

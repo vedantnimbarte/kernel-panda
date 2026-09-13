@@ -17,6 +17,7 @@ pub const MODE_TRESPASS: u64 = 1;
 pub const MODE_IPC: u64 = 2;
 pub const MODE_PEEK: u64 = 3;
 pub const MODE_FILES: u64 = 4;
+pub const MODE_DEVICE: u64 = 5;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -105,6 +106,21 @@ extern "C" fn main(parameters: u64) {
 
             user::write("  [ring 3] files: created, wrote, read back, removed\n");
             user::exit(0);
+        }
+
+        // Reach for the keyboard controller without having been given it. Every
+        // call must be refused; the results go back over IPC so the kernel can
+        // see each one rather than only that the program ended.
+        MODE_DEVICE => {
+            let read = user::port_read(0x60);
+            let written = user::port_write(0x60, 0xF4);
+            let bound = user::irq_bind(1, parameters.endpoint);
+            let report = user::Message {
+                tag: 0xDE,
+                words: [read as u64, written as u64, bound as u64, 0],
+                sender: 0,
+            };
+            user::ipc_send(parameters.endpoint, &report);
         }
 
         MODE_IPC => {

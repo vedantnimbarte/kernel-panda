@@ -241,16 +241,36 @@ pub fn grant(
     })
 }
 
+/// The `sender` of a message the kernel sent on its own account, such as an
+/// interrupt notification. No thread has this id, so a receiver seeing it knows
+/// no process wrote the message.
+pub const KERNEL_SENDER: u64 = u64::MAX;
+
 /// Enqueue a message. Never blocks.
 ///
 /// The `sender` field of `message` is overwritten with the real sender.
-pub fn send(sender: ThreadId, endpoint: EndpointId, mut message: Message) -> Result<(), Error> {
+pub fn send(sender: ThreadId, endpoint: EndpointId, message: Message) -> Result<(), Error> {
+    deliver(Some(sender), endpoint, message)
+}
+
+/// Enqueue a message from the kernel itself, stamped [`KERNEL_SENDER`]. No
+/// capability is checked: the kernel is the one that issues them.
+///
+/// Safe from interrupt context. It never blocks, and the registry lock masks
+/// interrupts like every lock a handler can reach.
+pub fn notify(endpoint: EndpointId, message: Message) -> Result<(), Error> {
+    deliver(None, endpoint, message)
+}
+
+fn deliver(sender: Option<ThreadId>, endpoint: EndpointId, mut message: Message) -> Result<(), Error> {
     let woken = with(|registry| {
-        if !registry.rights_of(sender, endpoint.0).contains(Rights::SEND) {
-            // Deliberately indistinguishable from "no such endpoint" would be
-            // better for probing resistance, but a clear error is worth more
-            // while the system is this young.
-            return Err(Error::NoCapability);
+        if let Some(sender) = sender {
+            if !registry.rights_of(sender, endpoint.0).contains(Rights::SEND) {
+                // Deliberately indistinguishable from "no such endpoint" would
+                // be better for probing resistance, but a clear error is worth
+                // more while the system is this young.
+                return Err(Error::NoCapability);
+            }
         }
 
         let queue = registry
@@ -262,7 +282,7 @@ pub fn send(sender: ThreadId, endpoint: EndpointId, mut message: Message) -> Res
             return Err(Error::QueueFull);
         }
 
-        message.sender = sender.0 as u64;
+        message.sender = sender.map_or(KERNEL_SENDER, |sender| sender.0 as u64);
         queue.queue.push_back(message);
 
         Ok(queue.waiting.pop_front())

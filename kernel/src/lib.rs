@@ -27,6 +27,7 @@ pub mod block;
 pub mod arch;
 pub mod console;
 pub mod crash;
+pub mod device;
 pub mod elf;
 pub mod fs;
 pub mod gbm;
@@ -255,9 +256,10 @@ fn map_pci_config(rsdp: u64) {
 /// an endpoint or a graphics buffer is.
 pub fn release_thread_resources(thread: sched::ThreadId) {
     gbm::release_thread(thread);
+    device::release_thread(thread);
     ipc::release_thread(thread);
     userspace::release_slot(thread);
-    // Last: the three above consult it while they are giving things back.
+    // Last: everything above consults it while giving things back.
     quota::release_thread(thread);
 }
 

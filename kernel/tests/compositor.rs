@@ -1,4 +1,4 @@
-﻿//! The input daemon and the Sovereign compositor.
+﻿//! The Sovereign compositor.
 //!
 //! The compositor runs entirely in Ring 3. It reaches the screen only through a
 //! shared buffer handle, and learns what to draw only through IPC. These cases
@@ -16,8 +16,8 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
-use panda_kernel::console::{framebuffer, input};
-use panda_kernel::ipc::{self, EndpointId, Rights};
+use panda_kernel::console::framebuffer;
+use panda_kernel::ipc::{self, EndpointId, Message, Rights};
 use panda_kernel::sched::ThreadId;
 use panda_kernel::{
     arch::x86_64::halt_loop, gbm, sched, smp, sync, testing, userspace, BOOTLOADER_CONFIG,
@@ -92,7 +92,7 @@ fn write_pixel(x: usize, y: usize, colour: (u8, u8, u8)) {
 
 static COMPOSITOR_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 static COMPOSITOR_TID: AtomicU64 = AtomicU64::new(0);
-static CLIENT_PARAMS: sync::Mutex<[u64; 10]> = sync::Mutex::new([0; 10]);
+static CLIENT_PARAMS: sync::Mutex<[u64; 11]> = sync::Mutex::new([0; 11]);
 
 fn compositor_thread() {
     let owner = sched::current_id().expect("no current thread");
@@ -116,15 +116,6 @@ fn client_thread() {
 
     // SAFETY: as in `compositor_thread`.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
-}
-
-fn input_thread() {
-    let owner = sched::current_id().expect("no current thread");
-    let image = userspace::load_elf(owner, userspace::INPUT_ELF)
-        .expect("failed to map the input daemon");
-    let endpoint = COMPOSITOR_ENDPOINT.load(Ordering::Acquire);
-    // SAFETY: as above.
-    unsafe { userspace::enter_ring3(image.entry, image.stack_top, endpoint) }
 }
 
 /// Bring up the compositor and wait until it is parked waiting for work, which
@@ -164,11 +155,12 @@ fn present_at_depth(
     y: u64,
     z: u64,
 ) {
-    present_full(endpoint, compositor, colour, x, y, z, 0);
+    present_full(endpoint, compositor, colour, x, y, z, 0, 0);
 }
 
 /// As `present_at_depth`, and if `move_to_x` is non-zero the client presents the
 /// same buffer again there.
+#[allow(clippy::too_many_arguments)]
 fn present_full(
     endpoint: EndpointId,
     compositor: ThreadId,
@@ -177,6 +169,7 @@ fn present_full(
     y: u64,
     z: u64,
     move_to_x: u64,
+    listen: u64,
 ) {
     let depth = gbm::bytes_per_pixel() as u64;
     *CLIENT_PARAMS.lock() = [
@@ -190,6 +183,7 @@ fn present_full(
         depth,
         z,
         move_to_x,
+        listen,
     ];
 
     let client = sync::without_interrupts(|| {
@@ -279,7 +273,7 @@ fn a_surface_that_moves_far_does_not_repaint_everything_between() {
     write_pixel(400, 710, sentinel);
     assert_eq!(pixel_at(400, 710), sentinel, "the sentinel did not take");
 
-    present_full(endpoint, compositor, 0x0000FF, from_x, 700, 0, to_x);
+    present_full(endpoint, compositor, 0x0000FF, from_x, 700, 0, to_x, 0);
 
     assert!(
         spin_until(|| pixel_at(to_x as usize + 10, 710) == (0xFF, 0x00, 0x00)),
@@ -544,53 +538,144 @@ fn a_surface_that_moves_does_not_leave_a_hole() {
     );
 }
 
+const WHITE: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+const BLUE: (u8, u8, u8) = (0xFF, 0x00, 0x00);
+const RED: (u8, u8, u8) = (0x00, 0x00, 0xFF);
+
+const TAG_KEY: u64 = 1;
+const TAG_POINTER: u64 = 3;
+
+/// Where the pointer starts: the middle of the screen.
+fn centre() -> (u64, u64) {
+    let info = framebuffer::info().expect("no framebuffer");
+    (info.width as u64 / 2, info.height as u64 / 2)
+}
+
+fn input_event(tag: u64, words: [u64; 4]) -> Message {
+    Message { tag, words, sender: 0 }
+}
+
+/// A pointer event from the kernel, which the compositor believes.
+fn pointer(endpoint: EndpointId, dx: i64, dy: i64, buttons: u64) {
+    ipc::notify(endpoint, input_event(TAG_POINTER, [dx as u64, dy as u64, buttons, 0]))
+        .expect("notify failed");
+}
+
+fn click(endpoint: EndpointId, dx: i64, dy: i64) {
+    pointer(endpoint, dx, dy, 1);
+    pointer(endpoint, 0, 0, 0);
+}
+
+fn key(endpoint: EndpointId, ascii: u8) {
+    ipc::notify(endpoint, input_event(TAG_KEY, [ascii as u64, 0, 1, 0])).expect("notify failed");
+}
+
+/// A pixel given as offsets from the centre.
+fn pixel_near_centre(dx: i64, dy: i64) -> (u8, u8, u8) {
+    let (cx, cy) = centre();
+    pixel_at((cx as i64 + dx) as usize, (cy as i64 + dy) as usize)
+}
+
 #[test_case]
-fn the_input_daemon_forwards_and_sanitises() {
-    let endpoint = ipc::create(me(), 16).expect("create failed");
-    COMPOSITOR_ENDPOINT.store(endpoint.0, Ordering::Release);
+fn a_pointer_event_draws_a_cursor_where_it_went() {
+    let (endpoint, _) = start_compositor();
 
-    let daemon = sync::without_interrupts(|| {
-        let id = sched::spawn("input", input_thread).expect("spawn failed");
-        ipc::grant(me(), id, endpoint, Rights::SEND).expect("grant failed");
-        id
-    });
-
+    // Row 2, column 1 of the arrow is fill.
+    pointer(endpoint, 30, 20, 0);
     assert!(
-        spin_until(|| sched::is_blocked(daemon)),
-        "the input daemon never parked waiting for a key"
+        spin_until(|| pixel_near_centre(31, 22) == WHITE),
+        "no cursor where the pointer moved to"
     );
 
-    // A printable character must arrive; a bell must not. Dropping control
-    // codes is the sanitising the PRD asks the input daemon to do.
-    input::inject(b'k');
-    input::inject(0x07);
-    input::inject(b'j');
+    pointer(endpoint, 40, 0, 0);
+    assert!(
+        spin_until(|| pixel_near_centre(71, 22) == WHITE),
+        "the cursor did not follow the pointer"
+    );
+    assert_ne!(
+        pixel_near_centre(31, 22),
+        WHITE,
+        "the cursor left a copy of itself behind"
+    );
+}
+
+#[test_case]
+fn pointer_events_from_a_process_are_ignored() {
+    let (endpoint, _) = start_compositor();
+
+    // This thread owns the endpoint, so the message goes out stamped with its
+    // id: a process, which is neither the kernel nor the named input daemon.
+    ipc::send(me(), endpoint, input_event(TAG_POINTER, [(-200i64) as u64, (-100i64) as u64, 0, 0]))
+        .expect("send failed");
+    // A believable event behind it, so there is something to wait for.
+    pointer(endpoint, 0, 0, 0);
 
     assert!(
-        spin_until(|| ipc::queued(endpoint) >= 2),
-        "the input daemon forwarded nothing"
+        spin_until(|| pixel_near_centre(1, 2) == WHITE),
+        "the cursor is not at the centre; a process moved the pointer"
+    );
+}
+
+#[test_case]
+fn a_click_raises_the_surface_under_the_pointer() {
+    let (endpoint, compositor) = start_compositor();
+    let (cx, cy) = centre();
+
+    // Red behind, blue overlapping it in front.
+    present_at_depth(endpoint, compositor, 0xFF0000, cx + 20, cy + 20, 1);
+    present_at_depth(endpoint, compositor, 0x0000FF, cx + 40, cy + 30, 2);
+    assert!(
+        spin_until(|| pixel_near_centre(55, 45) == BLUE),
+        "blue is not in front to begin with"
     );
 
-    let first = ipc::receive(me(), endpoint).expect("receive failed");
-    assert_eq!(first.tag, 1, "not a key event");
-    assert_eq!(first.words[0], b'k' as u64);
+    // Click on red, where blue does not cover it.
+    click(endpoint, 25, 25);
+    assert!(
+        spin_until(|| pixel_near_centre(55, 45) == RED),
+        "clicking a surface did not bring it to the front"
+    );
+}
+
+#[test_case]
+fn keys_reach_only_the_focused_client() {
+    let (endpoint, compositor) = start_compositor();
+    let (cx, cy) = centre();
+
+    let left = ipc::create(me(), 8).expect("create failed");
+    let right = ipc::create(me(), 8).expect("create failed");
+    ipc::grant(me(), compositor, left, Rights::SEND).expect("grant failed");
+    ipc::grant(me(), compositor, right, Rights::SEND).expect("grant failed");
+    present_full(endpoint, compositor, 0x00FF00, cx - 100, cy, 0, 0, left.0);
+    present_full(endpoint, compositor, 0x00FF00, cx + 100, cy, 0, 0, right.0);
+
+    // Nobody has focus: this key goes nowhere.
+    key(endpoint, b'x');
+
+    click(endpoint, -90, 10);
+    key(endpoint, b'a');
+    assert!(
+        spin_until(|| ipc::queued(left) > 0),
+        "the focused client did not get the key"
+    );
+
+    click(endpoint, 200, 0);
+    key(endpoint, b'b');
+    assert!(
+        spin_until(|| ipc::queued(right) > 0),
+        "focus did not move with the click"
+    );
     assert_eq!(
-        first.sender,
-        daemon.0 as u64,
-        "the key event did not come from the daemon"
+        ipc::queued(left),
+        1,
+        "a key reached a client that did not have focus"
     );
 
-    let second = ipc::receive(me(), endpoint).expect("receive failed");
+    let delivered = ipc::receive(me(), right).expect("receive failed");
+    assert_eq!(delivered.words[0], b'b' as u64, "the wrong key was delivered");
     assert_eq!(
-        second.words[0],
-        b'j' as u64,
-        "the bell was forwarded instead of being dropped"
-    );
-
-    // Escape shuts it down.
-    input::inject(0x1b);
-    assert!(
-        spin_until(|| !sched::is_alive(daemon)),
-        "the input daemon did not exit on escape"
+        delivered.sender,
+        compositor.0 as u64,
+        "the key did not come from the compositor"
     );
 }

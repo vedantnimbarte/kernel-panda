@@ -31,6 +31,9 @@ pub mod nr {
     pub const FILE_REMOVE: u64 = 17;
     pub const FILE_STAT: u64 = 18;
     pub const FILE_LIST: u64 = 19;
+    pub const PORT_READ: u64 = 20;
+    pub const PORT_WRITE: u64 = 21;
+    pub const IRQ_BIND: u64 = 22;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -130,6 +133,57 @@ pub fn ipc_send(endpoint: u64, message: &Message) -> i64 {
 
 pub fn ipc_receive(endpoint: u64, message: &mut Message) -> i64 {
     syscall(nr::IPC_RECV, endpoint, message as *mut Message as u64, 0)
+}
+
+/// A new endpoint, owned by the caller with every right. Returns its id.
+pub fn ipc_create(capacity: u64) -> i64 {
+    syscall(nr::IPC_CREATE, capacity, 0, 0)
+}
+
+pub fn ipc_grant(endpoint: u64, thread: u64, rights: u64) -> i64 {
+    syscall(nr::IPC_GRANT, endpoint, thread, rights)
+}
+
+/// Read one byte from an I/O port this process was granted.
+pub fn port_read(port: u16) -> i64 {
+    syscall(nr::PORT_READ, port as u64, 0, 0)
+}
+
+pub fn port_write(port: u16, value: u8) -> i64 {
+    syscall(nr::PORT_WRITE, port as u64, value as u64, 0)
+}
+
+/// Have interrupts on ISA line `irq` arrive on `endpoint` as messages.
+pub fn irq_bind(irq: u64, endpoint: u64) -> i64 {
+    syscall(nr::IRQ_BIND, irq, endpoint, 0)
+}
+
+/// The `sender` of a message the kernel wrote itself. No thread has this id.
+pub const KERNEL_SENDER: u64 = u64::MAX;
+
+/// Tag of an interrupt notification from the kernel. `words[0]` is the line.
+pub const TAG_IRQ: u64 = 0x1_0000;
+
+/// What the input daemon, the compositor and its clients say to each other.
+pub mod input {
+    /// Stop. From the input daemon, when escape is pressed.
+    pub const TAG_SHUTDOWN: u64 = 0;
+    /// `[ascii or 0, keycode, pressed, modifiers]`. The keycode is the set 1
+    /// scancode, with 0x100 added for the E0-prefixed keys.
+    pub const TAG_KEY: u64 = 1;
+    /// `[dx, dy, buttons, 0]`. Screen directions -- positive dy is down -- as
+    /// two's complement. Buttons: bit 0 left, 1 right, 2 middle.
+    pub const TAG_POINTER: u64 = 3;
+    /// From a client: send my key events to endpoint `words[0]` while I have
+    /// focus. The compositor must already hold `SEND` on it.
+    pub const TAG_LISTEN: u64 = 4;
+    /// From the kernel only: thread `words[0]` is the input daemon, and its key
+    /// and pointer events are to be believed.
+    pub const TAG_INPUT_SOURCE: u64 = 5;
+
+    pub const MODIFIER_SHIFT: u64 = 1 << 0;
+    pub const MODIFIER_CTRL: u64 = 1 << 1;
+    pub const MODIFIER_ALT: u64 = 1 << 2;
 }
 
 pub fn buffer_create(width: u64, height: u64) -> i64 {

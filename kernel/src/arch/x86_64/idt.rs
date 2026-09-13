@@ -41,6 +41,10 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
     idt[apic::TLB_SHOOTDOWN_VECTOR].set_handler_fn(tlb_shootdown_handler);
 
+    for (irq, handler) in ISA_HANDLERS.iter().enumerate() {
+        idt[crate::device::IRQ_VECTOR_BASE + irq as u8].set_handler_fn(*handler);
+    }
+
     super::syscall::register(&mut idt);
 
     idt
@@ -49,6 +53,28 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 /// Install the IDT. `gdt::init` must already have run.
 pub fn init() {
     IDT.load();
+}
+
+/// One handler per ISA line, because the handler is the only thing that knows
+/// which line it was: the CPU passes nothing but the frame.
+macro_rules! isa_handlers {
+    ($($irq:literal => $name:ident),* $(,)?) => {
+        $(
+            extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
+                crate::device::on_interrupt($irq);
+                apic::end_of_interrupt();
+            }
+        )*
+        const ISA_HANDLERS: [extern "x86-interrupt" fn(InterruptStackFrame); crate::device::ISA_IRQS] =
+            [$($name),*];
+    };
+}
+
+isa_handlers! {
+    0 => isa_0, 1 => isa_1, 2 => isa_2, 3 => isa_3,
+    4 => isa_4, 5 => isa_5, 6 => isa_6, 7 => isa_7,
+    8 => isa_8, 9 => isa_9, 10 => isa_10, 11 => isa_11,
+    12 => isa_12, 13 => isa_13, 14 => isa_14, 15 => isa_15,
 }
 
 /// Another processor has panicked and is stopping the world.
