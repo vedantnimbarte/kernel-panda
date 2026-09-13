@@ -1,14 +1,14 @@
-﻿//! Synchronisation primitives.
+//! Synchronisation primitives.
 //!
 //! The rest of the kernel locks through this module rather than naming a crate
 //! directly, so the primitive underneath can change without touching call sites.
-//! It has: [`Mutex`] is now an in-house ticket lock.
+//! Everything here is in-house: [`Mutex`], a ticket lock, and [`Once`] and
+//! [`Lazy`] for values made on first use.
 
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-pub use spin::{Lazy, Once};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 pub use x86_64::instructions::interrupts::without_interrupts;
 
@@ -181,4 +181,96 @@ impl<T> Drop for MutexGuard<'_, T> {
 /// Whether interrupts are currently enabled on this CPU.
 pub fn interrupts_enabled() -> bool {
     x86_64::instructions::interrupts::are_enabled()
+}
+
+/// A value set at most once, by whichever caller gets there first, and read
+/// freely after.
+///
+/// A caller arriving while another is still making the value spins until it is
+/// made. So the maker must not wait on anything that is itself waiting on this
+/// value -- the same processor calling back in, from inside the maker or from an
+/// interrupt taken during it, spins forever. A maker that panics leaves the
+/// value unmade and later callers spinning, which in a kernel whose panic stops
+/// every processor is moot.
+pub struct Once<T> {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+const EMPTY: u8 = 0;
+const MAKING: u8 = 1;
+const MADE: u8 = 2;
+
+// SAFETY: the value is written once, by the one caller that moved the state to
+// MAKING, and only read after the state says MADE, which is never undone. It is
+// shared by reference across threads, so it must be Sync, and handed over by
+// whoever makes it, so Send.
+unsafe impl<T: Send + Sync> Sync for Once<T> {}
+// SAFETY: moving the cell moves the value with it.
+unsafe impl<T: Send> Send for Once<T> {}
+
+impl<T> Once<T> {
+    pub const fn new() -> Self {
+        Self { state: AtomicU8::new(EMPTY), value: UnsafeCell::new(MaybeUninit::uninit()) }
+    }
+
+    /// The value, making it with `make` if nobody has.
+    pub fn call_once(&self, make: impl FnOnce() -> T) -> &T {
+        loop {
+            match self.state.compare_exchange(EMPTY, MAKING, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    // SAFETY: winning the exchange makes this the only writer,
+                    // and no reader looks until the state is MADE.
+                    unsafe { (*self.value.get()).write(make()) };
+                    self.state.store(MADE, Ordering::Release);
+                    break;
+                }
+                Err(MADE) => break,
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
+        // SAFETY: MADE, so written, and never written again.
+        unsafe { (*self.value.get()).assume_init_ref() }
+    }
+
+    /// The value, if it has been made.
+    pub fn get(&self) -> Option<&T> {
+        // SAFETY: as in `call_once`.
+        (self.state.load(Ordering::Acquire) == MADE).then(|| unsafe { (*self.value.get()).assume_init_ref() })
+    }
+}
+
+impl<T> Default for Once<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Drop for Once<T> {
+    fn drop(&mut self) {
+        if *self.state.get_mut() == MADE {
+            // SAFETY: made, and this is the last anyone sees of it.
+            unsafe { self.value.get_mut().assume_init_drop() };
+        }
+    }
+}
+
+/// A value made by `make` the first time it is used.
+pub struct Lazy<T, F = fn() -> T> {
+    once: Once<T>,
+    make: F,
+}
+
+impl<T, F> Lazy<T, F> {
+    pub const fn new(make: F) -> Self {
+        Self { once: Once::new(), make }
+    }
+}
+
+impl<T, F: Fn() -> T> Deref for Lazy<T, F> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.once.call_once(&self.make)
+    }
 }

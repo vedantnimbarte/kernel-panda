@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::memory::frame;
-use panda_kernel::sync::Mutex;
+use panda_kernel::sync::{Mutex, Once};
 use panda_kernel::{allocator, arch::x86_64::halt_loop, sched, smp, testing, time, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
@@ -406,4 +406,43 @@ fn page_tables_survive_concurrent_mapping() {
         "{leaked} frames lost across {WORKERS} workers; buffer memory is not \
          being returned under concurrent use"
     );
+}
+
+static RACED: Once<u64> = Once::new();
+static MAKERS: AtomicUsize = AtomicUsize::new(0);
+static RACE_START: AtomicBool = AtomicBool::new(false);
+static RACERS_DONE: AtomicUsize = AtomicUsize::new(0);
+static RACERS_WRONG: AtomicUsize = AtomicUsize::new(0);
+
+fn race_to_make() {
+    while !RACE_START.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let value = RACED.call_once(|| {
+        MAKERS.fetch_add(1, Ordering::AcqRel);
+        // Long enough that the others arrive while it is being made.
+        for _ in 0..1_000_000 {
+            core::hint::spin_loop();
+        }
+        0xC0FFEE
+    });
+    if *value != 0xC0FFEE {
+        RACERS_WRONG.fetch_add(1, Ordering::AcqRel);
+    }
+    RACERS_DONE.fetch_add(1, Ordering::AcqRel);
+}
+
+#[test_case]
+fn a_once_is_made_once_however_many_processors_race_for_it() {
+    const RACERS: usize = 8;
+    for _ in 0..RACERS {
+        sched::spawn("racer", race_to_make).expect("spawn failed");
+    }
+    assert!(RACED.get().is_none(), "made before anyone asked");
+    RACE_START.store(true, Ordering::Release);
+
+    assert!(spin_until(|| RACERS_DONE.load(Ordering::Acquire) == RACERS), "a racer never finished");
+    assert_eq!(MAKERS.load(Ordering::Acquire), 1, "the value was made more than once");
+    assert_eq!(RACERS_WRONG.load(Ordering::Acquire), 0, "a racer saw something other than the value");
+    assert_eq!(RACED.get(), Some(&0xC0FFEE));
 }

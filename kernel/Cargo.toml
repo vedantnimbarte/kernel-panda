@@ -26,15 +26,13 @@ default = []
 bump-allocator = []
 
 # Every dependency here ships inside the kernel image and must earn its place
-# against the auditability requirement. Three, and only three:
+# against the auditability requirement. Two, and only two:
 #   bootloader_api - mandated by the chosen boot path
 #   x86_64         - IDT/GDT/page-table structures; pure Rust, no C
-#   spin           - `Once` and `Lazy` only; the lock itself is in-house. Wrapped
-#                    behind crate::sync so it can be swapped out
+# Locks and one-time initialisation are in-house, in crate::sync.
 [dependencies]
 bootloader_api = "0.11"
 x86_64 = "0.15"
-spin = { version = "0.9", default-features = false, features = ["once", "lazy"] }
 # In-repo, not a dependency in the sense above: split out only so the profile
 # below can optimise it.
 panda-sha256 = { path = "sha256" }

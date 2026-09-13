@@ -27,7 +27,7 @@ stack running as an unprivileged process.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 216 cases across 27 boot-and-assert test kernels, run on four cores
+**Testing:** 217 cases across 27 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -178,21 +178,21 @@ xtask for bare metal.
 
 Everything that ships inside the kernel image has to earn its place. This is a
 kernel meant to be read and audited, and a dependency is code nobody here has
-read. Three crates earn it.
+read. Two crates earn it.
 
 | Crate | Why |
 | --- | --- |
 | `bootloader_api` | Required by the chosen boot path. |
 | `x86_64` | IDT/GDT/page-table structures and privileged instructions. Pure Rust; reimplementing is weeks of work for no safety gain. |
-| `spin` | `Once` and `Lazy`, for one-time initialisation of statics. Nothing else from it is compiled in. |
 
-`spin` used to supply the lock too, until the in-house ticket lock replaced it.
-Wrapping it behind `kernel/src/sync.rs` from the start is what made that swap a
-change to one file rather than to every call site, and the same wrapper is what
-would let `Once` and `Lazy` follow.
+`spin` was the third. It supplied the lock until the in-house ticket lock
+replaced it, then `Once` and `Lazy` until those were written too. Both swaps
+touched one file, `kernel/src/sync.rs`, because every call site had gone through
+it from the start.
 
 Written in-house rather than pulled in: the 16550 UART driver, the framebuffer
-console and its font, the physical frame allocator, and both heap allocators.
+console and its font, the physical frame allocator, both heap allocators, the
+locks and one-time initialisation, and SHA-256 for password hashes.
 `linked_list_allocator` is deliberately unused — ours is ~250 lines and the audit
 goal is the point.
 
