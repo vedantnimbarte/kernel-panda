@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use panda_kernel::arch::x86_64::apic;
 use panda_kernel::ipc::EndpointId;
 use panda_kernel::{
-    arch::x86_64::halt_loop, console, device, gbm, ipc, memory, pci, println, sched, sync, syscall, time,
+    arch::x86_64::halt_loop, console, device, gbm, ipc, memory, net, pci, println, sched, sync, syscall, time,
     userspace, BOOTLOADER_CONFIG,
 };
 
@@ -234,6 +234,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("  input daemon sent shutdown; both daemons exited");
     println!();
 
+    println!("net: a ring 3 stack pings the gateway");
+    net_demo(me);
+    println!();
+
     println!("shell: a ring 3 daemon reading the serial port");
     let shell = sched::spawn("shell", shell_thread).expect("scheduler not running");
     for line in ["help", "version", "hello", "exit"] {
@@ -328,6 +332,68 @@ static DISPLAY_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 /// `input::TAG_INPUT_SOURCE` in the user library.
 const INPUT_SOURCE: u64 = 5;
 static CLIENT_PARAMS: sync::Mutex<[u64; 8]> = sync::Mutex::new([0; 8]);
+
+static NET_CONTROL: AtomicU64 = AtomicU64::new(0);
+
+/// Start the network daemon and have it ping QEMU's gateway.
+fn net_demo(me: sched::ThreadId) {
+    if net::mac().is_none() {
+        println!("  no network card");
+        return;
+    }
+
+    let control = ipc::create(me, 32).expect("could not create an endpoint");
+    NET_CONTROL.store(control.0, Ordering::Release);
+    let stack = sync::without_interrupts(|| {
+        let id = sched::spawn("net", net_thread).expect("scheduler not running");
+        let rights = ipc::Rights::SEND.union(ipc::Rights::RECEIVE);
+        ipc::grant(me, id, control, rights).expect("grant failed");
+        // The one thread allowed to put frames on the wire and see them arrive.
+        net::allow_stack(id);
+        id
+    });
+    while sched::is_alive(stack) && !sched::is_blocked(stack) {
+        sched::yield_now();
+    }
+
+    let reply = ipc::create(me, 4).expect("could not create an endpoint");
+    ipc::grant(me, stack, reply, ipc::Rights::SEND).expect("grant failed");
+
+    const GATEWAY: u64 = 0x0A00_0202;
+    let started = time::uptime_ms();
+    let ping = ipc::Message {
+        tag: 1,
+        words: [GATEWAY, reply.0, 1, 0],
+        sender: 0,
+    };
+    ipc::send(me, control, ping).expect("send failed");
+
+    // Bounded: a machine without a network behind the card should still boot
+    // through to the shell.
+    while ipc::queued(reply) == 0 && time::uptime_ms() < started + 3000 {
+        sched::yield_now();
+    }
+    if ipc::queued(reply) > 0 {
+        let _ = ipc::receive(me, reply);
+        println!(
+            "  reply from 10.0.2.2 in {} ms, parsed entirely in Ring 3",
+            time::uptime_ms() - started
+        );
+    } else {
+        println!("  no reply from 10.0.2.2 within three seconds");
+    }
+}
+
+fn net_thread() {
+    let owner = sched::current_id().expect("no current thread");
+    let image = userspace::load_elf(owner, userspace::NET_ELF).expect("failed to load the network daemon");
+    // 10.0.2.15/24 behind 10.0.2.2: QEMU's user-mode network.
+    let parameters = [NET_CONTROL.load(Ordering::Acquire), 0x0A00_020F, 0x0A00_0202, 0xFFFF_FF00];
+    // SAFETY: the parameter page just mapped for a program not yet running.
+    unsafe { userspace::write_parameters(image.data, &parameters) };
+    // SAFETY: load_elf mapped the entry user-executable and the stack writable.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
+}
 
 fn compositor_thread() {
     let owner = sched::current_id().expect("no current thread");

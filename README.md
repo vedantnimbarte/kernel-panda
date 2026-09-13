@@ -11,7 +11,8 @@ It boots on bare metal or under QEMU, brings up every processor, and runs
 preemptively scheduled threads in their own address spaces. Drivers and the
 display server live in Ring 3 and talk through capability-mediated IPC. It has
 persistent storage: an AHCI driver, GPT partitioning, and a copy-on-write
-filesystem that survives a power cut.
+filesystem that survives a power cut. It is on the network, with the protocol
+stack running as an unprivileged process.
 
 | | |
 |---|---|
@@ -21,11 +22,12 @@ filesystem that survives a power cut.
 | Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
 | IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities |
-| Devices | Local APIC and I/O APIC, PCIe with ECAM, AHCI storage, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
+| Devices | Local APIC and I/O APIC, PCIe with ECAM and MSI-X, AHCI storage, virtio-net, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
+| Networking | ARP, IPv4, ICMP echo and UDP in a Ring 3 daemon; the kernel only moves Ethernet frames |
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 180+ cases across 22 boot-and-assert test kernels, run on four cores
+**Testing:** 190 cases across 23 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -81,6 +83,9 @@ compositor: a ring 3 display server
   presented a red surface at (400, 260)
   input daemon sent shutdown; both daemons exited
 
+net: a ring 3 stack pings the gateway
+  reply from 10.0.2.2 in 20 ms, parsed entirely in Ring 3
+
 shell: a ring 3 daemon reading the serial port
 panda> help
 commands: help version hello exit
@@ -129,12 +134,12 @@ kernel-panda/
 ├── xtask/           host-side build driver: images, QEMU, test runner
 ├── userland/        Ring 3 programs in Rust (its own cargo workspace)
 │   ├── src/lib.rs   syscall wrappers, entry macro, panic handler
-│   └── src/bin/     shell, compositor, input daemon (the PS/2 driver), client, test probe
+│   └── src/bin/     shell, compositor, input daemon (the PS/2 driver), network daemon, client, test probe
 └── kernel/          the kernel itself (its own cargo workspace)
     ├── src/
     │   ├── console/   16550 UART, framebuffer text console, 8x8 font
     │   ├── arch/x86_64/   GDT + TSS, IDT, Local APIC + timer, 8259 masking
-    │   ├── memory/    memory map, frame allocator, page tables, heap, kernel stacks
+    │   ├── memory/    memory map, frame allocator, page tables, heap, kernel stacks, DMA regions
     │   ├── allocator/ bump and linked-list `GlobalAlloc` implementations
     │   ├── sched/     threads, context switch, priorities, per-CPU run queues
     │   ├── block/     block layer, AHCI driver, GPT and MBR partitioning
@@ -147,7 +152,8 @@ kernel-panda/
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
     │   ├── syscall.rs    the entire Ring 3 surface
     │   ├── ipc.rs        endpoints, capabilities, blocking receive
-    │   ├── pci.rs        bus enumeration, BAR decoding, ECAM
+    │   ├── pci.rs        bus enumeration, BAR decoding, ECAM, MSI-X
+    │   ├── net.rs        the virtio-net driver and the frame-moving syscalls
     │   └── gbm.rs        shared graphics buffers and the scanout
     └── tests/       one standalone boot-and-assert kernel per file
 ```
@@ -759,6 +765,32 @@ one client type into another's window. Key and pointer events count only from
 the kernel, or from the thread the kernel has named as the input daemon — and
 naming it is a message only the kernel can send.
 
+**The network stack is a process; the kernel moves frames.** Everything that
+parses bytes from the network — ARP, IPv4 headers, ICMP, UDP — runs in a Ring 3
+daemon, so a malformed packet that finds a bug there kills an unprivileged
+process. The kernel's part is four system calls: the card's MAC, send a frame,
+take a frame, and have arrivals announced on an endpoint. Only the one thread
+the kernel designates may make them, the same way only the designated display
+server may have the screen.
+
+The virtio-net driver is in the kernel for the same reason the disk driver is:
+the card is a DMA engine, and without an IOMMU a Ring 3 driver holding one is
+isolated in appearance only. It speaks virtio's legacy interface, a block of
+I/O-port registers, because QEMU offers it and it is a fraction of the modern
+one's machinery.
+
+Arrivals are signalled by MSI-X. A device's legacy interrupt pin reaches the I/O
+APIC through wiring only the firmware's AML describes, and there is no AML
+interpreter; an MSI-X entry is an address and a value the device writes, and the
+address is simply the Local APIC's. The daemon's clients reach it over IPC, with
+datagrams in buffers they share, since a message carries four words.
+
+The tests run against QEMU's user-mode network: the gateway answers ARP and
+pings, and its built-in TFTP server hands out a file xtask writes, so the UDP
+path is checked byte for byte with nothing outside the emulator. The first
+driver offered its buffers in the descriptor table rather than the ring after
+it; QEMU's trace of a queue notified and never popped is what found it.
+
 ## Known limits
 
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
@@ -774,6 +806,10 @@ naming it is a message only the kernel can send.
   sequence is not decoded. An interrupt line stays routed after its driver
   exits; every ISA line is edge-triggered, so the cost is one ignored interrupt
   per event, not a storm.
+* The network card has one transmit buffer, so frames go out one at a time. The
+  daemon holds two frames while an address resolves and drops the rest, keeps
+  one datagram per bound port, does not reassemble fragments, and neither sends
+  nor checks UDP checksums.
 * Nothing outside the tests creates a crash partition yet, so on an ordinary
   boot a panic is reported to the console and not saved. Backtraces are raw
   return addresses: subtract the load base, `0x10000000000`, and look them up
@@ -783,7 +819,8 @@ naming it is a message only the kernel can send.
 
 The gaps that matter, so nobody has to discover them by trying:
 
-* **Networking.** No NIC driver, no stack.
+* **TCP, DHCP, DNS, IPv6.** The stack speaks ARP, IPv4, ICMP echo and UDP, with
+  its address given at start-up.
 * **Users and permissions.** Every Ring 3 process is equally unprivileged and
   equally anonymous. Capabilities bound what a process can reach; nothing binds
   *who* it is.
