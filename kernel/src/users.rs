@@ -18,7 +18,6 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs::{FsError, NodeKind};
 use crate::sched::{self, ThreadId};
@@ -145,17 +144,12 @@ fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-/// Unique per account, which is all a salt has to be. There is no entropy
-/// source to make it unpredictable as well; uniqueness is what stops one
-/// precomputed table from serving every account.
-fn new_salt(name: &str) -> [u8; 16] {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut hash = sha256::Sha256::default();
-    // SAFETY: RDTSC is available on every x86_64 processor.
-    hash.update(&unsafe { core::arch::x86_64::_rdtsc() }.to_le_bytes());
-    hash.update(&COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-    hash.update(name.as_bytes());
-    hash.finish()[..16].try_into().unwrap()
+/// Random, so no table computed in advance serves any account, and two
+/// accounts with the same password do not share a hash.
+fn new_salt() -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    crate::random::fill(&mut salt);
+    salt
 }
 
 /// Add an account to the root filesystem's database, creating the database if
@@ -190,7 +184,7 @@ pub fn add_account(name: &str, user: UserId, password: &str) -> Result<(), Accou
         return Err(AccountError::Exists);
     }
 
-    let salt = new_salt(name);
+    let salt = new_salt();
     let hash = sha256::pbkdf2(password.as_bytes(), &salt, ITERATIONS);
     let mut line = alloc::string::String::new();
     let _ = write!(line, "{name}:{user}:");

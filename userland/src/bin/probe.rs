@@ -28,6 +28,7 @@ pub const MODE_PERMISSIONS: u64 = 12;
 pub const MODE_LOGIN: u64 = 13;
 pub const MODE_TCP: u64 = 14;
 pub const MODE_RESOLVE: u64 = 15;
+pub const MODE_RANDOM: u64 = 16;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -435,6 +436,19 @@ extern "C" fn main(parameters: u64) {
             let database = user::file_read("/users", &mut buffer);
             let words = [wrong as u64, after_wrong as u64, right as u64, (user::user_id() as u64) << 32 | database as u32 as u64];
             user::ipc_send(parameters.endpoint, &user::Message { tag: 0x0413, words, sender: 0, sender_user: 0 });
+        }
+
+        // Random bytes from Ring 3: two draws, what the call returned, and what
+        // it returned for a request over the limit. Reported to `endpoint`.
+        MODE_RANDOM => {
+            let (mut first, mut second) = ([0u8; 8], [0u8; 8]);
+            let filled = user::random(&mut first);
+            user::random(&mut second);
+            let mut small = [0u8; 8];
+            // Claims 5000 bytes; the kernel must refuse before touching them.
+            let refused = user::syscall(user::nr::RANDOM, small.as_mut_ptr() as u64, 5000, 0);
+            let words = [u64::from_le_bytes(first), u64::from_le_bytes(second), filled as u64, refused as u64];
+            user::ipc_send(parameters.endpoint, &user::Message { tag: 0x2A2A, words, sender: 0, sender_user: 0 });
         }
 
         // Report the user this process runs as, to `endpoint`.

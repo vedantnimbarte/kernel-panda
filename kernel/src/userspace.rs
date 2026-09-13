@@ -1,4 +1,4 @@
-﻿//! User-space address regions, program loading, and the drop into Ring 3.
+//! User-space address regions, program loading, and the drop into Ring 3.
 //!
 //! ## Isolation
 //!
@@ -204,6 +204,7 @@ pub mod probe {
     pub const LOGIN: u64 = 13;
     pub const TCP: u64 = 14;
     pub const RESOLVE: u64 = 15;
+    pub const RANDOM: u64 = 16;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

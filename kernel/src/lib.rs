@@ -36,6 +36,7 @@ pub mod memory;
 pub mod net;
 pub mod pci;
 pub mod quota;
+pub mod random;
 pub mod ring;
 pub mod sched;
 pub use panda_sha256 as sha256;

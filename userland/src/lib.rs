@@ -47,6 +47,7 @@ pub mod nr {
     pub const FILE_CHMOD: u64 = 33;
     pub const LOGIN: u64 = 34;
     pub const TIMER_SET: u64 = 35;
+    pub const RANDOM: u64 = 36;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -478,6 +479,19 @@ pub const KERNEL_SENDER: u64 = u64::MAX;
 /// caller's earlier timer on that endpoint.
 pub fn timer_set(endpoint: u64, ms: u64, cookie: u64) -> i64 {
     syscall(nr::TIMER_SET, endpoint, ms, cookie)
+}
+
+/// Fill `buffer`, at most 4 KiB, with random bytes from the kernel. Returns the
+/// bytes written.
+pub fn random(buffer: &mut [u8]) -> i64 {
+    syscall(nr::RANDOM, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0)
+}
+
+/// A random word from the kernel.
+pub fn random_u64() -> u64 {
+    let mut bytes = [0u8; 8];
+    random(&mut bytes);
+    u64::from_le_bytes(bytes)
 }
 
 /// Tag of a timer's message from the kernel. `words[0]` is the cookie.

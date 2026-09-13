@@ -149,6 +149,13 @@ fn an_account_logs_in_with_its_password_and_nothing_else() {
     // the system's included.
     let database = fs.read_file(users::DATABASE).expect("no database");
     assert!(!database.windows(PASSWORD.len()).any(|w| w == PASSWORD.as_bytes()));
+
+    // The same password twice is two different hashes: the salts differ.
+    users::add_account("carol", 1002, "hunter2").expect("could not add carol");
+    let database = fs.read_file(users::DATABASE).expect("no database");
+    let text = core::str::from_utf8(&database).expect("not text");
+    let hash_of = |name: &str| text.lines().find(|line| line.starts_with(name)).and_then(|line| line.rsplit(':').next());
+    assert_ne!(hash_of("bob:"), hash_of("carol:"), "two accounts with one password share a hash");
     assert_eq!(fs.owner_as(users::DATABASE, None), Ok((ACCOUNTS, 0)));
     assert_eq!(fs.read_file_as(users::DATABASE, Some(SYSTEM)), Err(FsError::Denied));
     assert_eq!(fs.set_mode_as(users::DATABASE, 0b1111, Some(SYSTEM)), Err(FsError::Denied));

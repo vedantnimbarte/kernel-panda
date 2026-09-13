@@ -76,8 +76,9 @@ const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
 const DHCP_ACK: u8 = 5;
 const DHCP_NAK: u8 = 6;
-/// Lookups go out from this port plus their slot, so an answer names its slot.
-const DNS_LOCAL_PORT: u16 = 53000;
+/// Lookups go out from a port chosen at random at start-up, plus their slot, so
+/// an answer names its slot.
+const DNS_PORT_RANGE: core::ops::Range<u16> = 49152..65535 - RESOLVERS as u16;
 /// Timer ticks before a DHCP or DNS request is sent again, and DNS tries.
 const REQUEST_TICKS: u32 = 10;
 const DNS_TRIES: u32 = 3;
@@ -218,7 +219,6 @@ struct Stack {
     listeners: [Listener; LISTENERS],
     timer_armed: bool,
     next_port: u16,
-    next_sequence_start: u32,
     dhcp: Dhcp,
     dhcp_waited: u32,
     transaction: u32,
@@ -229,7 +229,7 @@ struct Stack {
     dns_server: u32,
     dns_port: u16,
     resolves: [Resolve; RESOLVERS],
-    next_dns_id: u16,
+    dns_local_port: u16,
 }
 
 extern "C" fn main(parameters: u64) {
@@ -265,13 +265,10 @@ extern "C" fn main(parameters: u64) {
         connections: [Connection::default(); CONNECTIONS],
         listeners: [Listener::default(); LISTENERS],
         timer_armed: false,
-        next_port: 49152,
-        // No entropy source, so initial sequence numbers are predictable from
-        // the MAC; see the README.
-        next_sequence_start: u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]),
+        next_port: 49152 + (user::random_u64() % 8192) as u16,
         dhcp: Dhcp::Done,
         dhcp_waited: 0,
-        transaction: u32::from_be_bytes([mac[5], mac[4], mac[3], mac[2]]),
+        transaction: user::random_u64() as u32,
         offered: 0,
         dhcp_server: 0,
         offered_dns: 0,
@@ -279,7 +276,7 @@ extern "C" fn main(parameters: u64) {
         dns_server: (parameters.dns >> 16) as u32,
         dns_port: parameters.dns as u16,
         resolves: [Resolve::default(); RESOLVERS],
-        next_dns_id: 1,
+        dns_local_port: DNS_PORT_RANGE.start + (user::random_u64() % DNS_PORT_RANGE.len() as u64) as u16,
     };
     if stack.address == 0 {
         stack.dhcp = Dhcp::Discovering;
@@ -523,7 +520,7 @@ impl Stack {
             self.dhcp_reply(payload);
             return;
         }
-        if let Some(slot) = port.checked_sub(DNS_LOCAL_PORT).map(usize::from).filter(|slot| *slot < RESOLVERS) {
+        if let Some(slot) = port.checked_sub(self.dns_local_port).map(usize::from).filter(|slot| *slot < RESOLVERS) {
             if self.resolves[slot].id != 0 && source == self.dns_server && source_port == self.dns_port {
                 self.dns_reply(slot, payload);
             }
@@ -891,9 +888,10 @@ impl Stack {
         true
     }
 
+    /// Random, so that nobody off the path can guess where a connection's
+    /// sequence numbers are and write into it.
     fn sequence_start(&mut self) -> u32 {
-        self.next_sequence_start = self.next_sequence_start.wrapping_add(0x0101_7F31);
-        self.next_sequence_start
+        user::random_u64() as u32
     }
 
     fn connect(&mut self, owner: u64, address: u32, local_port: u16, remote_port: u16, reply: u64, buffer: u64) {
@@ -1241,7 +1239,7 @@ impl Stack {
                 }
             }
             (Dhcp::Requesting, DHCP_NAK) => {
-                self.transaction = self.transaction.wrapping_add(1);
+                self.transaction = user::random_u64() as u32;
                 self.dhcp = Dhcp::Discovering;
                 self.dhcp_waited = 0;
                 self.dhcp_send(DHCP_DISCOVER);
@@ -1293,8 +1291,8 @@ impl Stack {
             return answer(net::RESOLVE_TIMED_OUT);
         };
 
-        let id = self.next_dns_id;
-        self.next_dns_id = self.next_dns_id.wrapping_add(1).max(1);
+        // Random, and never zero, which marks a free slot.
+        let id = (user::random_u64() as u16).max(1);
         self.resolves[slot] = Resolve { id, reply, token, base, length, waited: 0, tries: 1 };
         if !self.dns_query(slot) {
             self.resolves[slot] = Resolve::default();
@@ -1329,7 +1327,7 @@ impl Stack {
         at += 5;
 
         let (server, port) = (self.dns_server, self.dns_port);
-        self.send_datagram(server, DNS_LOCAL_PORT + slot as u16, port, &query[..at]);
+        self.send_datagram(server, self.dns_local_port + slot as u16, port, &query[..at]);
         true
     }
 

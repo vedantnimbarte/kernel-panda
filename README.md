@@ -17,7 +17,7 @@ stack running as an unprivileged process.
 | | |
 |---|---|
 | Memory | Bitmap frame allocator, four-level paging, per-process address spaces, kernel heap |
-| Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas, per-process users with no superuser, password logins |
+| Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas, per-process users with no superuser, password logins, a CSPRNG seeded from RDSEED/RDRAND |
 | Scheduling | Preemptive, three priorities, per-CPU run queues with work stealing, sleep and join |
 | Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
@@ -27,7 +27,7 @@ stack running as an unprivileged process.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 217 cases across 27 boot-and-assert test kernels, run on four cores
+**Testing:** 220 cases across 28 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -158,6 +158,7 @@ kernel-panda/
     │   ├── pci.rs        bus enumeration, BAR decoding, ECAM, MSI-X
     │   ├── net.rs        the virtio-net driver and the frame-moving syscalls
     │   ├── timer.rs      one-shot timers, delivered as messages
+    │   ├── random.rs     random bytes, seeded from the processor's generator
     │   ├── virtio.rs     virtio's legacy PCI interface and virtqueues, shared
     │   └── gbm.rs        shared graphics buffers and the scanout
     └── tests/       one standalone boot-and-assert kernel per file
@@ -725,6 +726,16 @@ kernel deadlocks the first time a handler prints: it spins on a lock held by the
 code it interrupted, which cannot run again to release it. The window is small,
 which only means the hang would be intermittent.
 
+**Random bytes come from the processor, stretched by a hash.** RDSEED, or
+RDRAND where there is no RDSEED, seeds a SHA-256 construction and is mixed in
+again on every request; each request ends by replacing the key with a hash of
+itself, so the state a request leaves behind cannot recompute what it handed
+out. Salts, TCP initial sequence numbers, DHCP transaction ids, DNS query ids
+and the port lookups go out from all come from it — Ring 3 by a system call.
+A processor with neither instruction gets a seed hashed from timing jitter and
+a line at boot saying it is guessable; xtask asks QEMU for both so the hardware
+path is the one tested.
+
 **A panic stops the world, then reports without waiting for anything.** Other
 processors are halted with an NMI, not an ordinary IPI: the processor most
 likely to be in the way is one spinning on a lock with interrupts masked, and
@@ -961,14 +972,12 @@ everything owned by the system and closed to all.
   lookups ask for IPv4 addresses only, over UDP, with no cache, and answers
   are trusted from whichever server was asked, by port and query id alone.
 * TCP drops out-of-order segments and waits for them to be sent again, ignores
-  the peer's window and options, has no congestion control and no TIME-WAIT,
-  and picks initial sequence numbers from the MAC and a counter, so they are
-  predictable. Resending after a timeout is not tested: QEMU's network loses
+  the peer's window and options, and has no congestion control and no
+  TIME-WAIT. Resending after a timeout is not tested: QEMU's network loses
   nothing, and a connection QEMU cannot complete to the host is never refused,
   only left to time out, which takes longer than a test kernel may run.
 * Accounts are added only by kernel code; there is no system call to add one or
-  to change a password. Salts are unique but not unpredictable — there is no
-  entropy source — and adding two accounts at once can lose one.
+  to change a password, and adding two accounts at once can lose one.
 * A crash record holds the first 4 KiB of a report. Backtraces name functions,
   not lines: file and line need the DWARF data, which is far larger than the
   symbol table and slower to search.

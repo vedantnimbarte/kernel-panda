@@ -553,7 +553,9 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool, crash: &Path) -> Resul
     // detects them as absent and skips them -- which means every protection they
     // provide goes untested, and a missing `stac` reads as working code. Asking
     // for them explicitly is what makes those paths real here.
-    cmd.args(["-cpu", "qemu64,+smep,+smap"]);
+    // RDRAND and RDSEED likewise: without them the kernel seeds its random
+    // numbers from timing, and the hardware path goes untested.
+    cmd.args(["-cpu", "qemu64,+smep,+smap,+rdrand,+rdseed"]);
     // A scratch SATA disk for the block driver to talk to.
     //
     // Attached through q35's own ICH9 AHCI controller, which is the same

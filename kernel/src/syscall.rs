@@ -48,6 +48,7 @@ pub mod numbers {
     pub const FILE_CHMOD: u64 = 33;
     pub const LOGIN: u64 = 34;
     pub const TIMER_SET: u64 = 35;
+    pub const RANDOM: u64 = 36;
 }
 
 /// Returned in RAX as a negative value.
@@ -196,6 +197,7 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::FILE_CHMOD => sys_file_chmod(frame.rdi, frame.rsi, frame.rdx),
         numbers::LOGIN => sys_login(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         numbers::TIMER_SET => crate::timer::sys_set(frame.rdi, frame.rsi, frame.rdx),
+        numbers::RANDOM => crate::random::sys_fill(frame.rdi, frame.rsi),
         _ => Err(Error::UnknownCall),
     };
 
