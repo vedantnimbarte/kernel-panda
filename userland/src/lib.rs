@@ -46,6 +46,7 @@ pub mod nr {
     pub const FILE_OWNER: u64 = 32;
     pub const FILE_CHMOD: u64 = 33;
     pub const LOGIN: u64 = 34;
+    pub const TIMER_SET: u64 = 35;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -400,6 +401,48 @@ pub mod net {
     /// `[buffer, length, destination address, local port << 16 | remote port]`.
     pub const TAG_UDP_SEND: u64 = 5;
 
+    /// `[address, local port << 16 | remote port, reply endpoint, buffer]`:
+    /// open a TCP connection. A local port of zero picks one. Answered with
+    /// [`TAG_TCP_OPEN`], or [`TAG_TCP_CLOSED`] naming connection `u64::MAX` if
+    /// there was no room. What arrives on it is written into `buffer`.
+    pub const TAG_TCP_CONNECT: u64 = 6;
+    /// `[port, reply endpoint, buffer, 0]`: accept the next connection to
+    /// `port`, announced with [`TAG_TCP_OPEN`]. One connection per listen.
+    pub const TAG_TCP_LISTEN: u64 = 7;
+    /// `[connection, address, remote port, local port]`.
+    pub const TAG_TCP_OPEN: u64 = 8;
+    /// `[connection, buffer, length, 0]`: send up to [`TCP_MSS`] bytes from the
+    /// start of `buffer`, which must hold them unchanged until
+    /// [`TAG_TCP_SENT`] -- a lost segment is resent from it. One send at a time.
+    pub const TAG_TCP_SEND: u64 = 9;
+    /// `[connection, length, 0, 0]`: the peer has it. A length of zero is a send
+    /// that was refused: too long, one already in flight, or not open.
+    pub const TAG_TCP_SENT: u64 = 10;
+    /// `[connection, length, 0, 0]`: the connection's buffer holds `length`
+    /// bytes from its start. Nothing more arrives until [`TAG_TCP_CONSUMED`].
+    pub const TAG_TCP_DATA: u64 = 11;
+    /// `[connection, 0, 0, 0]`: the buffer has been read; fill it again.
+    pub const TAG_TCP_CONSUMED: u64 = 12;
+    /// `[connection, 0, 0, 0]`: send what is in flight, then close.
+    pub const TAG_TCP_CLOSE: u64 = 13;
+    /// `[connection, reason, 0, 0]`.
+    pub const TAG_TCP_CLOSED: u64 = 14;
+
+    /// The peer will send nothing more. The connection still sends until it is
+    /// closed.
+    pub const CLOSED_PEER_FINISHED: u64 = 0;
+    /// Both sides are done and the connection is gone.
+    pub const CLOSED_FINISHED: u64 = 1;
+    /// The peer refused or reset it.
+    pub const CLOSED_RESET: u64 = 2;
+    /// Something sent was never acknowledged.
+    pub const CLOSED_TIMED_OUT: u64 = 3;
+    /// Every connection slot was taken.
+    pub const CLOSED_NO_ROOM: u64 = 4;
+
+    /// Most one segment carries, and so one send.
+    pub const TCP_MSS: usize = 1460;
+
     pub const fn address(a: u8, b: u8, c: u8, d: u8) -> u64 {
         (a as u64) << 24 | (b as u64) << 16 | (c as u64) << 8 | d as u64
     }
@@ -407,6 +450,16 @@ pub mod net {
 
 /// The `sender` of a message the kernel wrote itself. No thread has this id.
 pub const KERNEL_SENDER: u64 = u64::MAX;
+
+/// After `ms` milliseconds, the kernel sends [`TAG_TIMER`] with `cookie` to
+/// `endpoint`, which the caller must be able to receive on. Replaces the
+/// caller's earlier timer on that endpoint.
+pub fn timer_set(endpoint: u64, ms: u64, cookie: u64) -> i64 {
+    syscall(nr::TIMER_SET, endpoint, ms, cookie)
+}
+
+/// Tag of a timer's message from the kernel. `words[0]` is the cookie.
+pub const TAG_TIMER: u64 = 0x3_0000;
 
 /// Tag of an interrupt notification from the kernel. `words[0]` is the line.
 pub const TAG_IRQ: u64 = 0x1_0000;

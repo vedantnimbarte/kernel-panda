@@ -17,6 +17,8 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     thread,
@@ -97,6 +99,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
 
     // Kept between runs, so a panic is still there to read on the next boot.
     let crash = crash_disk("crash.img", false)?;
+    start_host_services();
     let code = match run_qemu(qemu_command(image, uefi, headless, &crash)?, timeout) {
         Ok(code) => code,
         // A timeout is the expected outcome when one was requested: the kernel
@@ -158,6 +161,7 @@ fn cmd_runner(args: &[String]) -> Result<ExitCode, String> {
     let image = if uefi { &images.uefi } else { &images.bios };
 
     let crash = crash_disk("crash-test.img", true)?;
+    start_host_services();
     let mut code = run_qemu(qemu_command(image, uefi, true, &crash)?, Some(TEST_TIMEOUT))?;
     if code == QEMU_EXIT_REBOOT {
         println!("xtask: rebooting");
@@ -327,6 +331,57 @@ const CRASH_PARTITION_TYPE: &[u8; 16] = b"KernelPandaCrash";
 /// against this, so it is fixed here rather than generated.
 const TFTP_FILE_CONTENTS: &str = "hello from the host, over TFTP\n";
 
+/// A TCP service on the host, which the guest reaches at 10.0.2.2. Must match
+/// `kernel/tests/net.rs`.
+const HOST_TCP_PORT: u16 = 47110;
+/// A host port QEMU forwards to the guest's port 80.
+const FORWARDED_PORT: u16 = 47111;
+
+/// What network tests talk to on the host, for as long as this process lives:
+///
+/// * a TCP server that greets, answers one line with "you said: " and that
+///   line, and closes;
+/// * a client that keeps connecting to the guest's port 80 until something
+///   there answers "hello from the host" with "hello from panda".
+///
+/// Neither matters to a kernel that does not use the network. A port already
+/// taken is left alone, and the test that needs it fails saying so.
+fn start_host_services() {
+    thread::spawn(|| {
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, HOST_TCP_PORT)) else {
+            return;
+        };
+        for mut stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = stream.write_all(b"hello from the host, over TCP\n");
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                    let _ = stream.write_all(format!("you said: {line}").as_bytes());
+                }
+            });
+        }
+    });
+
+    thread::spawn(|| {
+        let guest = SocketAddr::from((Ipv4Addr::LOCALHOST, FORWARDED_PORT));
+        loop {
+            thread::sleep(Duration::from_millis(500));
+            let Ok(mut stream) = TcpStream::connect_timeout(&guest, Duration::from_secs(1)) else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut answer = Vec::new();
+            if stream.write_all(b"hello from the host\n").is_ok()
+                && stream.read_to_end(&mut answer).is_ok()
+                && answer == b"hello from panda\n"
+            {
+                return;
+            }
+        }
+    });
+}
+
 /// The directory QEMU's TFTP server serves, holding `hello.txt`.
 fn tftp_root() -> Result<PathBuf, String> {
     let directory = workspace_root().join("target").join("images").join("tftp");
@@ -493,7 +548,7 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool, crash: &Path) -> Resul
     // and nothing to set up outside this process.
     let tftp = tftp_root()?;
     cmd.arg("-netdev")
-        .arg(format!("user,id=panda-net,tftp={}", qpath(&tftp)));
+        .arg(format!("user,id=panda-net,tftp={},hostfwd=tcp:127.0.0.1:{FORWARDED_PORT}-:80", qpath(&tftp)));
     cmd.args(["-device", "virtio-net-pci,netdev=panda-net"]);
 
     cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);

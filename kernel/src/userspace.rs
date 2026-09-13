@@ -202,6 +202,7 @@ pub mod probe {
     pub const WHOAMI: u64 = 11;
     pub const PERMISSIONS: u64 = 12;
     pub const LOGIN: u64 = 13;
+    pub const TCP: u64 = 14;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

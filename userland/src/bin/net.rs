@@ -1,4 +1,4 @@
-//! The network daemon: ARP, IPv4, ICMP and UDP, in Ring 3.
+//! The network daemon: ARP, IPv4, ICMP, UDP and TCP, in Ring 3.
 //!
 //! The kernel hands this process Ethernet frames and nothing else, so every
 //! byte that arrives from the network is parsed here, by a process with no
@@ -17,6 +17,11 @@
 //!   client asked for.
 //! * **UDP**: a client binds a port to a buffer it shares, and sends by naming a
 //!   buffer. Checksums are not sent -- IPv4 allows that -- and not checked.
+//! * **TCP**: connections opened and accepted, one segment in flight each way.
+//!   A client's send waits for its acknowledgement before the next, and the
+//!   receive side takes one segment into the client's buffer and closes its
+//!   window until the client has read it. Unacknowledged segments are resent on
+//!   a timer, backing off, until a connection gives up.
 
 #![no_std]
 #![no_main]
@@ -39,6 +44,7 @@ const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const PROTOCOL_ICMP: u8 = 1;
 const PROTOCOL_UDP: u8 = 17;
+const PROTOCOL_TCP: u8 = 6;
 const BROADCAST: [u8; 6] = [0xFF; 6];
 
 /// Identifier stamped on every echo request this daemon sends.
@@ -49,6 +55,79 @@ const WAITING_FRAMES: usize = 2;
 const PINGS: usize = 8;
 const BINDINGS: usize = 8;
 const MAPPINGS: usize = 8;
+const CONNECTIONS: usize = 8;
+const LISTENERS: usize = 4;
+
+const FIN: u8 = 0x01;
+const SYN: u8 = 0x02;
+const RST: u8 = 0x04;
+const PSH: u8 = 0x08;
+const ACK: u8 = 0x10;
+
+/// The resend timer's period, and the first resend's wait in its ticks.
+const TICK_MS: u64 = 200;
+const FIRST_RTO_TICKS: u32 = 5;
+const MAX_RTO_TICKS: u32 = 40;
+const MAX_RETRIES: u32 = 6;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum State {
+    #[default]
+    Free,
+    SynSent,
+    SynReceived,
+    Established,
+    /// Our FIN is out; theirs has not come.
+    FinWait1,
+    /// Our FIN is acknowledged; theirs has not come.
+    FinWait2,
+    /// Both FINs crossed; ours is not acknowledged yet.
+    Closing,
+    /// Their FIN came; ours has not gone.
+    CloseWait,
+    /// Their FIN came, and ours is out.
+    LastAck,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Connection {
+    state: State,
+    /// The thread that opened or accepted it, and the only one that may use it.
+    owner: u64,
+    reply: u64,
+    remote: u32,
+    remote_port: u16,
+    local_port: u16,
+    /// The client's receive buffer, and how much of it holds data.
+    base: u64,
+    size: u64,
+    filled: usize,
+    /// Data is waiting in the buffer for the client, so the window is shut.
+    delivered: bool,
+    /// Oldest sequence number not acknowledged, and the next to send. Something
+    /// is in flight whenever they differ.
+    unacknowledged: u32,
+    next_send: u32,
+    next_receive: u32,
+    /// What is in flight, to send again: its flags, and its data, which stays
+    /// in the client's buffer.
+    flight_flags: u8,
+    flight_base: u64,
+    flight_length: usize,
+    close_requested: bool,
+    waited: u32,
+    timeout: u32,
+    retries: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Listener {
+    port: u16,
+    owner: u64,
+    reply: u64,
+    base: u64,
+    size: u64,
+}
 
 #[derive(Clone, Copy)]
 struct Waiting {
@@ -89,6 +168,12 @@ struct Stack {
     /// Buffers mapped into this process: handle, base, size.
     mappings: [(u64, u64, u64); MAPPINGS],
     next_identification: u16,
+    control: u64,
+    connections: [Connection; CONNECTIONS],
+    listeners: [Listener; LISTENERS],
+    timer_armed: bool,
+    next_port: u16,
+    next_sequence_start: u32,
 }
 
 extern "C" fn main(parameters: u64) {
@@ -120,6 +205,14 @@ extern "C" fn main(parameters: u64) {
         bindings: [Binding::default(); BINDINGS],
         mappings: [(0, 0, 0); MAPPINGS],
         next_identification: 1,
+        control: parameters.control,
+        connections: [Connection::default(); CONNECTIONS],
+        listeners: [Listener::default(); LISTENERS],
+        timer_armed: false,
+        next_port: 49152,
+        // No entropy source, so initial sequence numbers are predictable from
+        // the MAC; see the README.
+        next_sequence_start: u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]),
     };
 
     // Anything that arrived before the bind was announced to nobody.
@@ -133,6 +226,8 @@ extern "C" fn main(parameters: u64) {
         if message.sender == user::KERNEL_SENDER {
             if message.tag == user::TAG_NET_RECEIVED {
                 stack.drain();
+            } else if message.tag == user::TAG_TIMER {
+                stack.tick();
             }
             continue;
         }
@@ -158,19 +253,37 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
 /// The Internet checksum: the ones' complement of the ones' complement sum of
 /// the bytes taken as big-endian 16-bit words.
 fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
+    fold(add_words(0, bytes))
+}
+
+fn add_words(mut sum: u64, bytes: &[u8]) -> u64 {
     for pair in bytes.chunks(2) {
         let word = if pair.len() == 2 {
             u16::from_be_bytes([pair[0], pair[1]])
         } else {
             u16::from_be_bytes([pair[0], 0])
         };
-        sum += word as u32;
+        sum += word as u64;
     }
+    sum
+}
+
+fn fold(mut sum: u64) -> u16 {
     while sum > 0xFFFF {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+/// A TCP checksum: over a pseudo-header of the addresses, protocol and length,
+/// then the segment. Zero when checking a segment that carries a good one.
+fn tcp_checksum(source: u32, destination: u32, segment: &[u8]) -> u16 {
+    let mut pseudo = [0u8; 12];
+    pseudo[0..4].copy_from_slice(&source.to_be_bytes());
+    pseudo[4..8].copy_from_slice(&destination.to_be_bytes());
+    pseudo[9] = PROTOCOL_TCP;
+    pseudo[10..12].copy_from_slice(&(segment.len() as u16).to_be_bytes());
+    fold(add_words(add_words(0, &pseudo), segment))
 }
 
 impl Stack {
@@ -281,6 +394,7 @@ impl Stack {
         match packet[9] {
             PROTOCOL_ICMP => self.icmp(source, payload),
             PROTOCOL_UDP => self.udp(source, payload),
+            PROTOCOL_TCP => self.tcp(source, payload),
             _ => {}
         }
     }
@@ -421,6 +535,29 @@ impl Stack {
             net::TAG_PING => self.ping(a as u32, b, c),
             net::TAG_UDP_BIND => self.bind(a as u16, b, c),
             net::TAG_UDP_SEND => self.send_udp(a, b as usize, c as u32, (d >> 16) as u16, d as u16),
+            net::TAG_TCP_CONNECT => self.connect(message.sender, a as u32, (b >> 16) as u16, b as u16, c, d),
+            net::TAG_TCP_LISTEN => self.listen(message.sender, a as u16, b, c),
+            _ => {}
+        }
+
+        // The rest name a connection, and only its owner may use it.
+        let index = a as usize;
+        if index >= CONNECTIONS
+            || self.connections[index].state == State::Free
+            || self.connections[index].owner != message.sender
+        {
+            return;
+        }
+        match message.tag {
+            net::TAG_TCP_SEND => self.send_tcp(index, b, c as usize),
+            net::TAG_TCP_CONSUMED => {
+                let connection = &mut self.connections[index];
+                connection.filled = 0;
+                connection.delivered = false;
+                // The window opens again: say so, or the peer never sends.
+                self.send_ack(index);
+            }
+            net::TAG_TCP_CLOSE => self.close(index),
             _ => {}
         }
     }
@@ -502,5 +639,408 @@ impl Stack {
         // was checked against it.
         unsafe { core::ptr::copy_nonoverlapping(base as *const u8, datagram[8..].as_mut_ptr(), length) };
         self.send_ipv4(destination, PROTOCOL_UDP, &datagram[..8 + length]);
+    }
+}
+
+// --- TCP ---------------------------------------------------------------------
+
+impl Stack {
+    fn tcp(&mut self, source: u32, segment: &[u8]) {
+        if segment.len() < 20 || tcp_checksum(source, self.address, segment) != 0 {
+            return;
+        }
+        let remote_port = read_u16(segment, 0);
+        let local_port = read_u16(segment, 2);
+        let sequence = read_u32(segment, 4);
+        let acknowledgement = read_u32(segment, 8);
+        let offset = (segment[12] >> 4) as usize * 4;
+        let flags = segment[13];
+        if offset < 20 || offset > segment.len() {
+            return;
+        }
+        let payload = &segment[offset..];
+
+        let found = self.connections.iter().position(|c| {
+            c.state != State::Free && c.remote == source && c.remote_port == remote_port && c.local_port == local_port
+        });
+        let Some(index) = found else {
+            if flags & RST != 0 {
+                return;
+            }
+            if flags & SYN != 0 && flags & ACK == 0 && self.accept(source, remote_port, local_port, sequence) {
+                return;
+            }
+            // Nothing here: refuse, in the form RFC 793 asks for.
+            let length = payload.len() as u32 + (flags & (SYN | FIN) != 0) as u32;
+            if flags & ACK != 0 {
+                self.segment(source, local_port, remote_port, acknowledgement, 0, RST, 0, &[]);
+            } else {
+                let ack = sequence.wrapping_add(length);
+                self.segment(source, local_port, remote_port, 0, ack, RST | ACK, 0, &[]);
+            }
+            return;
+        };
+
+        let connection = self.connections[index];
+        if flags & RST != 0 {
+            // Believed only at the expected place, so a blind guess cannot
+            // tear a connection down.
+            let expected = match connection.state {
+                State::SynSent => flags & ACK != 0 && acknowledgement == connection.next_send,
+                _ => sequence == connection.next_receive,
+            };
+            if expected {
+                self.finish(index, net::CLOSED_RESET);
+            }
+            return;
+        }
+
+        match connection.state {
+            State::SynSent => {
+                if flags & (SYN | ACK) == SYN | ACK && acknowledgement == connection.next_send {
+                    let connection = &mut self.connections[index];
+                    connection.next_receive = sequence.wrapping_add(1);
+                    connection.state = State::Established;
+                    self.flight_landed(index);
+                    self.send_ack(index);
+                    self.announce_open(index);
+                }
+                return;
+            }
+            State::SynReceived => {
+                if flags & ACK == 0 || acknowledgement != connection.next_send {
+                    return;
+                }
+                self.connections[index].state = State::Established;
+                self.flight_landed(index);
+                self.announce_open(index);
+            }
+            _ => {
+                let in_flight = connection.unacknowledged != connection.next_send;
+                if flags & ACK != 0 && in_flight && acknowledgement == connection.next_send {
+                    self.flight_landed(index);
+                }
+            }
+        }
+
+        let receiving = matches!(
+            self.connections[index].state,
+            State::Established | State::FinWait1 | State::FinWait2
+        );
+        let mut accepted = payload.is_empty();
+        if !payload.is_empty() && receiving {
+            let connection = &mut self.connections[index];
+            let fits = connection.filled + payload.len() <= connection.size as usize;
+            if sequence == connection.next_receive && !connection.delivered && fits {
+                // SAFETY: the client's buffer, mapped with `size` bytes, and the
+                // copy was just checked to fit.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        (connection.base as usize + connection.filled) as *mut u8,
+                        payload.len(),
+                    )
+                };
+                connection.filled += payload.len();
+                connection.next_receive = connection.next_receive.wrapping_add(payload.len() as u32);
+                connection.delivered = true;
+                accepted = true;
+                let words = [index as u64, connection.filled as u64, 0, 0];
+                self.tell(index, net::TAG_TCP_DATA, words);
+            }
+        }
+
+        let connection = self.connections[index];
+        let fin_in_order = flags & FIN != 0
+            && accepted
+            && sequence.wrapping_add(payload.len() as u32) == connection.next_receive;
+        if fin_in_order && receiving {
+            self.connections[index].next_receive = connection.next_receive.wrapping_add(1);
+            self.send_ack(index);
+            match connection.state {
+                State::Established => {
+                    self.connections[index].state = State::CloseWait;
+                    self.tell(index, net::TAG_TCP_CLOSED, [index as u64, net::CLOSED_PEER_FINISHED, 0, 0]);
+                }
+                State::FinWait1 => self.connections[index].state = State::Closing,
+                _ => self.finish(index, net::CLOSED_FINISHED),
+            }
+        } else if !payload.is_empty() || flags & FIN != 0 {
+            // Taken or not, say where this side is, so the peer knows what to
+            // send again. A repeated FIN whose acknowledgement was lost lands here.
+            self.send_ack(index);
+        }
+    }
+
+    /// A SYN for a port someone is listening on becomes a connection.
+    fn accept(&mut self, source: u32, remote_port: u16, local_port: u16, sequence: u32) -> bool {
+        let Some(listener) = self.listeners.iter().position(|l| l.port == local_port && l.base != 0) else {
+            return false;
+        };
+        let Some(index) = self.connections.iter().position(|c| c.state == State::Free) else {
+            return false;
+        };
+        let listening = core::mem::take(&mut self.listeners[listener]);
+        let start = self.sequence_start();
+        self.connections[index] = Connection {
+            state: State::SynReceived,
+            owner: listening.owner,
+            reply: listening.reply,
+            remote: source,
+            remote_port,
+            local_port,
+            base: listening.base,
+            size: listening.size,
+            unacknowledged: start,
+            next_send: start,
+            next_receive: sequence.wrapping_add(1),
+            ..Connection::default()
+        };
+        self.start_flight(index, SYN, 0, 0);
+        true
+    }
+
+    fn sequence_start(&mut self) -> u32 {
+        self.next_sequence_start = self.next_sequence_start.wrapping_add(0x0101_7F31);
+        self.next_sequence_start
+    }
+
+    fn connect(&mut self, owner: u64, address: u32, local_port: u16, remote_port: u16, reply: u64, buffer: u64) {
+        let Some((base, size)) = self.mapping(buffer) else {
+            return;
+        };
+        let Some(index) = self.connections.iter().position(|c| c.state == State::Free) else {
+            let words = [u64::MAX, net::CLOSED_NO_ROOM, 0, 0];
+            user::ipc_send(reply, &user::Message { tag: net::TAG_TCP_CLOSED, words, sender: 0, sender_user: 0 });
+            return;
+        };
+        let local_port = if local_port != 0 {
+            local_port
+        } else {
+            self.next_port = self.next_port.checked_add(1).unwrap_or(49152);
+            self.next_port
+        };
+        let start = self.sequence_start();
+        self.connections[index] = Connection {
+            state: State::SynSent,
+            owner,
+            reply,
+            remote: address,
+            remote_port,
+            local_port,
+            base,
+            size,
+            unacknowledged: start,
+            next_send: start,
+            ..Connection::default()
+        };
+        self.start_flight(index, SYN, 0, 0);
+    }
+
+    fn listen(&mut self, owner: u64, port: u16, reply: u64, buffer: u64) {
+        let Some((base, size)) = self.mapping(buffer) else {
+            return;
+        };
+        let slot = self.listeners.iter().position(|l| l.base == 0 || (l.port == port && l.owner == owner));
+        if let Some(slot) = slot {
+            self.listeners[slot] = Listener { port, owner, reply, base, size };
+        }
+    }
+
+    fn send_tcp(&mut self, index: usize, buffer: u64, length: usize) {
+        let connection = self.connections[index];
+        let open = matches!(connection.state, State::Established | State::CloseWait);
+        let idle = connection.unacknowledged == connection.next_send && !connection.close_requested;
+        let mapped = self.mapping(buffer);
+        match mapped {
+            Some((base, size)) if open && idle && length > 0 && length <= net::TCP_MSS && length <= size as usize => {
+                self.start_flight(index, PSH, base, length);
+            }
+            _ => self.tell(index, net::TAG_TCP_SENT, [index as u64, 0, 0, 0]),
+        }
+    }
+
+    fn close(&mut self, index: usize) {
+        let connection = self.connections[index];
+        match connection.state {
+            State::SynSent | State::SynReceived => {
+                self.send_reset(index);
+                self.finish(index, net::CLOSED_FINISHED);
+            }
+            State::Established | State::CloseWait if connection.unacknowledged == connection.next_send => {
+                self.send_fin(index);
+            }
+            State::Established | State::CloseWait => self.connections[index].close_requested = true,
+            _ => {}
+        }
+    }
+
+    fn send_fin(&mut self, index: usize) {
+        let connection = &mut self.connections[index];
+        connection.state = match connection.state {
+            State::CloseWait => State::LastAck,
+            _ => State::FinWait1,
+        };
+        self.start_flight(index, FIN, 0, 0);
+    }
+
+    /// What was in flight has been acknowledged.
+    fn flight_landed(&mut self, index: usize) {
+        let connection = &mut self.connections[index];
+        connection.unacknowledged = connection.next_send;
+        let (flags, length) = (connection.flight_flags, connection.flight_length);
+        connection.flight_flags = 0;
+        connection.flight_length = 0;
+
+        if flags & FIN != 0 {
+            match connection.state {
+                State::FinWait1 => connection.state = State::FinWait2,
+                State::Closing | State::LastAck => self.finish(index, net::CLOSED_FINISHED),
+                _ => {}
+            }
+            return;
+        }
+        if length > 0 {
+            self.tell(index, net::TAG_TCP_SENT, [index as u64, length as u64, 0, 0]);
+        }
+        let connection = self.connections[index];
+        if connection.close_requested && matches!(connection.state, State::Established | State::CloseWait) {
+            self.connections[index].close_requested = false;
+            self.send_fin(index);
+        }
+    }
+
+    /// Put something in flight and send it. A SYN and a FIN each take a
+    /// sequence number, as data takes one per byte.
+    fn start_flight(&mut self, index: usize, flags: u8, base: u64, length: usize) {
+        let connection = &mut self.connections[index];
+        connection.unacknowledged = connection.next_send;
+        connection.next_send = connection
+            .next_send
+            .wrapping_add(length as u32 + (flags & (SYN | FIN) != 0) as u32);
+        connection.flight_flags = flags;
+        connection.flight_base = base;
+        connection.flight_length = length;
+        connection.waited = 0;
+        connection.timeout = FIRST_RTO_TICKS;
+        connection.retries = 0;
+        self.transmit(index);
+        self.arm_timer();
+    }
+
+    fn transmit(&mut self, index: usize) {
+        let connection = self.connections[index];
+        let mut flags = connection.flight_flags;
+        if connection.state != State::SynSent {
+            flags |= ACK;
+        }
+        // SAFETY: a buffer mapped into this process with at least `length`
+        // bytes; `send_tcp` checked the length against it.
+        let data = unsafe { core::slice::from_raw_parts(connection.flight_base as *const u8, connection.flight_length) };
+        let mut payload = [0u8; net::TCP_MSS];
+        payload[..data.len()].copy_from_slice(data);
+        self.connection_segment(index, connection.unacknowledged, flags, &payload[..data.len()]);
+    }
+
+    fn send_ack(&mut self, index: usize) {
+        let sequence = self.connections[index].next_send;
+        self.connection_segment(index, sequence, ACK, &[]);
+    }
+
+    fn send_reset(&mut self, index: usize) {
+        let sequence = self.connections[index].next_send;
+        self.connection_segment(index, sequence, RST, &[]);
+    }
+
+    fn connection_segment(&mut self, index: usize, sequence: u32, flags: u8, payload: &[u8]) {
+        let c = self.connections[index];
+        // Shut while the client has data to read, so nothing arrives that
+        // there is no room for.
+        let window = if c.delivered { 0 } else { (c.size as usize - c.filled).min(0xFFFF) as u16 };
+        self.segment(c.remote, c.local_port, c.remote_port, sequence, c.next_receive, flags, window, payload);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn segment(
+        &mut self,
+        destination: u32,
+        local_port: u16,
+        remote_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        flags: u8,
+        window: u16,
+        payload: &[u8],
+    ) {
+        let mut segment = [0u8; 24 + net::TCP_MSS];
+        // A SYN carries one option: the largest segment this side takes.
+        let header = if flags & SYN != 0 { 24 } else { 20 };
+        segment[0..2].copy_from_slice(&local_port.to_be_bytes());
+        segment[2..4].copy_from_slice(&remote_port.to_be_bytes());
+        segment[4..8].copy_from_slice(&sequence.to_be_bytes());
+        if flags & ACK != 0 {
+            segment[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
+        }
+        segment[12] = (header as u8 / 4) << 4;
+        segment[13] = flags;
+        segment[14..16].copy_from_slice(&window.to_be_bytes());
+        if header == 24 {
+            segment[20..24].copy_from_slice(&[2, 4, 0x05, 0xB4]);
+        }
+        segment[header..header + payload.len()].copy_from_slice(payload);
+        let length = header + payload.len();
+        let sum = tcp_checksum(self.address, destination, &segment[..length]);
+        segment[16..18].copy_from_slice(&sum.to_be_bytes());
+        self.send_ipv4(destination, PROTOCOL_TCP, &segment[..length]);
+    }
+
+    fn announce_open(&mut self, index: usize) {
+        let c = self.connections[index];
+        let words = [index as u64, c.remote as u64, c.remote_port as u64, c.local_port as u64];
+        self.tell(index, net::TAG_TCP_OPEN, words);
+    }
+
+    fn tell(&self, index: usize, tag: u64, words: [u64; 4]) {
+        let message = user::Message { tag, words, sender: 0, sender_user: 0 };
+        user::ipc_send(self.connections[index].reply, &message);
+    }
+
+    /// The connection is over: tell its owner why and free the slot.
+    fn finish(&mut self, index: usize, reason: u64) {
+        self.tell(index, net::TAG_TCP_CLOSED, [index as u64, reason, 0, 0]);
+        self.connections[index] = Connection::default();
+    }
+
+    fn arm_timer(&mut self) {
+        let waiting = self.connections.iter().any(|c| c.state != State::Free && c.unacknowledged != c.next_send);
+        if waiting && !self.timer_armed && user::timer_set(self.control, TICK_MS, 0) >= 0 {
+            self.timer_armed = true;
+        }
+    }
+
+    /// Resend what has waited too long, and give up on what has been resent
+    /// too often.
+    fn tick(&mut self) {
+        self.timer_armed = false;
+        for index in 0..CONNECTIONS {
+            let connection = &mut self.connections[index];
+            if connection.state == State::Free || connection.unacknowledged == connection.next_send {
+                continue;
+            }
+            connection.waited += 1;
+            if connection.waited < connection.timeout {
+                continue;
+            }
+            connection.retries += 1;
+            if connection.retries > MAX_RETRIES {
+                self.send_reset(index);
+                self.finish(index, net::CLOSED_TIMED_OUT);
+                continue;
+            }
+            connection.waited = 0;
+            connection.timeout = (connection.timeout * 2).min(MAX_RTO_TICKS);
+            self.transmit(index);
+        }
+        self.arm_timer();
     }
 }

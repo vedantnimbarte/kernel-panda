@@ -47,6 +47,7 @@ pub mod numbers {
     pub const FILE_OWNER: u64 = 32;
     pub const FILE_CHMOD: u64 = 33;
     pub const LOGIN: u64 = 34;
+    pub const TIMER_SET: u64 = 35;
 }
 
 /// Returned in RAX as a negative value.
@@ -194,6 +195,7 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::FILE_OWNER => sys_file_owner(frame.rdi, frame.rsi),
         numbers::FILE_CHMOD => sys_file_chmod(frame.rdi, frame.rsi, frame.rdx),
         numbers::LOGIN => sys_login(frame.rdi, frame.rsi, frame.rdx, frame.r10),
+        numbers::TIMER_SET => crate::timer::sys_set(frame.rdi, frame.rsi, frame.rdx),
         _ => Err(Error::UnknownCall),
     };
 

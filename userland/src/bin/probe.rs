@@ -26,6 +26,7 @@ pub const MODE_RING_MOVE_HEAD: u64 = 10;
 pub const MODE_WHOAMI: u64 = 11;
 pub const MODE_PERMISSIONS: u64 = 12;
 pub const MODE_LOGIN: u64 = 13;
+pub const MODE_TCP: u64 = 14;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -216,6 +217,99 @@ extern "C" fn main(parameters: u64) {
                 words[1 + index / 8] |= (*byte as u64) << (8 * (index % 8));
             }
             user::ipc_send(parameters.report, &user::Message { tag: 0x7F7F, words, sender: 0, sender_user: 0 });
+        }
+
+        // One TCP conversation through the network daemon. `address` is a port:
+        // with bit 63 set, listen on it; otherwise connect to it on the host,
+        // 10.0.2.2. Either way, answer the first line that arrives with
+        // "hello from panda", then close once the other side has. Reports the
+        // bytes received, their FNV-1a hash, and why the connection ended --
+        // or u64::MAX, the reason, and the step, if it never opened.
+        MODE_TCP => {
+            use user::net;
+            let report = |words: [u64; 4]| {
+                user::ipc_send(parameters.report, &user::Message { tag: 0x7C7C, words, sender: 0, sender_user: 0 });
+                user::exit(0)
+            };
+            let send = |tag: u64, words: [u64; 4]| {
+                user::ipc_send(parameters.endpoint, &user::Message { tag, words, sender: 0, sender_user: 0 });
+            };
+
+            let reply = user::ipc_create(8);
+            if reply < 0 || user::ipc_grant(reply as u64, parameters.daemon, 1) < 0 {
+                report([u64::MAX, 0, 1, 0]);
+            }
+            let reply = reply as u64;
+            let (receive, transmit) = (user::buffer_create(1024, 1), user::buffer_create(256, 1));
+            if receive < 0 || transmit < 0 {
+                report([u64::MAX, 0, 2, 0]);
+            }
+            let (receive, transmit) = (receive as u64, transmit as u64);
+            if user::buffer_share(receive, parameters.daemon) < 0 || user::buffer_share(transmit, parameters.daemon) < 0 {
+                report([u64::MAX, 0, 3, 0]);
+            }
+            let (receive_base, transmit_base) = (user::buffer_map(receive), user::buffer_map(transmit));
+            if receive_base < 0 || transmit_base < 0 {
+                report([u64::MAX, 0, 4, 0]);
+            }
+
+            let port = parameters.address as u16;
+            if parameters.address >> 63 != 0 {
+                send(net::TAG_TCP_LISTEN, [port as u64, reply, receive, 0]);
+            } else {
+                send(net::TAG_TCP_CONNECT, [net::address(10, 0, 2, 2), port as u64, reply, receive]);
+            }
+
+            let mut message = user::Message::default();
+            if user::ipc_receive(reply, &mut message) < 0 {
+                report([u64::MAX, 0, 5, 0]);
+            }
+            if message.tag != net::TAG_TCP_OPEN {
+                report([u64::MAX, message.words[1], 6, 0]);
+            }
+            let connection = message.words[0];
+
+            let mut received = [0u8; 256];
+            let mut total = 0usize;
+            let mut answered = false;
+            let reason = loop {
+                if user::ipc_receive(reply, &mut message) < 0 {
+                    report([u64::MAX, 0, 7, 0]);
+                }
+                match message.tag {
+                    net::TAG_TCP_DATA => {
+                        let length = message.words[1] as usize;
+                        // SAFETY: the daemon wrote `length` bytes at the start of
+                        // the mapped receive buffer, never more than its size.
+                        let data = unsafe { core::slice::from_raw_parts(receive_base as *const u8, length) };
+                        let take = length.min(received.len() - total);
+                        received[total..total + take].copy_from_slice(&data[..take]);
+                        total += take;
+                        send(net::TAG_TCP_CONSUMED, [connection, 0, 0, 0]);
+
+                        if !answered && received[..total].contains(&b'\n') {
+                            answered = true;
+                            let line = b"hello from panda\n";
+                            // SAFETY: this process's mapped buffer, far larger
+                            // than the line, which stays put until acknowledged.
+                            unsafe { core::ptr::copy_nonoverlapping(line.as_ptr(), transmit_base as *mut u8, line.len()) };
+                            send(net::TAG_TCP_SEND, [connection, transmit, line.len() as u64, 0]);
+                        }
+                    }
+                    net::TAG_TCP_SENT if message.words[1] == 0 => report([u64::MAX, 0, 8, 0]),
+                    net::TAG_TCP_SENT => {}
+                    net::TAG_TCP_CLOSED if message.words[1] == net::CLOSED_PEER_FINISHED => {
+                        send(net::TAG_TCP_CLOSE, [connection, 0, 0, 0]);
+                    }
+                    net::TAG_TCP_CLOSED => break message.words[1],
+                    _ => {}
+                }
+            };
+
+            let hash = received[..total]
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3));
+            report([total as u64, hash, reason, 0]);
         }
 
         // The two ends of a ring. `endpoint` is the ring, `daemon` the message

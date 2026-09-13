@@ -136,7 +136,7 @@ fn me() -> ThreadId {
 
 static CONTROL: AtomicU64 = AtomicU64::new(0);
 static STACK: AtomicU64 = AtomicU64::new(u64::MAX);
-static PROBE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static PROBE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 fn stack_thread() {
     let owner = me();
@@ -184,7 +184,8 @@ fn probe_thread() {
     let (daemon, report) = (STACK.load(Ordering::Acquire), second);
     // Probe parameters: mode, address, endpoint, daemon, report.
     // SAFETY: the parameter page just mapped for a program not yet running.
-    unsafe { userspace::write_parameters(image.data, &[mode, 0, first, daemon, report]) };
+    let address = PROBE[3].load(Ordering::Acquire);
+    unsafe { userspace::write_parameters(image.data, &[mode, address, first, daemon, report]) };
     // SAFETY: as in `stack_thread`.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
@@ -251,6 +252,7 @@ fn stack_serves_a_process_fetching_a_file_over_udp() {
 fn stack_is_the_only_process_that_can_send_frames() {
     stack();
     let report = ipc::create(me(), 4).expect("create failed");
+    PROBE[3].store(0, Ordering::Release);
     PROBE[0].store(userspace::probe::DEVICE, Ordering::Release);
     PROBE[1].store(report.0, Ordering::Release);
     PROBE[2].store(0, Ordering::Release);
@@ -267,3 +269,56 @@ fn stack_is_the_only_process_that_can_send_frames() {
         "a process other than the stack put a frame on the wire"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TCP, against services xtask runs on the host
+// ---------------------------------------------------------------------------
+
+/// What xtask's host services use. Must match xtask.
+const HOST_TCP_PORT: u64 = 47110;
+const FORWARDED_PORT: u64 = 80;
+
+const CLOSED_FINISHED: u64 = 1;
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Run the TCP probe with `address` and wait for its report.
+fn tcp_probe(address: u64) -> [u64; 4] {
+    let (control, _) = stack();
+    let report = ipc::create(me(), 4).expect("create failed");
+    PROBE[0].store(userspace::probe::TCP, Ordering::Release);
+    PROBE[1].store(control.0, Ordering::Release);
+    PROBE[2].store(report.0, Ordering::Release);
+    PROBE[3].store(address, Ordering::Release);
+    sync::without_interrupts(|| {
+        let id = sched::spawn("tcp-probe", probe_thread).expect("spawn failed");
+        ipc::grant(me(), id, control, Rights::SEND).expect("grant failed");
+        ipc::grant(me(), id, report, Rights::SEND).expect("grant failed");
+    });
+    assert!(spin_until(|| ipc::queued(report) > 0), "the TCP probe reported nothing");
+    ipc::receive(me(), report).expect("receive failed").words
+}
+
+#[test_case]
+fn stack_tcp_connects_out_and_talks_both_ways() {
+    let [length, hash, reason, _] = tcp_probe(HOST_TCP_PORT);
+    assert_ne!(length, u64::MAX, "the connection never opened: reason {hash}, step {reason}");
+    // The host greets, answers the probe's line, and closes.
+    let expected = b"hello from the host, over TCP\nyou said: hello from panda\n";
+    assert_eq!(length, expected.len() as u64, "the probe received the wrong number of bytes");
+    assert_eq!(hash, fnv1a(expected), "the bytes received were not the host's");
+    assert_eq!(reason, CLOSED_FINISHED, "the connection did not close cleanly");
+}
+
+#[test_case]
+fn stack_tcp_accepts_a_connection_in() {
+    let [length, hash, reason, _] = tcp_probe(1 << 63 | FORWARDED_PORT);
+    assert_ne!(length, u64::MAX, "no connection was accepted: reason {hash}, step {reason}");
+    let expected = b"hello from the host\n";
+    assert_eq!(length, expected.len() as u64, "the probe received the wrong number of bytes");
+    assert_eq!(hash, fnv1a(expected), "the bytes received were not the host's");
+    assert_eq!(reason, CLOSED_FINISHED, "the connection did not close cleanly");
+}
+

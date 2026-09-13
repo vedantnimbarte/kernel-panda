@@ -23,11 +23,11 @@ stack running as an unprivileged process.
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
 | IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities, and shared message rings that cost no system call per message |
 | Devices | Local APIC and I/O APIC, PCIe with ECAM and MSI-X, AHCI, NVMe and virtio-blk storage, virtio-net, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
-| Networking | ARP, IPv4, ICMP echo and UDP in a Ring 3 daemon; the kernel only moves Ethernet frames |
+| Networking | ARP, IPv4, ICMP echo, UDP and TCP in a Ring 3 daemon; the kernel only moves Ethernet frames |
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 210 cases across 27 boot-and-assert test kernels, run on four cores
+**Testing:** 214 cases across 27 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -157,6 +157,7 @@ kernel-panda/
     │   ├── ring.rs       message rings two processes share
     │   ├── pci.rs        bus enumeration, BAR decoding, ECAM, MSI-X
     │   ├── net.rs        the virtio-net driver and the frame-moving syscalls
+    │   ├── timer.rs      one-shot timers, delivered as messages
     │   ├── virtio.rs     virtio's legacy PCI interface and virtqueues, shared
     │   └── gbm.rs        shared graphics buffers and the scanout
     └── tests/       one standalone boot-and-assert kernel per file
@@ -782,7 +783,7 @@ the kernel, or from the thread the kernel has named as the input daemon — and
 naming it is a message only the kernel can send.
 
 **The network stack is a process; the kernel moves frames.** Everything that
-parses bytes from the network — ARP, IPv4 headers, ICMP, UDP — runs in a Ring 3
+parses bytes from the network — ARP, IPv4 headers, ICMP, UDP, TCP — runs in a Ring 3
 daemon, so a malformed packet that finds a bug there kills an unprivileged
 process. The kernel's part is four system calls: the card's MAC, send a frame,
 take a frame, and have arrivals announced on an endpoint. Only the one thread
@@ -806,6 +807,27 @@ pings, and its built-in TFTP server hands out a file xtask writes, so the UDP
 path is checked byte for byte with nothing outside the emulator. The first
 driver offered its buffers in the descriptor table rather than the ring after
 it; QEMU's trace of a queue notified and never popped is what found it.
+
+**TCP holds one segment in flight each way, and waits on the client for both.**
+A send is up to one segment from a buffer the client shared, and is answered
+once the peer acknowledges it; the next send waits for that. Arriving data goes
+into the client's buffer and the window closes until the client says it has
+read it, so nothing arrives that there is no room for. What is not acknowledged
+is sent again from the client's buffer — the daemon keeps no copy, so a
+connection costs it a few dozen bytes — after a second, then two, and so on to
+eight, and after six tries the connection is reset and reported as timed out.
+Only the thread that opened or accepted a connection may use it; the daemon
+checks the sender the kernel stamped on each request.
+
+Resending needs time, and a Ring 3 process had no sense of it. A timer is now a
+system call: after a delay the kernel sends a message to an endpoint the caller
+can receive on, so a daemon waiting for a packet and waiting for a deadline is
+waiting in one place. It runs off the tick that wakes sleeping threads.
+
+The tests reach services xtask runs on the host for as long as a test kernel
+does: a server the guest connects out to, which greets, answers a line and
+closes, and a client that keeps connecting in, through a port QEMU forwards,
+until the guest answers it.
 
 **A disk behind SATA, NVMe or virtio looks the same from above.** The block layer
 asks for sectors by number, and each driver answers through the same interface,
@@ -927,6 +949,12 @@ everything owned by the system and closed to all.
   daemon holds two frames while an address resolves and drops the rest, keeps
   one datagram per bound port, does not reassemble fragments, and neither sends
   nor checks UDP checksums.
+* TCP drops out-of-order segments and waits for them to be sent again, ignores
+  the peer's window and options, has no congestion control and no TIME-WAIT,
+  and picks initial sequence numbers from the MAC and a counter, so they are
+  predictable. Resending after a timeout is not tested: QEMU's network loses
+  nothing, and a connection QEMU cannot complete to the host is never refused,
+  only left to time out, which takes longer than a test kernel may run.
 * Accounts are added only by kernel code; there is no system call to add one or
   to change a password. Salts are unique but not unpredictable — there is no
   entropy source — and adding two accounts at once can lose one.
@@ -938,7 +966,7 @@ everything owned by the system and closed to all.
 
 The gaps that matter, so nobody has to discover them by trying:
 
-* **TCP, DHCP, DNS, IPv6.** The stack speaks ARP, IPv4, ICMP echo and UDP, with
+* **DHCP, DNS, IPv6.** The stack speaks ARP, IPv4, ICMP echo, UDP and TCP, with
   its address given at start-up.
 * **A libc or a toolchain for third-party software.** Programs are built in this
   repository's `userland` workspace against its own syscall wrappers.

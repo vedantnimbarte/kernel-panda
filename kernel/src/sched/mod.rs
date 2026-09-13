@@ -920,6 +920,7 @@ pub fn on_timer_tick() {
     if sleeper_due {
         wake_due_sleepers(now);
     }
+    crate::timer::on_tick(now);
 
     if slice_expired {
         schedule();

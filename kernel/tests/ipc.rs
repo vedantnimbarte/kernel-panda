@@ -18,7 +18,7 @@ use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::ipc::{self, EndpointId, Message, Rights};
 use panda_kernel::sched::ThreadId;
 use panda_kernel::syscall::Error;
-use panda_kernel::{arch::x86_64::halt_loop, sched, sync, testing, userspace, BOOTLOADER_CONFIG};
+use panda_kernel::{arch::x86_64::halt_loop, sched, sync, testing, time, timer, userspace, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -469,4 +469,39 @@ fn a_ring3_process_can_send_through_a_granted_capability() {
         "the sender field was not replaced with the real Ring 3 sender -- the \
          user program wrote 999 into it"
     );
+}
+
+#[test_case]
+fn a_timer_is_a_message_from_the_kernel_after_its_delay() {
+    let endpoint = ipc::create(me(), 4).expect("create failed");
+    let start = time::uptime_ms();
+    timer::sys_set(endpoint.0, 100, 0xC0FFEE).expect("setting a timer failed");
+    let message = ipc::receive(me(), endpoint).expect("receive failed");
+    let elapsed = time::uptime_ms() - start;
+
+    assert_eq!(message.tag, timer::TAG_TIMER);
+    assert_eq!(message.words[0], 0xC0FFEE, "the timer carried the wrong cookie");
+    assert_eq!(message.sender, ipc::KERNEL_SENDER, "a timer's message did not come from the kernel");
+    // One tick of slack for where in a tick it was set.
+    assert!(elapsed + 10 >= 100, "the timer fired after {elapsed} ms of 100");
+
+    // Setting another on the same endpoint replaces the first.
+    timer::sys_set(endpoint.0, 30, 1).expect("setting a timer failed");
+    timer::sys_set(endpoint.0, 30, 2).expect("setting a timer failed");
+    sched::sleep_ms(200);
+    assert_eq!(ipc::queued(endpoint), 1, "a replaced timer fired as well");
+    assert_eq!(ipc::receive(me(), endpoint).expect("receive failed").words[0], 2);
+}
+
+#[test_case]
+fn a_timer_needs_the_right_to_receive_where_it_goes() {
+    // Created by another thread, so this one holds nothing on it.
+    static ENDPOINT: AtomicU64 = AtomicU64::new(u64::MAX);
+    sched::spawn("owner", || {
+        let id = sched::current_id().expect("no thread");
+        ENDPOINT.store(ipc::create(id, 4).expect("create failed").0, Ordering::Release);
+    })
+    .expect("spawn failed");
+    assert!(spin_until(|| ENDPOINT.load(Ordering::Acquire) != u64::MAX));
+    assert_eq!(timer::sys_set(ENDPOINT.load(Ordering::Acquire), 10, 0), Err(Error::NoCapability));
 }

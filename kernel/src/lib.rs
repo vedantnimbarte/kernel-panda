@@ -44,6 +44,7 @@ pub mod sync;
 pub mod syscall;
 pub mod testing;
 pub mod time;
+pub mod timer;
 pub mod users;
 pub mod userspace;
 pub mod virtio;
@@ -269,6 +270,7 @@ pub fn release_thread_resources(thread: sched::ThreadId) {
     ring::release_thread(thread);
     device::release_thread(thread);
     net::release_thread(thread);
+    timer::release_thread(thread);
     ipc::release_thread(thread);
     userspace::release_slot(thread);
     // Last: everything above consults it while giving things back.
