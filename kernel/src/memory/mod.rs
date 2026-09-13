@@ -8,6 +8,7 @@
 //!    tables.
 //! 4. Map and initialise the kernel heap, which needs both.
 
+pub mod dma;
 pub mod frame;
 pub mod heap;
 pub mod kstack;

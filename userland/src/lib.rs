@@ -34,6 +34,10 @@ pub mod nr {
     pub const PORT_READ: u64 = 20;
     pub const PORT_WRITE: u64 = 21;
     pub const IRQ_BIND: u64 = 22;
+    pub const NET_INFO: u64 = 23;
+    pub const NET_SEND: u64 = 24;
+    pub const NET_RECEIVE: u64 = 25;
+    pub const NET_BIND: u64 = 26;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -157,6 +161,29 @@ pub fn port_write(port: u16, value: u8) -> i64 {
 pub fn irq_bind(irq: u64, endpoint: u64) -> i64 {
     syscall(nr::IRQ_BIND, irq, endpoint, 0)
 }
+
+/// The network card's MAC address. Network stack only.
+pub fn net_info(mac: &mut [u8; 6]) -> i64 {
+    syscall(nr::NET_INFO, mac.as_mut_ptr() as u64, 0, 0)
+}
+
+/// Put one Ethernet frame on the wire. Network stack only.
+pub fn net_send(frame: &[u8]) -> i64 {
+    syscall(nr::NET_SEND, frame.as_ptr() as u64, frame.len() as u64, 0)
+}
+
+/// Take one received frame; returns its length, or zero if none was waiting.
+pub fn net_receive(buffer: &mut [u8]) -> i64 {
+    syscall(nr::NET_RECEIVE, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0)
+}
+
+/// Have arriving frames announced on `endpoint`. Network stack only.
+pub fn net_bind(endpoint: u64) -> i64 {
+    syscall(nr::NET_BIND, endpoint, 0, 0)
+}
+
+/// Tag of the kernel's "frames have arrived" notification.
+pub const TAG_NET_RECEIVED: u64 = 0x2_0000;
 
 /// The `sender` of a message the kernel wrote itself. No thread has this id.
 pub const KERNEL_SENDER: u64 = u64::MAX;

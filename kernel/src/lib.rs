@@ -33,6 +33,7 @@ pub mod fs;
 pub mod gbm;
 pub mod ipc;
 pub mod memory;
+pub mod net;
 pub mod pci;
 pub mod quota;
 pub mod sched;
@@ -129,6 +130,10 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     //
     // SAFETY: called once, during boot, with PCI and paging up.
     unsafe { block::init() };
+
+    // The network card, if there is one. Its receive interrupt is routed by
+    // MSI-X to this processor's Local APIC, which is up by now.
+    net::init();
 
     // And mount whatever is on it. Nothing is formatted here: a kernel that
     // formats a disk it does not recognise destroys whatever was on it, and
@@ -257,6 +262,7 @@ fn map_pci_config(rsdp: u64) {
 pub fn release_thread_resources(thread: sched::ThreadId) {
     gbm::release_thread(thread);
     device::release_thread(thread);
+    net::release_thread(thread);
     ipc::release_thread(thread);
     userspace::release_slot(thread);
     // Last: everything above consults it while giving things back.

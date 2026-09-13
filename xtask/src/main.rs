@@ -302,6 +302,19 @@ const SCRATCH_DISK_BYTES: u64 = 16 * 1024 * 1024;
 ///
 /// Zero-filled rather than left as whatever was on disk, so a test reading a
 /// sector it never wrote sees a defined value.
+/// Contents of the file the TFTP server hands out. A network test compares
+/// against this, so it is fixed here rather than generated.
+const TFTP_FILE_CONTENTS: &str = "hello from the host, over TFTP\n";
+
+/// The directory QEMU's TFTP server serves, holding `hello.txt`.
+fn tftp_root() -> Result<PathBuf, String> {
+    let directory = workspace_root().join("target").join("images").join("tftp");
+    fs::create_dir_all(&directory).map_err(|e| format!("could not create {directory:?}: {e}"))?;
+    let file = directory.join("hello.txt");
+    fs::write(&file, TFTP_FILE_CONTENTS).map_err(|e| format!("could not write {file:?}: {e}"))?;
+    Ok(directory)
+}
+
 fn scratch_disk() -> Result<PathBuf, String> {
     let path = workspace_root()
         .join("target")
@@ -361,6 +374,15 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool) -> Result<Command, Str
     cmd.arg("-drive")
         .arg(format!("id=panda-disk,if=none,format=raw,file={}", qpath(&disk)));
     cmd.args(["-device", "ide-hd,drive=panda-disk,bus=ide.1"]);
+
+    // A network card on QEMU's user-mode network: the guest is 10.0.2.15, the
+    // gateway 10.0.2.2 answers pings, and a TFTP server on it serves one known
+    // file. Everything a network test needs, with no host networking involved
+    // and nothing to set up outside this process.
+    let tftp = tftp_root()?;
+    cmd.arg("-netdev")
+        .arg(format!("user,id=panda-net,tftp={}", qpath(&tftp)));
+    cmd.args(["-device", "virtio-net-pci,netdev=panda-net"]);
 
     cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     // Turn a triple fault into a dead VM instead of an invisible reboot loop.

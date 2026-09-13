@@ -44,6 +44,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     for (irq, handler) in ISA_HANDLERS.iter().enumerate() {
         idt[crate::device::IRQ_VECTOR_BASE + irq as u8].set_handler_fn(*handler);
     }
+    for (slot, handler) in MSI_HANDLERS.iter().enumerate() {
+        idt[crate::pci::MSI_VECTOR_BASE + slot as u8].set_handler_fn(*handler);
+    }
 
     super::syscall::register(&mut idt);
 
@@ -55,26 +58,34 @@ pub fn init() {
     IDT.load();
 }
 
-/// One handler per ISA line, because the handler is the only thing that knows
-/// which line it was: the CPU passes nothing but the frame.
-macro_rules! isa_handlers {
-    ($($irq:literal => $name:ident),* $(,)?) => {
+/// One handler per vector, because the handler is the only thing that knows
+/// which vector it was: the CPU passes nothing but the frame.
+macro_rules! numbered_handlers {
+    ($table:ident, $count:expr, $dispatch:path, $($n:literal => $name:ident),* $(,)?) => {
         $(
             extern "x86-interrupt" fn $name(_frame: InterruptStackFrame) {
-                crate::device::on_interrupt($irq);
+                $dispatch($n);
                 apic::end_of_interrupt();
             }
         )*
-        const ISA_HANDLERS: [extern "x86-interrupt" fn(InterruptStackFrame); crate::device::ISA_IRQS] =
-            [$($name),*];
+        const $table: [extern "x86-interrupt" fn(InterruptStackFrame); $count] = [$($name),*];
     };
 }
 
-isa_handlers! {
+numbered_handlers! {
+    ISA_HANDLERS, crate::device::ISA_IRQS, crate::device::on_interrupt,
     0 => isa_0, 1 => isa_1, 2 => isa_2, 3 => isa_3,
     4 => isa_4, 5 => isa_5, 6 => isa_6, 7 => isa_7,
     8 => isa_8, 9 => isa_9, 10 => isa_10, 11 => isa_11,
     12 => isa_12, 13 => isa_13, 14 => isa_14, 15 => isa_15,
+}
+
+numbered_handlers! {
+    MSI_HANDLERS, crate::pci::MSI_VECTORS, crate::pci::msi_dispatch,
+    0 => msi_0, 1 => msi_1, 2 => msi_2, 3 => msi_3,
+    4 => msi_4, 5 => msi_5, 6 => msi_6, 7 => msi_7,
+    8 => msi_8, 9 => msi_9, 10 => msi_10, 11 => msi_11,
+    12 => msi_12, 13 => msi_13, 14 => msi_14, 15 => msi_15,
 }
 
 /// Another processor has panicked and is stopping the world.

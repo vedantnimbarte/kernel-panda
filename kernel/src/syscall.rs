@@ -35,6 +35,10 @@ pub mod numbers {
     pub const PORT_READ: u64 = 20;
     pub const PORT_WRITE: u64 = 21;
     pub const IRQ_BIND: u64 = 22;
+    pub const NET_INFO: u64 = 23;
+    pub const NET_SEND: u64 = 24;
+    pub const NET_RECEIVE: u64 = 25;
+    pub const NET_BIND: u64 = 26;
 }
 
 /// Returned in RAX as a negative value.
@@ -167,6 +171,10 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::PORT_READ => crate::device::sys_port_read(frame.rdi),
         numbers::PORT_WRITE => crate::device::sys_port_write(frame.rdi, frame.rsi),
         numbers::IRQ_BIND => crate::device::sys_irq_bind(frame.rdi, frame.rsi),
+        numbers::NET_INFO => crate::net::sys_info(frame.rdi),
+        numbers::NET_SEND => crate::net::sys_send(frame.rdi, frame.rsi),
+        numbers::NET_RECEIVE => crate::net::sys_receive(frame.rdi, frame.rsi),
+        numbers::NET_BIND => crate::net::sys_bind(frame.rdi),
         _ => Err(Error::UnknownCall),
     };
 

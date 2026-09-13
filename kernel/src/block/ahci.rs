@@ -32,7 +32,8 @@ use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::PhysAddr;
 
 use super::{validate, BlockDevice, BlockError, SECTOR_SIZE};
-use crate::memory::{frame, paging};
+use crate::memory::dma::DmaRegion;
+use crate::memory::paging;
 use crate::pci;
 
 /// PCI class 0x01 subclass 0x06: a SATA controller. Programming interface 0x01
@@ -145,92 +146,6 @@ struct CommandTable {
 /// Scatter-gather entries per command. Each covers up to 4 MiB, so this bounds
 /// a single transfer at far more than anything here asks for.
 const PRDT_ENTRIES: usize = 8;
-
-/// Physically contiguous memory shared with the controller.
-///
-/// Freed when the port is dropped, which never happens -- a disk found at boot
-/// stays found. Kept as an owned type anyway so the lifetime is stated rather
-/// than implied.
-struct DmaRegion {
-    physical: PhysAddr,
-    virtual_base: u64,
-    frames: u64,
-}
-
-impl DmaRegion {
-    /// Allocate `frames` contiguous physical frames and map them uncached.
-    fn new(frames: u64, virtual_base: u64) -> Option<Self> {
-        let first = frame::with(|allocator| allocator.allocate_contiguous(frames as usize))?;
-
-        // Uncached and write-through. The controller updates these structures by
-        // DMA; a cached view can answer a read from a line fetched before it
-        // did, which shows up as a command that never appears to complete.
-        let flags = PageTableFlags::PRESENT
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_CACHE
-            | PageTableFlags::WRITE_THROUGH
-            | PageTableFlags::NO_EXECUTE;
-
-        for index in 0..frames {
-            let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(
-                x86_64::VirtAddr::new(virtual_base + index * 4096),
-            );
-            let target = PhysFrame::<Size4KiB>::containing_address(
-                first.start_address() + index * 4096,
-            );
-            // SAFETY: the frames were just allocated contiguously and belong to
-            // nobody else, and this virtual range is reserved for AHCI.
-            if unsafe { paging::map_to_frame(page, target, flags) }.is_err() {
-                for done in 0..index {
-                    let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(
-                        x86_64::VirtAddr::new(virtual_base + done * 4096),
-                    );
-                    let _ = paging::unmap(page);
-                }
-                frame::with(|allocator| {
-                    for offset in 0..frames {
-                        allocator.deallocate(PhysFrame::containing_address(
-                            first.start_address() + offset * 4096,
-                        ));
-                    }
-                });
-                return None;
-            }
-        }
-
-        // Zeroed, because the controller reads these before the CPU has written
-        // every field and whatever the last owner left looks like a command.
-        // SAFETY: just mapped, writable, and this size.
-        unsafe {
-            core::ptr::write_bytes(virtual_base as *mut u8, 0, (frames * 4096) as usize);
-        }
-
-        Some(Self {
-            physical: first.start_address(),
-            virtual_base,
-            frames,
-        })
-    }
-
-    fn physical_at(&self, offset: u64) -> u64 {
-        self.physical.as_u64() + offset
-    }
-
-    fn virtual_at(&self, offset: u64) -> u64 {
-        self.virtual_base + offset
-    }
-}
-
-impl Drop for DmaRegion {
-    fn drop(&mut self) {
-        for index in 0..self.frames {
-            let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(
-                x86_64::VirtAddr::new(self.virtual_base + index * 4096),
-            );
-            let _ = paging::unmap_and_free(page);
-        }
-    }
-}
 
 // Layout within the port's DMA region. One page for the command list and
 // received FIS, one for the command table, and two for a bounce buffer.

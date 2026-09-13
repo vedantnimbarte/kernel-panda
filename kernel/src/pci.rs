@@ -598,6 +598,163 @@ pub fn extended_capabilities(address: Address) -> Vec<ExtendedCapability> {
     found
 }
 
+/// Walk a device's standard capability list: `(id, offset)` pairs.
+///
+/// These live in the first 256 bytes, so either configuration mechanism reaches
+/// them. MSI and MSI-X are here; everything PCI Express added is in the extended
+/// list above.
+pub fn capabilities(address: Address) -> Vec<(u8, u8)> {
+    let mut found = Vec::new();
+    // Status bit 4: the device has a capability list at all.
+    if (read_config(address, 0x04) >> 16) & (1 << 4) == 0 {
+        return found;
+    }
+
+    let mut offset = (read_config(address, 0x34) & 0xFC) as u8;
+    // Bounded, because a list that points in a circle is a real firmware bug and
+    // the space holds at most 48 capabilities.
+    for _ in 0..48 {
+        // The first 0x40 bytes are the standard header; nothing lives there.
+        if offset < 0x40 {
+            break;
+        }
+        let header = read_config(address, offset);
+        found.push(((header & 0xFF) as u8, offset));
+        offset = ((header >> 8) & 0xFC) as u8;
+    }
+    found
+}
+
+/// Capability id of MSI-X.
+const CAPABILITY_MSIX: u8 = 0x11;
+
+/// Interrupt vectors handed out to MSI-X entries.
+pub const MSI_VECTOR_BASE: u8 = 0x50;
+pub const MSI_VECTORS: usize = 16;
+
+/// The function each MSI vector calls, as a raw pointer, or zero for a free one.
+/// Atomic so the interrupt handler can read it without a lock.
+static MSI_HANDLERS: [AtomicU64; MSI_VECTORS] = [const { AtomicU64::new(0) }; MSI_VECTORS];
+
+/// Where MSI-X tables are mapped, one page per routed entry.
+const MSIX_VIRT_BASE: u64 = 0x0000_7300_0000_0000;
+static MSIX_NEXT_PAGE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsiError {
+    /// The device has no MSI-X capability, or not that many entries.
+    NotSupported,
+    /// Every MSI vector is taken.
+    NoVector,
+    /// The table's BAR is not a memory BAR, or could not be mapped.
+    Table,
+}
+
+/// Point MSI-X table entry `entry` of a device at a vector of its own, which
+/// calls `handler` on this processor, and turn MSI-X on.
+///
+/// Message-signalled interrupts are why no ACPI interpreter is needed. A
+/// device's legacy interrupt pin reaches the I/O APIC through wiring only the
+/// firmware's AML describes; an MSI-X entry is just an address and a value the
+/// device writes when it wants attention, and the address is the Local APIC's.
+///
+/// `handler` runs in interrupt context with interrupts masked. It must not
+/// block.
+pub fn route_msix(address: Address, entry: u16, handler: fn()) -> Result<u8, MsiError> {
+    let capability = capabilities(address)
+        .into_iter()
+        .find(|(id, _)| *id == CAPABILITY_MSIX)
+        .map(|(_, offset)| offset)
+        .ok_or(MsiError::NotSupported)?;
+
+    let header = read_config(address, capability);
+    let control = (header >> 16) as u16;
+    let table_size = (control & 0x7FF) + 1;
+    if entry >= table_size {
+        return Err(MsiError::NotSupported);
+    }
+
+    // Table offset and BAR indicator share a register: the low three bits say
+    // which BAR, the rest is the offset into it.
+    let table = read_config(address, capability + 4);
+    let bar_offset = 0x10 + (table & 0b111) as u8 * 4;
+    let raw = read_config(address, bar_offset);
+    if raw & 1 != 0 {
+        return Err(MsiError::Table);
+    }
+    let mut base = (raw & !0xF) as u64;
+    if (raw >> 1) & 0b11 == 0b10 {
+        base |= (read_config(address, bar_offset + 4) as u64) << 32;
+    }
+    let physical = base + (table & !0b111) as u64 + entry as u64 * 16;
+
+    // A vector first, so a device that fires the moment it is unmasked has
+    // somewhere to go.
+    let slot = (0..MSI_VECTORS)
+        .find(|&slot| {
+            MSI_HANDLERS[slot]
+                .compare_exchange(0, handler as usize as u64, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+        .ok_or(MsiError::NoVector)?;
+    let vector = MSI_VECTOR_BASE + slot as u8;
+
+    let virtual_page = MSIX_VIRT_BASE + MSIX_NEXT_PAGE.fetch_add(1, Ordering::AcqRel) * 4096;
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::WRITE_THROUGH
+        | PageTableFlags::NO_EXECUTE;
+    // SAFETY: the device's own register space, named by its BAR, at a virtual
+    // page nothing else uses.
+    let mapped = unsafe {
+        paging::map_to_frame(
+            Page::<Size4KiB>::containing_address(VirtAddr::new(virtual_page)),
+            PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(physical)),
+            flags,
+        )
+    };
+    if mapped.is_err() {
+        MSI_HANDLERS[slot].store(0, Ordering::Release);
+        return Err(MsiError::Table);
+    }
+    let register = virtual_page + (physical & 0xFFF);
+
+    // Memory decoding, so the table is reachable, and bus mastering, which is
+    // what lets the device send the message at all.
+    let command = read_config(address, 0x04);
+    // SAFETY: enabling decoding and mastering on a device its driver owns.
+    unsafe { write_config(address, 0x04, command | 0b110) };
+
+    let apic_id = crate::arch::x86_64::apic::id();
+    // SAFETY: an MSI-X table entry -- address low, address high, data, vector
+    // control -- inside the page just mapped. Unmasked last, once the entry is
+    // complete.
+    unsafe {
+        core::ptr::write_volatile(register as *mut u32, 0xFEE0_0000 | (apic_id as u32) << 12);
+        core::ptr::write_volatile((register + 4) as *mut u32, 0);
+        core::ptr::write_volatile((register + 8) as *mut u32, vector as u32);
+        core::ptr::write_volatile((register + 12) as *mut u32, 0);
+    }
+
+    // Enabled, and the function-wide mask cleared.
+    let control = (control | 1 << 15) & !(1 << 14);
+    // SAFETY: the MSI-X control word of this device's own capability.
+    unsafe { write_config(address, capability, (header & 0xFFFF) | (control as u32) << 16) };
+
+    Ok(vector)
+}
+
+/// Called by the interrupt handler for MSI vector `slot`.
+pub fn msi_dispatch(slot: usize) {
+    let raw = MSI_HANDLERS[slot].load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: only ever stored from a `fn()` in `route_msix`.
+        let handler: fn() = unsafe { core::mem::transmute::<usize, fn()>(raw as usize) };
+        handler();
+    }
+}
+
 /// Check the two views of configuration space describe the same registers.
 ///
 /// They are two windows onto one set of registers, so they must agree about the
