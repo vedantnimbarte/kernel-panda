@@ -191,6 +191,10 @@ impl Scheduler {
         self.threads.get(id.0).and_then(|slot| slot.as_deref())
     }
 
+    fn thread_opt_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
+        self.threads.get_mut(id.0).and_then(|slot| slot.as_deref_mut())
+    }
+
     /// Free threads that have run to completion.
     ///
     /// Never one that any processor is still standing on. `on_cpu` covers both
@@ -875,6 +879,13 @@ pub fn set_address_space(id: ThreadId, space: crate::memory::paging::AddressSpac
     with(|scheduler| {
         scheduler.thread_mut(id).address_space = Some(space);
     });
+}
+
+/// Detach a thread's page tables from it, so no later switch to the thread
+/// loads them. The first step in freeing them.
+pub fn take_address_space(id: ThreadId) -> Option<crate::memory::paging::AddressSpace> {
+    with(|scheduler| scheduler.thread_opt_mut(id).and_then(|thread| thread.address_space.take()))
+        .flatten()
 }
 
 /// A thread's page tables, if it has its own.

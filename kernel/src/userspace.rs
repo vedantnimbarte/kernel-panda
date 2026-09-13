@@ -120,16 +120,28 @@ pub fn release_slot(owner: ThreadId) {
     let Some(slot) = slot_of(owner) else {
         return;
     };
-    let space = crate::sched::address_space_of(owner);
+    // Detached first: from here on, a switch to this thread -- on this CPU or
+    // any other it migrates to -- loads the kernel's tables instead.
+    let space = crate::sched::take_address_space(owner);
 
     // No page-by-page unmapping. Releasing the space walks its user subtree and
     // frees every table and data page in it, which is both simpler and correct
     // for ELF images -- their segments land wherever the program headers say,
     // not at a layout this function could predict.
     if let Some(space) = space {
-        // SAFETY: the thread is exiting and its space is not loaded -- the
-        // scheduler switched to the kernel's on the way here, and no other CPU
-        // exists yet to have it active.
+        // The exiting thread is usually still running on these very tables.
+        // Freeing them underneath it hands the level 4 frame to whichever CPU
+        // allocates next, which clears it while this one is still translating
+        // through it: a reset, or a thread stuck somewhere it never went.
+        if paging::AddressSpace::active() == space {
+            // SAFETY: the kernel's space carries every kernel mapping, which is
+            // all this thread touches from here to its last switch.
+            unsafe { paging::kernel_space().activate() };
+        }
+        // SAFETY: not active here, just checked; not active on any other CPU,
+        // because a thread runs on one at a time and the scheduler loads each
+        // incoming thread's own tables; and detached above, so it cannot be
+        // loaded again.
         unsafe { space.release() };
     }
 

@@ -246,9 +246,13 @@ fn table_is_empty(table: &PageTable) -> bool {
 /// freeing one there is right rather than merely tolerable -- the mapping really
 /// has gone everywhere.
 ///
-/// Returns true if anything was freed, which the caller needs to know: dropping
-/// a table invalidates cached *paging structures*, not just page translations,
-/// and those survive a single-address invalidation.
+/// Returns the tables it detached, which the caller frees -- but only after
+/// every processor has forgotten them. Dropping a table invalidates cached
+/// *paging structures*, not just translations, and until the shootdown lands
+/// another CPU can still walk through its cached pointer to this table. Freeing
+/// it first let the allocator hand the frame to someone else inside that
+/// window: a CPU switching to a new thread whose stack reused the address read
+/// its saved registers through a table that was by then somebody's data.
 ///
 /// # Safety
 ///
@@ -257,7 +261,7 @@ unsafe fn reclaim_empty_tables(
     space: &AddressSpace,
     page: Page<Size4KiB>,
     offset: VirtAddr,
-) -> bool {
+) -> Detached {
     // Walk down, remembering each table and the index within it that leads to
     // the next. `parents[i]` is the table at level 4 - i; `children[i]` is the
     // frame its entry points at.
@@ -274,10 +278,10 @@ unsafe fn reclaim_empty_tables(
         let entry = &table[indices[level]];
         let flags = entry.flags();
         if !flags.contains(PageTableFlags::PRESENT) || flags.contains(PageTableFlags::HUGE_PAGE) {
-            return false;
+            return Detached::NONE;
         }
         let Ok(child) = entry.frame() else {
-            return false;
+            return Detached::NONE;
         };
 
         parents[level] = current;
@@ -288,7 +292,7 @@ unsafe fn reclaim_empty_tables(
     // Bottom up, stopping at the first table that still has something in it: a
     // P2 cannot be empty while the P1 under it survives. Level 0 -- clearing an
     // entry in the level 4 table -- is excluded for the reason above.
-    let mut freed = false;
+    let mut detached = Detached::NONE;
     for level in (1..3).rev() {
         // SAFETY: a live page table reached through the walk above.
         let child = unsafe { table_at(children[level], offset) };
@@ -301,11 +305,30 @@ unsafe fn reclaim_empty_tables(
         let parent = unsafe { table_at(parents[level], offset) };
         parent[indices[level]].set_unused();
 
-        frame::with(|allocator| allocator.deallocate(children[level]));
-        freed = true;
+        detached.0[level - 1] = Some(children[level]);
     }
 
-    freed
+    detached
+}
+
+/// Page tables unlinked from their parents and not yet freed. At most one P1
+/// and one P2 per unmapped page.
+#[must_use = "detached tables are freed only after the shootdown"]
+struct Detached([Option<PhysFrame<Size4KiB>>; 2]);
+
+impl Detached {
+    const NONE: Detached = Detached([None; 2]);
+
+    fn any(&self) -> bool {
+        self.0.iter().any(Option::is_some)
+    }
+
+    /// Give the tables back. Call once no processor can still be using them.
+    fn free(self) {
+        for table in self.0.into_iter().flatten() {
+            frame::with(|allocator| allocator.deallocate(table));
+        }
+    }
 }
 
 static KERNEL_SPACE: Once<AddressSpace> = Once::new();
@@ -397,11 +420,7 @@ pub fn unmap(page: Page<Size4KiB>) -> Result<PhysFrame<Size4KiB>, UnmapError> {
         },
     )?;
 
-    if reclaim_tables_for(&space, page) {
-        shoot_down_all_if_shared(&space);
-    } else {
-        shoot_down_if_shared(&space, page);
-    }
+    shoot_down_and_free(&space, page, reclaim_tables_for(&space, page));
     Ok(frame)
 }
 
@@ -574,11 +593,7 @@ pub fn unmap_in(
         },
     )?;
 
-    if reclaim_tables_for(space, page) {
-        shoot_down_all_if_shared(space);
-    } else {
-        shoot_down_if_shared(space, page);
-    }
+    shoot_down_and_free(space, page, reclaim_tables_for(space, page));
     Ok(frame)
 }
 
@@ -592,25 +607,36 @@ pub fn unmap_in(
 /// Re-checking emptiness under the lock is what makes the gap between the two
 /// harmless. Every edit goes through this lock, so a table that gained an entry
 /// in between is simply seen to be non-empty and left alone.
-fn reclaim_tables_for(space: &AddressSpace, page: Page<Size4KiB>) -> bool {
+fn reclaim_tables_for(space: &AddressSpace, page: Page<Size4KiB>) -> Detached {
     without_interrupts(|| {
         let _guard = PAGING.lock();
         let Some(offset) = PHYSICAL_OFFSET.get().copied() else {
-            return false;
+            return Detached::NONE;
         };
 
         // SAFETY: the page was just unmapped from `space`, and the lock is held.
-        let freed = unsafe { reclaim_empty_tables(space, page, offset) };
+        let detached = unsafe { reclaim_empty_tables(space, page, offset) };
 
-        if freed {
+        if detached.any() {
             // Invalidating one address is not enough here. Processors cache
             // *paging structures* as well as translations, so a P2 that still
             // remembers a P1 we have just handed back to the allocator would
             // walk into whatever gets allocated next.
             x86_64::instructions::tlb::flush_all();
         }
-        freed
+        detached
     })
+}
+
+/// Tell the other processors about an unmap, then free whatever tables it
+/// emptied -- in that order, for the reason on [`reclaim_empty_tables`].
+fn shoot_down_and_free(space: &AddressSpace, page: Page<Size4KiB>, detached: Detached) {
+    if detached.any() {
+        shoot_down_all_if_shared(space);
+    } else {
+        shoot_down_if_shared(space, page);
+    }
+    detached.free();
 }
 
 /// Ask the other processors to forget their translations, if this space is one
