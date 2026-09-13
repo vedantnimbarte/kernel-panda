@@ -25,7 +25,7 @@ filesystem that survives a power cut.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order and damage tracking |
 
-**Testing:** 170+ cases across 20 boot-and-assert test kernels, run on four cores
+**Testing:** 170+ cases across 21 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -139,6 +139,7 @@ kernel-panda/
     │   ├── sched/     threads, context switch, priorities, per-CPU run queues
     │   ├── block/     block layer, AHCI driver, GPT and MBR partitioning
     │   ├── fs/        copy-on-write filesystem and its formatter
+    │   ├── crash.rs   the panic handler: stop, report, save, find next boot
     │   ├── smp.rs     starting the other processors, per-CPU identity
     │   ├── acpi.rs    MADT and MCFG: processors, I/O APICs, the PCIe window
     │   ├── quota.rs   per-process resource limits
@@ -675,6 +676,24 @@ kernel deadlocks the first time a handler prints: it spins on a lock held by the
 code it interrupted, which cannot run again to release it. The window is small,
 which only means the hang would be intermittent.
 
+**A panic stops the world, then reports without waiting for anything.** Other
+processors are halted with an NMI, not an ordinary IPI: the processor most
+likely to be in the way is one spinning on a lock with interrupts masked, and
+only a non-maskable interrupt reaches it. After that every lock on the path is
+tried rather than taken — the console, the scheduler, the page tables, the
+disk — because the holder may be a processor that was just stopped, or the code
+that panicked. The backtrace follows frame pointers (forced on in
+`kernel/.cargo/config.toml`) and checks each frame is mapped and kernel-only
+before reading it; a panic inside a system call has the user's stack at the top
+of the chain, and SMAP would fault on it.
+
+The report goes to a GPT partition whose type GUID is the ASCII
+`KernelPandaCrash`, text first and header last, so an interrupted save leaves
+the old state rather than a header describing half-written text. If the disk
+lock is held the record is not written at all: going ahead would overwrite the
+bounce buffer a command already in flight is about to be DMA'd from. The next
+boot prints the record and clears it.
+
 ## Known limits
 
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
@@ -702,6 +721,10 @@ which only means the hang would be intermittent.
 * ECAM maps a bus the first time something reads above offset 0xFF on it, and
   never unmaps. A workload touching every bus ends up with the whole window
   mapped, which is what the eager version did to begin with.
+* Nothing outside the tests creates a crash partition yet, so on an ordinary
+  boot a panic is reported to the console and not saved. Backtraces are raw
+  return addresses: subtract the load base, `0x10000000000`, and look them up
+  in the kernel ELF. The image carries no symbol table to do it at panic time.
 
 ## Not built yet
 
@@ -713,8 +736,6 @@ The gaps that matter, so nobody has to discover them by trying:
   *who* it is.
 * **A libc or a toolchain for third-party software.** Programs are built in this
   repository's `userland` workspace against its own syscall wrappers.
-* **Crash reporting.** A kernel panic halts. There is no dump, and no log that
-  survives the reboot.
 * **An IOMMU.** Without one, a Ring 3 driver handed a DMA-capable device is not
   isolated from the rest of physical memory, which is why the disk driver is in
   the kernel.

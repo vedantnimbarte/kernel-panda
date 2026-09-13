@@ -463,6 +463,31 @@ pub fn service_shootdown_request() {
     }
 }
 
+/// Send a non-maskable interrupt to one processor.
+///
+/// For stopping the world on a panic. A fixed vector would do nothing to a
+/// processor spinning on a lock with interrupts masked, which is exactly the
+/// processor most likely to be in the way.
+///
+/// # Safety
+///
+/// `apic_id` must name a processor that has installed an IDT with an NMI
+/// handler.
+pub unsafe fn send_nmi(apic_id: u8) {
+    const DELIVERY_NMI: u32 = 0b100 << 8;
+
+    if APIC_VIRT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    // SAFETY: the APIC is mapped, checked above. The caller vouches for the
+    // target.
+    unsafe {
+        write_reg(REG_ICR_HIGH, (apic_id as u32) << 24);
+        write_reg(REG_ICR_LOW, DELIVERY_NMI);
+        wait_for_delivery();
+    }
+}
+
 /// Send a fixed-delivery interrupt to one processor.
 ///
 /// Addressed individually rather than with the "all except self" shorthand.

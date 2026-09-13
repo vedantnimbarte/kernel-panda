@@ -54,6 +54,8 @@ pub enum BlockError {
     OutOfMemory,
     /// Writing was refused because the device is read-only.
     ReadOnly,
+    /// Someone else was using the device and the caller would not wait.
+    Busy,
 }
 
 /// Something that stores numbered sectors and gives them back.
@@ -73,6 +75,15 @@ pub trait BlockDevice: Send + Sync {
     /// buffer, and a power cut between the two loses it. Anything claiming to be
     /// crash-safe has to be able to ask.
     fn flush(&self) -> Result<(), BlockError>;
+
+    /// Write and flush, or refuse at once if anyone else is using the device.
+    ///
+    /// For the panic path. The holder may be a processor that has just been
+    /// stopped, or the very code that panicked, and neither is ever letting go.
+    /// Going ahead anyway would stomp on a command already in flight -- its data
+    /// is copied out of the same bounce buffer -- so the only honest answers are
+    /// "done" and [`BlockError::Busy`].
+    fn write_now(&self, lba: u64, buffer: &[u8]) -> Result<(), BlockError>;
 
     /// Bytes it holds, for reporting.
     fn capacity(&self) -> u64 {

@@ -381,7 +381,5 @@ fn ring3_demo() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!();
-    println!("KERNEL PANIC: {info}");
-    halt_loop()
+    panda_kernel::crash::panic(info)
 }

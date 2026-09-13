@@ -49,3 +49,8 @@ spin = { version = "0.9", default-features = false, features = [
 [[test]]
 name = "stack_overflow"
 harness = false
+
+# Reaches its own panic handler on purpose, which no `#[test_case]` survives.
+[[test]]
+name = "crash"
+harness = false

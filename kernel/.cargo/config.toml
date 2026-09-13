@@ -13,3 +13,6 @@ build-std-features = ["compiler-builtins-mem"]
 # Keep in sync with xtask::runner_binary_path().
 [target.x86_64-unknown-none]
 runner = ["../target/release/xtask.exe", "runner"]
+# Frame pointers, so a panic can walk the stack. Without them `rbp` is just
+# another register and the chain it would describe does not exist.
+rustflags = ["-C", "force-frame-pointers=yes"]

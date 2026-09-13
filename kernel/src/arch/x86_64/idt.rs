@@ -19,6 +19,7 @@ use super::{apic, gdt};
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
 
+    idt.non_maskable_interrupt.set_handler_fn(nmi_handler);
     idt.breakpoint.set_handler_fn(breakpoint_handler);
     idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
     idt.general_protection_fault
@@ -48,6 +49,22 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 /// Install the IDT. `gdt::init` must already have run.
 pub fn init() {
     IDT.load();
+}
+
+/// Another processor has panicked and is stopping the world.
+///
+/// Anything else arriving here -- a watchdog, a parity error the firmware chose
+/// to report this way -- is ignored rather than printed: the console lock may be
+/// held by the code this interrupted, and an NMI cannot be masked to wait it out.
+extern "x86-interrupt" fn nmi_handler(_frame: InterruptStackFrame) {
+    if crate::crash::is_panicking() {
+        // Further NMIs are blocked until an `iret` that never comes, and `cli`
+        // keeps everything else out, so `hlt` does not return.
+        x86_64::instructions::interrupts::disable();
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
 }
 
 /// `int3`. Recoverable by design -- this returns and execution continues, which

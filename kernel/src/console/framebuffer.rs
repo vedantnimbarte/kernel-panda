@@ -228,3 +228,12 @@ pub fn _print(args: fmt::Arguments) {
         let _ = console.lock().write_fmt(args);
     }
 }
+
+/// `_print`, but skipped rather than waiting if the console is in use. For the
+/// panic path.
+pub fn _try_print(args: fmt::Arguments) {
+    use fmt::Write;
+    if let Some(mut console) = CONSOLE.get().and_then(|console| console.try_lock()) {
+        let _ = console.write_fmt(args);
+    }
+}

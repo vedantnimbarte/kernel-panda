@@ -447,6 +447,26 @@ pub fn set_flags(page: Page<Size4KiB>, flags: PageTableFlags) -> Result<(), Flag
     })
 }
 
+/// [`flags`], but `None` rather than waiting if the page tables are locked.
+///
+/// For the panic path. Whoever holds the lock may be a processor that has just
+/// been stopped, or the code that panicked, and neither will release it.
+pub fn try_flags(address: VirtAddr) -> Option<PageTableFlags> {
+    let _guard = PAGING.try_lock()?;
+    let offset = *PHYSICAL_OFFSET.get()?;
+
+    // SAFETY: as in `with_space`, and the lock is held.
+    let mapper = unsafe {
+        let table = &mut *((offset + AddressSpace::active().frame().start_address().as_u64())
+            .as_mut_ptr::<PageTable>());
+        OffsetPageTable::new(table, offset)
+    };
+    match mapper.translate(address) {
+        TranslateResult::Mapped { flags, .. } => Some(flags),
+        _ => None,
+    }
+}
+
 /// Whether paging has been initialised.
 pub fn is_initialised() -> bool {
     PHYSICAL_OFFSET.get().is_some()

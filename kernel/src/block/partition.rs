@@ -49,6 +49,9 @@ pub struct Partition {
     /// MBR type byte, or the first byte of the GPT type GUID. Enough to spot a
     /// partition this kernel put there; not enough to identify every scheme.
     pub kind: u8,
+    /// The whole GPT type GUID, or zeroes for MBR. What anything that will
+    /// write to a partition on the strength of its type has to match against.
+    pub type_guid: [u8; 16],
     pub scheme: Scheme,
 }
 
@@ -126,6 +129,7 @@ fn read_mbr(sector: &[u8]) -> Vec<Partition> {
             start,
             sectors,
             kind,
+            type_guid: [0; 16],
             scheme: Scheme::Mbr,
         });
     }
@@ -200,6 +204,7 @@ fn read_gpt(device: &dyn BlockDevice) -> Result<Option<Vec<Partition>>, BlockErr
             start: first,
             sectors: last - first + 1,
             kind: kind_guid[0],
+            type_guid: kind_guid,
             scheme: Scheme::Gpt,
         });
     }
@@ -290,6 +295,11 @@ impl BlockDevice for PartitionDevice {
     fn flush(&self) -> Result<(), BlockError> {
         self.disk.flush()
     }
+
+    fn write_now(&self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+        let absolute = self.map(lba, buffer.len())?;
+        self.disk.write_now(absolute, buffer)
+    }
 }
 
 /// Write a single-partition GPT covering the whole disk.
@@ -370,6 +380,7 @@ pub fn write_single_partition_gpt(
         start: first_usable,
         sectors: last_usable - first_usable + 1,
         kind: kind[0],
+        type_guid: kind,
         scheme: Scheme::Gpt,
     })
 }

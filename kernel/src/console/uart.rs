@@ -213,3 +213,13 @@ pub fn _print(args: fmt::Arguments) {
     // into the void.
     let _ = COM1.lock().write_fmt(args);
 }
+
+/// `_print` for the panic path, which cannot wait for a lock whose holder may
+/// never run again.
+///
+/// Drives the port through a second handle rather than the locked one. Output
+/// from another processor would interleave, so stop them first.
+pub fn _print_unlocked(args: fmt::Arguments) {
+    use fmt::Write;
+    let _ = SerialPort::new(COM1_BASE).write_fmt(args);
+}

@@ -26,6 +26,7 @@ pub mod allocator;
 pub mod block;
 pub mod arch;
 pub mod console;
+pub mod crash;
 pub mod elf;
 pub mod fs;
 pub mod gbm;
@@ -133,6 +134,10 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // "did not recognise it" covers a disk written by a newer version of this
     // very filesystem.
     fs::mount_root();
+
+    // And look for somewhere to leave a crash record, printing any the last
+    // boot left there.
+    crash::init();
 
     // Other processors last of all: they need the APIC calibrated, the heap for
     // their stacks, and the scheduler ready to adopt them.

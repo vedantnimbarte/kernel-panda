@@ -451,13 +451,27 @@ impl BlockDevice for AhciDisk {
     }
 
     fn write(&self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
-        // The transfer path needs a mutable slice for the read direction; a
-        // write never touches the caller's buffer, so this is a cast rather
-        // than a copy.
-        let sectors = validate(self.sectors, lba, buffer.len())?;
-        let _ = sectors;
-
         let _guard = self.lock.lock();
+        self.write_locked(lba, buffer)
+    }
+
+    fn flush(&self) -> Result<(), BlockError> {
+        let _guard = self.lock.lock();
+        self.run_command(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
+    }
+
+    fn write_now(&self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+        let _guard = self.lock.try_lock().ok_or(BlockError::Busy)?;
+        self.write_locked(lba, buffer)?;
+        self.run_command(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
+    }
+}
+
+impl AhciDisk {
+    /// The write itself. The caller holds `lock`.
+    fn write_locked(&self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
+        validate(self.sectors, lba, buffer.len())?;
+
         let per_chunk = (BOUNCE_BYTES as usize) / SECTOR_SIZE;
         let mut done = 0usize;
         let total = buffer.len() / SECTOR_SIZE;
@@ -487,11 +501,6 @@ impl BlockDevice for AhciDisk {
         }
 
         Ok(())
-    }
-
-    fn flush(&self) -> Result<(), BlockError> {
-        let _guard = self.lock.lock();
-        self.run_command(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
     }
 }
 

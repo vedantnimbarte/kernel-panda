@@ -857,6 +857,14 @@ pub fn current_name() -> Option<&'static str> {
     .flatten()
 }
 
+/// [`current_name`], but `None` rather than waiting for the scheduler lock. For
+/// the panic path, which may have been reached from inside the scheduler.
+pub fn try_current_name() -> Option<&'static str> {
+    let guard = SCHEDULER.try_lock()?;
+    let scheduler = guard.as_ref()?;
+    scheduler.current[cpu_index()].map(|id| scheduler.thread(id).name)
+}
+
 /// Threads that exist and have not been reaped.
 pub fn live_thread_count() -> usize {
     with(|scheduler| scheduler.threads.iter().filter(|slot| slot.is_some()).count()).unwrap_or(0)
