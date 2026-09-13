@@ -166,7 +166,7 @@ fn a_buffer_cannot_be_mapped_without_access() {
     TARGET_BUFFER.store(buffer.0, Ordering::Release);
     OUTSIDER_RAN.store(false, Ordering::Release);
 
-    sched::spawn("outsider", outsider).expect("spawn failed");
+    let id = sched::spawn("outsider", outsider).expect("spawn failed");
     assert!(
         spin_until(|| OUTSIDER_RAN.load(Ordering::Acquire)),
         "the outsider thread never ran"
@@ -180,6 +180,18 @@ fn a_buffer_cannot_be_mapped_without_access() {
     );
 
     gbm::destroy(me(), buffer).expect("destroy failed");
+
+    // Cases run in name order, so this one comes first and the frame accounting
+    // in `destroying_returns_the_frames` runs right after it. `join` returns once
+    // the thread has finished, but its kernel stack -- and the page table the
+    // stack emptied, which is freed only after a shootdown every processor has
+    // acknowledged -- goes back later, from whichever CPU buries it. Waiting for
+    // the reap keeps that return out of the next case's measurement.
+    sched::join(id);
+    assert!(
+        spin_until(|| !sched::is_alive(id)),
+        "the outsider thread was never reaped"
+    );
 }
 
 static SHARED_BUFFER: AtomicU64 = AtomicU64::new(0);
