@@ -29,15 +29,12 @@ bump-allocator = []
 # against the auditability requirement. Three, and only three:
 #   bootloader_api - mandated by the chosen boot path
 #   x86_64         - IDT/GDT/page-table structures; pure Rust, no C
-#   spin           - spinlocks, wrapped behind crate::sync so it can be swapped out
+#   spin           - `Once` and `Lazy` only; the lock itself is in-house. Wrapped
+#                    behind crate::sync so it can be swapped out
 [dependencies]
 bootloader_api = "0.11"
 x86_64 = "0.15"
-spin = { version = "0.9", default-features = false, features = [
-    "spin_mutex",
-    "once",
-    "lazy",
-] }
+spin = { version = "0.9", default-features = false, features = ["once", "lazy"] }
 
 # Test targets keep cargo's default `harness = true`. That is what makes cargo
 # pass `--test` to rustc, which is in turn what activates `custom_test_frameworks`

@@ -176,16 +176,18 @@ xtask for bare metal.
 
 Everything that ships inside the kernel image has to earn its place. This is a
 kernel meant to be read and audited, and a dependency is code nobody here has
-read. Two crates earn it.
+read. Three crates earn it.
 
 | Crate | Why |
 | --- | --- |
 | `bootloader_api` | Required by the chosen boot path. |
 | `x86_64` | IDT/GDT/page-table structures and privileged instructions. Pure Rust; reimplementing is weeks of work for no safety gain. |
+| `spin` | `Once` and `Lazy`, for one-time initialisation of statics. Nothing else from it is compiled in. |
 
-`spin` was the third until the in-house ticket lock replaced it. Wrapping it
-behind `kernel/src/sync.rs` from the start is what made that swap a change to one
-file rather than to every call site.
+`spin` used to supply the lock too, until the in-house ticket lock replaced it.
+Wrapping it behind `kernel/src/sync.rs` from the start is what made that swap a
+change to one file rather than to every call site, and the same wrapper is what
+would let `Once` and `Lazy` follow.
 
 Written in-house rather than pulled in: the 16550 UART driver, the framebuffer
 console and its font, the physical frame allocator, and both heap allocators.
