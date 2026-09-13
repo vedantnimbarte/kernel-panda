@@ -125,6 +125,10 @@ use panda_kernel::{sync, syscall, userspace};
 
 const TAG_PING: u64 = 1;
 const TAG_PONG: u64 = 2;
+const TAG_NET_CONFIG: u64 = 15;
+
+/// The test's DNS server, which xtask runs on the host. Must match xtask.
+const HOST_DNS_PORT: u64 = 47153;
 
 const fn packed(address: [u8; 4]) -> u64 {
     u32::from_be_bytes(address) as u64
@@ -141,20 +145,20 @@ static PROBE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 fn stack_thread() {
     let owner = me();
     let image = userspace::load_elf(owner, userspace::NET_ELF).expect("failed to load the stack");
-    let parameters = [
-        CONTROL.load(Ordering::Acquire),
-        packed(GUEST_IP),
-        packed(GATEWAY_IP),
-        packed([255, 255, 255, 0]),
-    ];
+    // No address, so the daemon asks DHCP for one; and the test's DNS server
+    // on the host rather than QEMU's, which forwards to whatever the host uses.
+    let parameters = [CONTROL.load(Ordering::Acquire), 0, 0, 0, packed(GATEWAY_IP) << 16 | HOST_DNS_PORT];
     // SAFETY: the parameter page just mapped for a program not yet running.
     unsafe { userspace::write_parameters(image.data, &parameters) };
     // SAFETY: load_elf mapped the entry executable and the stack writable.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
 }
 
+static CONFIG: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// The network daemon, running once for the whole test kernel: it is the only
-/// thread allowed the card, and later cases reuse it.
+/// thread allowed the card, and later cases reuse it. Returns once DHCP has
+/// given it an address.
 fn stack() -> (EndpointId, ThreadId) {
     if let Some(id) = Some(STACK.load(Ordering::Acquire)).filter(|id| *id != u64::MAX) {
         return (EndpointId(CONTROL.load(Ordering::Acquire)), ThreadId(id as usize));
@@ -173,6 +177,17 @@ fn stack() -> (EndpointId, ThreadId) {
         "the network daemon never settled"
     );
     assert!(sched::is_alive(daemon), "the network daemon died starting up");
+
+    let reply = ipc::create(me(), 4).expect("create failed");
+    ipc::grant(me(), daemon, reply, Rights::SEND).expect("grant failed");
+    let ask = Message { tag: TAG_NET_CONFIG, words: [reply.0, 0, 0, 0], sender: 0, sender_user: 0 };
+    ipc::send(me(), control, ask).expect("send failed");
+    assert!(spin_until(|| ipc::queued(reply) > 0), "DHCP never gave the daemon an address");
+    let configured = ipc::receive(me(), reply).expect("receive failed");
+    for (slot, word) in CONFIG.iter().zip(configured.words) {
+        slot.store(word, Ordering::Release);
+    }
+
     STACK.store(daemon.0 as u64, Ordering::Release);
     (control, daemon)
 }
@@ -188,6 +203,39 @@ fn probe_thread() {
     unsafe { userspace::write_parameters(image.data, &[mode, address, first, daemon, report]) };
     // SAFETY: as in `stack_thread`.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
+}
+
+#[test_case]
+fn stack_configures_itself_by_dhcp() {
+    stack();
+    let [address, gateway, netmask, dns] = CONFIG.each_ref().map(|word| word.load(Ordering::Acquire));
+    // What QEMU's user network hands out.
+    assert_eq!(address, packed(GUEST_IP), "DHCP gave the wrong address");
+    assert_eq!(gateway, packed(GATEWAY_IP), "DHCP gave the wrong gateway");
+    assert_eq!(netmask, packed([255, 255, 255, 0]), "DHCP gave the wrong netmask");
+    assert_eq!(dns, packed([10, 0, 2, 3]), "DHCP offered the wrong DNS server");
+}
+
+#[test_case]
+fn stack_resolves_names() {
+    let (control, _) = stack();
+    let report = ipc::create(me(), 4).expect("create failed");
+    PROBE[0].store(userspace::probe::RESOLVE, Ordering::Release);
+    PROBE[1].store(control.0, Ordering::Release);
+    PROBE[2].store(report.0, Ordering::Release);
+    PROBE[3].store(0, Ordering::Release);
+    sync::without_interrupts(|| {
+        let id = sched::spawn("dns-probe", probe_thread).expect("spawn failed");
+        ipc::grant(me(), id, control, Rights::SEND).expect("grant failed");
+        ipc::grant(me(), id, report, Rights::SEND).expect("grant failed");
+    });
+    assert!(spin_until(|| ipc::queued(report) > 0), "the DNS probe reported nothing");
+    let [known, known_status, unknown, unknown_status] = ipc::receive(me(), report).expect("receive failed").words;
+
+    assert_ne!(known, u64::MAX, "the probe failed at step {known_status}");
+    // What xtask's DNS server answers.
+    assert_eq!((known, known_status), (packed([10, 1, 2, 3]), 0), "panda.test did not resolve");
+    assert_eq!((unknown, unknown_status), (0, 3), "nowhere.test was not reported as no such name");
 }
 
 #[test_case]

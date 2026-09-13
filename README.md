@@ -23,11 +23,11 @@ stack running as an unprivileged process.
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
 | IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities, and shared message rings that cost no system call per message |
 | Devices | Local APIC and I/O APIC, PCIe with ECAM and MSI-X, AHCI, NVMe and virtio-blk storage, virtio-net, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
-| Networking | ARP, IPv4, ICMP echo, UDP and TCP in a Ring 3 daemon; the kernel only moves Ethernet frames |
+| Networking | ARP, IPv4, ICMP echo, UDP, TCP, DHCP and DNS in a Ring 3 daemon; the kernel only moves Ethernet frames |
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 214 cases across 27 boot-and-assert test kernels, run on four cores
+**Testing:** 216 cases across 27 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -783,7 +783,7 @@ the kernel, or from the thread the kernel has named as the input daemon — and
 naming it is a message only the kernel can send.
 
 **The network stack is a process; the kernel moves frames.** Everything that
-parses bytes from the network — ARP, IPv4 headers, ICMP, UDP, TCP — runs in a Ring 3
+parses bytes from the network — ARP, IPv4 headers, ICMP, UDP, TCP, DHCP, DNS — runs in a Ring 3
 daemon, so a malformed packet that finds a bug there kills an unprivileged
 process. The kernel's part is four system calls: the card's MAC, send a frame,
 take a frame, and have arrivals announced on an endpoint. Only the one thread
@@ -824,10 +824,18 @@ system call: after a delay the kernel sends a message to an endpoint the caller
 can receive on, so a daemon waiting for a packet and waiting for a deadline is
 waiting in one place. It runs off the tick that wakes sleeping threads.
 
+**Started without an address, the daemon asks DHCP for one.** Clients asking
+for the configuration before it arrives are answered when it does, so nothing
+has to guess when the network is up. It resolves names with the DNS server DHCP
+offered, or one it was given at start-up; a lookup is one question for an IPv4
+address, asked three times two seconds apart before it is reported as timed out.
+
 The tests reach services xtask runs on the host for as long as a test kernel
 does: a server the guest connects out to, which greets, answers a line and
-closes, and a client that keeps connecting in, through a port QEMU forwards,
-until the guest answers it.
+closes; a client that keeps connecting in, through a port QEMU forwards, until
+the guest answers it; and a DNS server that knows one name. QEMU's own DNS
+server forwards to whatever the host uses, and a test that passes only on a
+machine with a working resolver is not a test of this code.
 
 **A disk behind SATA, NVMe or virtio looks the same from above.** The block layer
 asks for sectors by number, and each driver answers through the same interface,
@@ -949,6 +957,9 @@ everything owned by the system and closed to all.
   daemon holds two frames while an address resolves and drops the rest, keeps
   one datagram per bound port, does not reassemble fragments, and neither sends
   nor checks UDP checksums.
+* A DHCP lease is never renewed, and the offer's lease time is ignored. DNS
+  lookups ask for IPv4 addresses only, over UDP, with no cache, and answers
+  are trusted from whichever server was asked, by port and query id alone.
 * TCP drops out-of-order segments and waits for them to be sent again, ignores
   the peer's window and options, has no congestion control and no TIME-WAIT,
   and picks initial sequence numbers from the MAC and a counter, so they are
@@ -966,8 +977,7 @@ everything owned by the system and closed to all.
 
 The gaps that matter, so nobody has to discover them by trying:
 
-* **DHCP, DNS, IPv6.** The stack speaks ARP, IPv4, ICMP echo, UDP and TCP, with
-  its address given at start-up.
+* **IPv6.** The stack speaks ARP, IPv4, ICMP echo, UDP, TCP, DHCP and DNS.
 * **A libc or a toolchain for third-party software.** Programs are built in this
   repository's `userland` workspace against its own syscall wrappers.
 * **An IOMMU.** Without one, a Ring 3 driver handed a DMA-capable device is not

@@ -18,7 +18,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     thread,
@@ -336,13 +336,18 @@ const TFTP_FILE_CONTENTS: &str = "hello from the host, over TFTP\n";
 const HOST_TCP_PORT: u16 = 47110;
 /// A host port QEMU forwards to the guest's port 80.
 const FORWARDED_PORT: u16 = 47111;
+/// A DNS server on the host, which the guest reaches at 10.0.2.2. Knows one
+/// name. Must match `kernel/tests/net.rs`.
+const HOST_DNS_PORT: u16 = 47153;
 
 /// What network tests talk to on the host, for as long as this process lives:
 ///
 /// * a TCP server that greets, answers one line with "you said: " and that
 ///   line, and closes;
 /// * a client that keeps connecting to the guest's port 80 until something
-///   there answers "hello from the host" with "hello from panda".
+///   there answers "hello from the host" with "hello from panda";
+/// * a DNS server that says `panda.test` is 10.1.2.3 and that nothing else
+///   exists.
 ///
 /// Neither matters to a kernel that does not use the network. A port already
 /// taken is left alone, and the test that needs it fails saying so.
@@ -360,6 +365,18 @@ fn start_host_services() {
                     let _ = stream.write_all(format!("you said: {line}").as_bytes());
                 }
             });
+        }
+    });
+
+    thread::spawn(|| {
+        let Ok(socket) = UdpSocket::bind((Ipv4Addr::LOCALHOST, HOST_DNS_PORT)) else {
+            return;
+        };
+        let mut query = [0u8; 512];
+        while let Ok((length, client)) = socket.recv_from(&mut query) {
+            if let Some(answer) = dns_answer(&query[..length]) {
+                let _ = socket.send_to(&answer, client);
+            }
         }
     });
 
@@ -473,6 +490,34 @@ fn crash_disk(name: &str, fresh: bool) -> Result<PathBuf, String> {
     }
     fs::write(&path, &disk).map_err(|e| format!("could not write {path:?}: {e}"))?;
     Ok(path)
+}
+
+/// The answer to one DNS question: `panda.test` A is 10.1.2.3; everything else
+/// is no such name.
+fn dns_answer(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 || u16::from_be_bytes([query[4], query[5]]) != 1 {
+        return None;
+    }
+    let mut at = 12;
+    let mut labels = Vec::new();
+    while *query.get(at)? != 0 {
+        let length = query[at] as usize;
+        labels.push(String::from_utf8_lossy(query.get(at + 1..at + 1 + length)?).to_ascii_lowercase());
+        at += 1 + length;
+    }
+    let question = query.get(12..at + 5)?;
+    let kind = u16::from_be_bytes([query[at + 1], query[at + 2]]);
+    let known = labels.join(".") == "panda.test" && kind == 1;
+
+    let mut answer = Vec::from(&query[0..2]);
+    answer.extend_from_slice(if known { &[0x81, 0x80] } else { &[0x81, 0x83] });
+    answer.extend_from_slice(&[0, 1, 0, known as u8, 0, 0, 0, 0]);
+    answer.extend_from_slice(question);
+    if known {
+        // A pointer to the question's name, then A, IN, a minute, four bytes.
+        answer.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 1, 2, 3]);
+    }
+    Some(answer)
 }
 
 fn crc32(bytes: &[u8]) -> u32 {

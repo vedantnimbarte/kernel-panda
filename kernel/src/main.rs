@@ -363,6 +363,26 @@ fn net_demo(me: sched::ThreadId) {
     let reply = ipc::create(me, 4).expect("could not create an endpoint");
     ipc::grant(me, stack, reply, ipc::Rights::SEND).expect("grant failed");
 
+    // Bounded, like the ping below.
+    let asked = ipc::Message { tag: 15, words: [reply.0, 0, 0, 0], sender: 0, sender_user: 0 };
+    ipc::send(me, control, asked).expect("send failed");
+    let started = time::uptime_ms();
+    while ipc::queued(reply) == 0 && time::uptime_ms() < started + 3000 {
+        sched::yield_now();
+    }
+    let configured = (ipc::queued(reply) > 0).then(|| ipc::receive(me, reply)).and_then(Result::ok);
+    let Some(configured) = configured.filter(|message| message.tag == 16) else {
+        println!("  DHCP gave no address within three seconds");
+        return;
+    };
+    let dotted = |a: u64| alloc::format!("{}.{}.{}.{}", a >> 24 & 255, a >> 16 & 255, a >> 8 & 255, a & 255);
+    println!(
+        "  DHCP: address {}, gateway {}, DNS {}",
+        dotted(configured.words[0]),
+        dotted(configured.words[1]),
+        dotted(configured.words[3])
+    );
+
     const GATEWAY: u64 = 0x0A00_0202;
     let started = time::uptime_ms();
     let ping = ipc::Message {
@@ -392,8 +412,8 @@ fn net_demo(me: sched::ThreadId) {
 fn net_thread() {
     let owner = sched::current_id().expect("no current thread");
     let image = userspace::load_elf(owner, userspace::NET_ELF).expect("failed to load the network daemon");
-    // 10.0.2.15/24 behind 10.0.2.2: QEMU's user-mode network.
-    let parameters = [NET_CONTROL.load(Ordering::Acquire), 0x0A00_020F, 0x0A00_0202, 0xFFFF_FF00];
+    // No address: the daemon asks DHCP, and uses the DNS server it offers.
+    let parameters = [NET_CONTROL.load(Ordering::Acquire), 0, 0, 0, 0];
     // SAFETY: the parameter page just mapped for a program not yet running.
     unsafe { userspace::write_parameters(image.data, &parameters) };
     // SAFETY: load_elf mapped the entry user-executable and the stack writable.

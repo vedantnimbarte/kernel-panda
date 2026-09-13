@@ -443,6 +443,28 @@ pub mod net {
     /// Most one segment carries, and so one send.
     pub const TCP_MSS: usize = 1460;
 
+    /// `[reply endpoint, 0, 0, 0]`: answered with [`TAG_NET_CONFIGURED`] once
+    /// the daemon has an address -- at once if it was given one, or when DHCP
+    /// has found one.
+    pub const TAG_NET_CONFIG: u64 = 15;
+    /// `[address, gateway, netmask, DNS server DHCP offered or 0]`.
+    pub const TAG_NET_CONFIGURED: u64 = 16;
+    /// `[buffer, length, reply endpoint, token]`: look up the IPv4 address of
+    /// the name at the start of `buffer`, which must hold it until answered.
+    pub const TAG_RESOLVE: u64 = 17;
+    /// `[token, address, status, 0]`.
+    pub const TAG_RESOLVED: u64 = 18;
+
+    pub const RESOLVE_FOUND: u64 = 0;
+    /// The server says there is no such name.
+    pub const RESOLVE_NO_SUCH_NAME: u64 = 3;
+    /// The name exists but has no IPv4 address.
+    pub const RESOLVE_NO_ADDRESS: u64 = 0x100;
+    /// No answer came, or there is no server to ask.
+    pub const RESOLVE_TIMED_OUT: u64 = 0x101;
+    /// Not a name: empty, too long, or with an empty or overlong label.
+    pub const RESOLVE_BAD_NAME: u64 = 0x102;
+
     pub const fn address(a: u8, b: u8, c: u8, d: u8) -> u64 {
         (a as u64) << 24 | (b as u64) << 16 | (c as u64) << 8 | d as u64
     }

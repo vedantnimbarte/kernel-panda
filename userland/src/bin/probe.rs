@@ -27,6 +27,7 @@ pub const MODE_WHOAMI: u64 = 11;
 pub const MODE_PERMISSIONS: u64 = 12;
 pub const MODE_LOGIN: u64 = 13;
 pub const MODE_TCP: u64 = 14;
+pub const MODE_RESOLVE: u64 = 15;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -310,6 +311,47 @@ extern "C" fn main(parameters: u64) {
                 .iter()
                 .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ *byte as u64).wrapping_mul(0x0100_0000_01b3));
             report([total as u64, hash, reason, 0]);
+        }
+
+        // Look up two names through the network daemon: one the test's DNS
+        // server knows, one it does not. Reports each address and status -- or
+        // u64::MAX and the step that failed.
+        MODE_RESOLVE => {
+            use user::net;
+            let report = |words: [u64; 4]| {
+                user::ipc_send(parameters.report, &user::Message { tag: 0xD45, words, sender: 0, sender_user: 0 });
+                user::exit(0)
+            };
+            let reply = user::ipc_create(4);
+            if reply < 0 || user::ipc_grant(reply as u64, parameters.daemon, 1) < 0 {
+                report([u64::MAX, 1, 0, 0]);
+            }
+            let reply = reply as u64;
+            let buffer = user::buffer_create(256, 1);
+            if buffer < 0 || user::buffer_share(buffer as u64, parameters.daemon) < 0 {
+                report([u64::MAX, 2, 0, 0]);
+            }
+            let base = user::buffer_map(buffer as u64);
+            if base < 0 {
+                report([u64::MAX, 3, 0, 0]);
+            }
+
+            let mut words = [0u64; 4];
+            for (index, name) in [&b"panda.test"[..], &b"nowhere.test"[..]].into_iter().enumerate() {
+                // SAFETY: this process's mapped buffer, far larger than the name.
+                unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), base as *mut u8, name.len()) };
+                let request = [buffer as u64, name.len() as u64, reply, index as u64];
+                let message = user::Message { tag: net::TAG_RESOLVE, words: request, sender: 0, sender_user: 0 };
+                user::ipc_send(parameters.endpoint, &message);
+
+                let mut answer = user::Message::default();
+                if user::ipc_receive(reply, &mut answer) < 0 || answer.tag != net::TAG_RESOLVED {
+                    report([u64::MAX, 4, 0, 0]);
+                }
+                words[2 * index] = answer.words[1];
+                words[2 * index + 1] = answer.words[2];
+            }
+            report(words);
         }
 
         // The two ends of a ring. `endpoint` is the ring, `daemon` the message

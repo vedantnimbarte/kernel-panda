@@ -1,4 +1,4 @@
-//! The network daemon: ARP, IPv4, ICMP, UDP and TCP, in Ring 3.
+//! The network daemon: ARP, IPv4, ICMP, UDP, TCP, DHCP and DNS, in Ring 3.
 //!
 //! The kernel hands this process Ethernet frames and nothing else, so every
 //! byte that arrives from the network is parsed here, by a process with no
@@ -22,6 +22,11 @@
 //!   receive side takes one segment into the client's buffer and closes its
 //!   window until the client has read it. Unacknowledged segments are resent on
 //!   a timer, backing off, until a connection gives up.
+//! * **DHCP**: started with no address, the daemon asks for one, and answers
+//!   clients asking for the configuration once it has it. The lease is taken
+//!   for as long as the daemon runs; it is never renewed.
+//! * **DNS**: IPv4 addresses for names, from the server DHCP offered or one
+//!   given at start-up, asked again twice before giving up.
 
 #![no_std]
 #![no_main]
@@ -37,6 +42,9 @@ struct Parameters {
     address: u64,
     gateway: u64,
     netmask: u64,
+    /// A DNS server to use instead of any DHCP offers, as `address << 16 |
+    /// port`, or zero.
+    dns: u64,
 }
 
 const MAX_FRAME: usize = 1514;
@@ -57,6 +65,43 @@ const BINDINGS: usize = 8;
 const MAPPINGS: usize = 8;
 const CONNECTIONS: usize = 8;
 const LISTENERS: usize = 4;
+const RESOLVERS: usize = 4;
+const CONFIG_WAITERS: usize = 4;
+
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_COOKIE: [u8; 4] = [99, 130, 83, 99];
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+const DHCP_NAK: u8 = 6;
+/// Lookups go out from this port plus their slot, so an answer names its slot.
+const DNS_LOCAL_PORT: u16 = 53000;
+/// Timer ticks before a DHCP or DNS request is sent again, and DNS tries.
+const REQUEST_TICKS: u32 = 10;
+const DNS_TRIES: u32 = 3;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Dhcp {
+    /// Given an address, or has one.
+    #[default]
+    Done,
+    Discovering,
+    Requesting,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Resolve {
+    /// Zero for a free slot.
+    id: u16,
+    reply: u64,
+    token: u64,
+    base: u64,
+    length: usize,
+    waited: u32,
+    tries: u32,
+}
 
 const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
@@ -174,6 +219,17 @@ struct Stack {
     timer_armed: bool,
     next_port: u16,
     next_sequence_start: u32,
+    dhcp: Dhcp,
+    dhcp_waited: u32,
+    transaction: u32,
+    offered: u32,
+    dhcp_server: u32,
+    offered_dns: u32,
+    config_waiters: [u64; CONFIG_WAITERS],
+    dns_server: u32,
+    dns_port: u16,
+    resolves: [Resolve; RESOLVERS],
+    next_dns_id: u16,
 }
 
 extern "C" fn main(parameters: u64) {
@@ -213,7 +269,23 @@ extern "C" fn main(parameters: u64) {
         // No entropy source, so initial sequence numbers are predictable from
         // the MAC; see the README.
         next_sequence_start: u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]),
+        dhcp: Dhcp::Done,
+        dhcp_waited: 0,
+        transaction: u32::from_be_bytes([mac[5], mac[4], mac[3], mac[2]]),
+        offered: 0,
+        dhcp_server: 0,
+        offered_dns: 0,
+        config_waiters: [0; CONFIG_WAITERS],
+        dns_server: (parameters.dns >> 16) as u32,
+        dns_port: parameters.dns as u16,
+        resolves: [Resolve::default(); RESOLVERS],
+        next_dns_id: 1,
     };
+    if stack.address == 0 {
+        stack.dhcp = Dhcp::Discovering;
+        stack.dhcp_send(DHCP_DISCOVER);
+        stack.arm_timer();
+    }
 
     // Anything that arrived before the bind was announced to nobody.
     stack.drain();
@@ -385,7 +457,8 @@ impl Stack {
         if read_u16(packet, 6) & 0x3FFF != 0 {
             return;
         }
-        if read_u32(packet, 16) != self.address {
+        let destination = read_u32(packet, 16);
+        if destination != self.address && destination != u32::MAX && self.address != 0 {
             return;
         }
 
@@ -446,6 +519,17 @@ impl Stack {
         let length = (read_u16(datagram, 4) as usize).clamp(8, datagram.len());
         let payload = &datagram[8..length];
 
+        if port == DHCP_CLIENT_PORT && self.dhcp != Dhcp::Done {
+            self.dhcp_reply(payload);
+            return;
+        }
+        if let Some(slot) = port.checked_sub(DNS_LOCAL_PORT).map(usize::from).filter(|slot| *slot < RESOLVERS) {
+            if self.resolves[slot].id != 0 && source == self.dns_server && source_port == self.dns_port {
+                self.dns_reply(slot, payload);
+            }
+            return;
+        }
+
         let Some(binding) = self.bindings.iter().find(|binding| binding.port == port && binding.base != 0) else {
             return;
         };
@@ -493,6 +577,11 @@ impl Stack {
         frame[34..34 + payload.len()].copy_from_slice(payload);
         let length = 14 + total;
 
+        if destination == u32::MAX {
+            frame[0..6].copy_from_slice(&BROADCAST);
+            user::net_send(&frame[..length]);
+            return;
+        }
         let next_hop = if destination & self.netmask == self.address & self.netmask {
             destination
         } else {
@@ -537,6 +626,8 @@ impl Stack {
             net::TAG_UDP_SEND => self.send_udp(a, b as usize, c as u32, (d >> 16) as u16, d as u16),
             net::TAG_TCP_CONNECT => self.connect(message.sender, a as u32, (b >> 16) as u16, b as u16, c, d),
             net::TAG_TCP_LISTEN => self.listen(message.sender, a as u16, b, c),
+            net::TAG_NET_CONFIG => self.config(a),
+            net::TAG_RESOLVE => self.resolve(a, b as usize, c, d),
             _ => {}
         }
 
@@ -1012,7 +1103,9 @@ impl Stack {
     }
 
     fn arm_timer(&mut self) {
-        let waiting = self.connections.iter().any(|c| c.state != State::Free && c.unacknowledged != c.next_send);
+        let waiting = self.connections.iter().any(|c| c.state != State::Free && c.unacknowledged != c.next_send)
+            || self.dhcp != Dhcp::Done
+            || self.resolves.iter().any(|r| r.id != 0);
         if waiting && !self.timer_armed && user::timer_set(self.control, TICK_MS, 0) >= 0 {
             self.timer_armed = true;
         }
@@ -1022,6 +1115,8 @@ impl Stack {
     /// too often.
     fn tick(&mut self) {
         self.timer_armed = false;
+        self.dhcp_tick();
+        self.dns_tick();
         for index in 0..CONNECTIONS {
             let connection = &mut self.connections[index];
             if connection.state == State::Free || connection.unacknowledged == connection.next_send {
@@ -1043,4 +1138,273 @@ impl Stack {
         }
         self.arm_timer();
     }
+}
+
+// --- DHCP and DNS ------------------------------------------------------------
+
+impl Stack {
+    /// A UDP datagram of this daemon's own, rather than a client's.
+    fn send_datagram(&mut self, destination: u32, local: u16, remote: u16, payload: &[u8]) {
+        let mut datagram = [0u8; 8 + 512];
+        let length = 8 + payload.len();
+        datagram[0..2].copy_from_slice(&local.to_be_bytes());
+        datagram[2..4].copy_from_slice(&remote.to_be_bytes());
+        datagram[4..6].copy_from_slice(&(length as u16).to_be_bytes());
+        datagram[8..length].copy_from_slice(payload);
+        self.send_ipv4(destination, PROTOCOL_UDP, &datagram[..length]);
+    }
+
+    fn dhcp_send(&mut self, kind: u8) {
+        let mut message = [0u8; 300];
+        message[0..4].copy_from_slice(&[1, 1, 6, 0]);
+        message[4..8].copy_from_slice(&self.transaction.to_be_bytes());
+        // Answer by broadcast: this machine cannot receive unicast until it has
+        // the address it is asking for.
+        message[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+        message[28..34].copy_from_slice(&self.mac);
+        message[236..240].copy_from_slice(&DHCP_COOKIE);
+
+        let mut options = [0u8; 32];
+        let mut length = 0;
+        let mut option = |bytes: &[u8]| {
+            options[length..length + bytes.len()].copy_from_slice(bytes);
+            length += bytes.len();
+        };
+        option(&[53, 1, kind]);
+        if kind == DHCP_REQUEST {
+            let [a, b, c, d] = self.offered.to_be_bytes();
+            option(&[50, 4, a, b, c, d]);
+            let [a, b, c, d] = self.dhcp_server.to_be_bytes();
+            option(&[54, 4, a, b, c, d]);
+        }
+        // Asking for the netmask, the router and a DNS server.
+        option(&[55, 3, 1, 3, 6, 255]);
+        message[240..240 + length].copy_from_slice(&options[..length]);
+
+        self.send_datagram(u32::MAX, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &message);
+    }
+
+    fn dhcp_reply(&mut self, message: &[u8]) {
+        if message.len() < 240
+            || message[0] != 2
+            || read_u32(message, 4) != self.transaction
+            || message[28..34] != self.mac
+            || message[236..240] != DHCP_COOKIE
+        {
+            return;
+        }
+
+        let (mut kind, mut netmask, mut router, mut dns, mut server) = (0, 0, 0, 0, 0);
+        let mut at = 240;
+        while at + 1 < message.len() && message[at] != 255 {
+            if message[at] == 0 {
+                at += 1;
+                continue;
+            }
+            let (code, length, value) = (message[at], message[at + 1] as usize, at + 2);
+            if value + length > message.len() {
+                return;
+            }
+            match code {
+                53 if length == 1 => kind = message[value],
+                1 if length == 4 => netmask = read_u32(message, value),
+                3 if length >= 4 => router = read_u32(message, value),
+                6 if length >= 4 => dns = read_u32(message, value),
+                54 if length == 4 => server = read_u32(message, value),
+                _ => {}
+            }
+            at = value + length;
+        }
+
+        match (self.dhcp, kind) {
+            (Dhcp::Discovering, DHCP_OFFER) => {
+                self.offered = read_u32(message, 16);
+                self.dhcp_server = server;
+                self.dhcp = Dhcp::Requesting;
+                self.dhcp_waited = 0;
+                self.dhcp_send(DHCP_REQUEST);
+            }
+            (Dhcp::Requesting, DHCP_ACK) => {
+                self.address = self.offered;
+                self.netmask = netmask;
+                self.gateway = router;
+                self.offered_dns = dns;
+                if self.dns_port == 0 && dns != 0 {
+                    self.dns_server = dns;
+                    self.dns_port = 53;
+                }
+                self.dhcp = Dhcp::Done;
+                for waiter in core::mem::take(&mut self.config_waiters) {
+                    if waiter != 0 {
+                        self.configured(waiter);
+                    }
+                }
+            }
+            (Dhcp::Requesting, DHCP_NAK) => {
+                self.transaction = self.transaction.wrapping_add(1);
+                self.dhcp = Dhcp::Discovering;
+                self.dhcp_waited = 0;
+                self.dhcp_send(DHCP_DISCOVER);
+            }
+            _ => {}
+        }
+    }
+
+    fn dhcp_tick(&mut self) {
+        if self.dhcp == Dhcp::Done {
+            return;
+        }
+        self.dhcp_waited += 1;
+        if self.dhcp_waited >= REQUEST_TICKS {
+            self.dhcp_waited = 0;
+            let kind = if self.dhcp == Dhcp::Discovering { DHCP_DISCOVER } else { DHCP_REQUEST };
+            self.dhcp_send(kind);
+        }
+    }
+
+    fn config(&mut self, reply: u64) {
+        if self.dhcp == Dhcp::Done {
+            self.configured(reply);
+        } else if let Some(slot) = self.config_waiters.iter_mut().find(|waiter| **waiter == 0) {
+            *slot = reply;
+        }
+    }
+
+    fn configured(&self, reply: u64) {
+        let words = [self.address as u64, self.gateway as u64, self.netmask as u64, self.offered_dns as u64];
+        user::ipc_send(reply, &user::Message { tag: net::TAG_NET_CONFIGURED, words, sender: 0, sender_user: 0 });
+    }
+
+    fn resolve(&mut self, buffer: u64, length: usize, reply: u64, token: u64) {
+        let answer = |status: u64| {
+            let words = [token, 0, status, 0];
+            user::ipc_send(reply, &user::Message { tag: net::TAG_RESOLVED, words, sender: 0, sender_user: 0 });
+        };
+        let Some((base, size)) = self.mapping(buffer) else {
+            return;
+        };
+        if length == 0 || length > 253 || length > size as usize {
+            return answer(net::RESOLVE_BAD_NAME);
+        }
+        if self.dns_port == 0 {
+            return answer(net::RESOLVE_TIMED_OUT);
+        }
+        let Some(slot) = self.resolves.iter().position(|r| r.id == 0) else {
+            return answer(net::RESOLVE_TIMED_OUT);
+        };
+
+        let id = self.next_dns_id;
+        self.next_dns_id = self.next_dns_id.wrapping_add(1).max(1);
+        self.resolves[slot] = Resolve { id, reply, token, base, length, waited: 0, tries: 1 };
+        if !self.dns_query(slot) {
+            self.resolves[slot] = Resolve::default();
+            return answer(net::RESOLVE_BAD_NAME);
+        }
+        self.arm_timer();
+    }
+
+    /// Send the lookup in `slot`. `false` if its name is not a name.
+    fn dns_query(&mut self, slot: usize) -> bool {
+        let lookup = self.resolves[slot];
+        // SAFETY: a buffer mapped into this process, and `resolve` checked the
+        // length against its size.
+        let name = unsafe { core::slice::from_raw_parts(lookup.base as *const u8, lookup.length) };
+
+        let mut query = [0u8; 12 + 255 + 4];
+        query[0..2].copy_from_slice(&lookup.id.to_be_bytes());
+        // A standard query, recursion desired, one question.
+        query[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
+        query[4..6].copy_from_slice(&1u16.to_be_bytes());
+        let mut at = 12;
+        for label in name.split(|byte| *byte == b'.') {
+            if label.is_empty() || label.len() > 63 {
+                return false;
+            }
+            query[at] = label.len() as u8;
+            query[at + 1..at + 1 + label.len()].copy_from_slice(label);
+            at += 1 + label.len();
+        }
+        // The root, then type A, class IN.
+        query[at..at + 5].copy_from_slice(&[0, 0, 1, 0, 1]);
+        at += 5;
+
+        let (server, port) = (self.dns_server, self.dns_port);
+        self.send_datagram(server, DNS_LOCAL_PORT + slot as u16, port, &query[..at]);
+        true
+    }
+
+    fn dns_reply(&mut self, slot: usize, message: &[u8]) {
+        let lookup = self.resolves[slot];
+        // An answer, to this question.
+        if message.len() < 12 || read_u16(message, 0) != lookup.id || message[2] & 0x80 == 0 {
+            return;
+        }
+        let code = (message[3] & 0x0F) as u64;
+        let (questions, answers) = (read_u16(message, 4), read_u16(message, 6));
+
+        let mut at = 12;
+        let mut address = None;
+        for _ in 0..questions {
+            at = skip_name(message, at) + 4;
+        }
+        for _ in 0..answers {
+            at = skip_name(message, at);
+            if at + 10 > message.len() {
+                break;
+            }
+            let length = read_u16(message, at + 8) as usize;
+            let (kind, class) = (read_u16(message, at), read_u16(message, at + 2));
+            if kind == 1 && class == 1 && length == 4 && at + 14 <= message.len() {
+                address = Some(read_u32(message, at + 10));
+                break;
+            }
+            at += 10 + length;
+        }
+
+        let (address, status) = match (address, code) {
+            (Some(address), 0) => (address, net::RESOLVE_FOUND),
+            (_, 0) => (0, net::RESOLVE_NO_ADDRESS),
+            (_, code) => (0, code),
+        };
+        self.resolves[slot] = Resolve::default();
+        let words = [lookup.token, address as u64, status, 0];
+        user::ipc_send(lookup.reply, &user::Message { tag: net::TAG_RESOLVED, words, sender: 0, sender_user: 0 });
+    }
+
+    fn dns_tick(&mut self) {
+        for slot in 0..RESOLVERS {
+            let lookup = &mut self.resolves[slot];
+            if lookup.id == 0 {
+                continue;
+            }
+            lookup.waited += 1;
+            if lookup.waited < REQUEST_TICKS {
+                continue;
+            }
+            lookup.waited = 0;
+            lookup.tries += 1;
+            if lookup.tries > DNS_TRIES {
+                let words = [lookup.token, 0, net::RESOLVE_TIMED_OUT, 0];
+                let reply = lookup.reply;
+                self.resolves[slot] = Resolve::default();
+                user::ipc_send(reply, &user::Message { tag: net::TAG_RESOLVED, words, sender: 0, sender_user: 0 });
+            } else {
+                self.dns_query(slot);
+            }
+        }
+    }
+}
+
+/// Past a name in a DNS message: labels ending in the root or in a pointer to
+/// another name. Past the end of the message if it runs off it, which every
+/// caller's bounds check then catches.
+fn skip_name(message: &[u8], mut at: usize) -> usize {
+    while at < message.len() {
+        match message[at] {
+            0 => return at + 1,
+            length if length & 0xC0 == 0xC0 => return at + 2,
+            length => at += 1 + length as usize,
+        }
+    }
+    usize::MAX / 2
 }
