@@ -36,6 +36,7 @@ pub mod memory;
 pub mod net;
 pub mod pci;
 pub mod quota;
+pub mod ring;
 pub mod sched;
 pub mod smp;
 pub mod sync;
@@ -262,6 +263,7 @@ fn map_pci_config(rsdp: u64) {
 /// an endpoint or a graphics buffer is.
 pub fn release_thread_resources(thread: sched::ThreadId) {
     gbm::release_thread(thread);
+    ring::release_thread(thread);
     device::release_thread(thread);
     net::release_thread(thread);
     ipc::release_thread(thread);

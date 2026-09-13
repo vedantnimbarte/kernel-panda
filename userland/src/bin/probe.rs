@@ -19,6 +19,10 @@ pub const MODE_PEEK: u64 = 3;
 pub const MODE_FILES: u64 = 4;
 pub const MODE_DEVICE: u64 = 5;
 pub const MODE_TFTP: u64 = 6;
+pub const MODE_RING_SEND: u64 = 7;
+pub const MODE_RING_RECEIVE: u64 = 8;
+pub const MODE_RING_FORGE_MESSAGE: u64 = 9;
+pub const MODE_RING_MOVE_HEAD: u64 = 10;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -208,6 +212,76 @@ extern "C" fn main(parameters: u64) {
                 words[1 + index / 8] |= (*byte as u64) << (8 * (index % 8));
             }
             user::ipc_send(parameters.report, &user::Message { tag: 0x7F7F, words, sender: 0 });
+        }
+
+        // The two ends of a ring. `endpoint` is the ring, `daemon` the message
+        // count, and the result goes to `report`: messages handled, then
+        // messages that arrived wrong -- or, if mapping was refused, u64::MAX and
+        // the error. A non-zero `address` makes this side dawdle after each
+        // message, far longer than the other side spins, so the other side has
+        // to sleep and be woken.
+        MODE_RING_SEND | MODE_RING_RECEIVE => {
+            use user::ring::{Ring, Side};
+            let report = |words: [u64; 4]| {
+                user::ipc_send(parameters.report, &user::Message { tag: 0x2170, words, sender: 0 });
+            };
+            let side = if parameters.mode == MODE_RING_SEND { Side::Sender } else { Side::Receiver };
+            let ring = match Ring::map(parameters.endpoint, side) {
+                Ok(ring) => ring,
+                Err(error) => {
+                    report([u64::MAX, error as u64, 0, 0]);
+                    user::exit(1);
+                }
+            };
+
+            let (mut handled, mut wrong) = (0u64, 0u64);
+            let mut slot = [0u8; user::ring::SLOT_BYTES];
+            for sequence in 0..parameters.daemon {
+                let check = sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                if side == Side::Sender {
+                    slot[0..8].copy_from_slice(&sequence.to_le_bytes());
+                    slot[8..16].copy_from_slice(&check.to_le_bytes());
+                    if !ring.send(&slot) {
+                        break;
+                    }
+                } else {
+                    if !ring.receive(&mut slot) {
+                        break;
+                    }
+                    let got = u64::from_le_bytes(slot[0..8].try_into().unwrap_or([0; 8]));
+                    let got_check = u64::from_le_bytes(slot[8..16].try_into().unwrap_or([0; 8]));
+                    if got != sequence || got_check != check {
+                        wrong += 1;
+                    }
+                }
+                handled += 1;
+                if parameters.address != 0 {
+                    for _ in 0..50_000 {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+            report([handled, wrong, 0, 0]);
+        }
+
+        // A receiver writing a message, and a sender moving the receiver's
+        // position. Both pages are read-only to them, so both must fault, and
+        // the report after is only reached if they did not.
+        MODE_RING_FORGE_MESSAGE | MODE_RING_MOVE_HEAD => {
+            use user::ring::{Ring, Side};
+            // Slots start at page 3, the receiver's head is at page 2.
+            let (side, offset) = if parameters.mode == MODE_RING_FORGE_MESSAGE {
+                (Side::Receiver, 3 * 4096)
+            } else {
+                (Side::Sender, 2 * 4096)
+            };
+            let Ok(ring) = Ring::map(parameters.endpoint, side) else {
+                user::exit(1);
+            };
+            // SAFETY: deliberately not safe; the page is read-only and this must
+            // fault before the report below.
+            unsafe { core::ptr::write_volatile((ring.base() + offset) as *mut u32, 0xBAD) };
+            user::ipc_send(parameters.report, &user::Message { tag: 0xBAD, words: [0; 4], sender: 0 });
         }
 
         MODE_IPC => {

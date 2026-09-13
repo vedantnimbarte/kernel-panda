@@ -195,6 +195,10 @@ pub mod probe {
     pub const FILES: u64 = 4;
     pub const DEVICE: u64 = 5;
     pub const TFTP: u64 = 6;
+    pub const RING_SEND: u64 = 7;
+    pub const RING_RECEIVE: u64 = 8;
+    pub const RING_FORGE_MESSAGE: u64 = 9;
+    pub const RING_MOVE_HEAD: u64 = 10;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

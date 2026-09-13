@@ -117,6 +117,26 @@ struct Registry {
 }
 
 impl Registry {
+    /// Claim `span` bytes of a thread's shared-mapping area.
+    fn reserve(&mut self, thread: ThreadId, span: u64) -> Result<u64, Error> {
+        // The thread's allocated slot, not its id. Those were the same thing
+        // until slots became reusable, and conflating them is what let the
+        // seventeenth user program index past the end of the region.
+        let slot = userspace::ensure_slot(thread).ok_or(Error::OutOfMemory)?;
+        let slot_base = userspace::slot_base_of(slot);
+        let offset = self
+            .next_offset
+            .entry(thread.0)
+            .or_insert(userspace::BUFFER_AREA_OFFSET);
+
+        if *offset + span > userspace::SLOT_SIZE {
+            return Err(Error::OutOfMemory);
+        }
+        let address = slot_base + *offset;
+        *offset += span;
+        Ok(address)
+    }
+
     fn new() -> Self {
         Self {
             buffers: BTreeMap::new(),
@@ -339,26 +359,13 @@ pub fn map(thread: ThreadId, buffer: BufferId) -> Result<u64, Error> {
             return Ok((Vec::new(), 0u64, *existing));
         }
 
-        // The thread's allocated slot, not its id. Those were the same thing
-        // until slots became reusable, and conflating them is what let the
-        // seventeenth user program index past the end of the region.
-        let slot = userspace::ensure_slot(thread).ok_or(Error::OutOfMemory)?;
-        let slot_base = userspace::slot_base_of(slot);
-        let offset = registry
-            .next_offset
-            .entry(thread.0)
-            .or_insert(userspace::BUFFER_AREA_OFFSET);
-
-        let address = slot_base + *offset;
         let span = entry.info.size.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-
-        if *offset + span > userspace::SLOT_SIZE {
-            return Err(Error::OutOfMemory);
+        let (frames, size) = (entry.frames.clone(), entry.info.size);
+        let address = registry.reserve(thread, span)?;
+        if let Some(entry) = registry.buffers.get_mut(&buffer.0) {
+            entry.mappings.push((thread, address));
         }
-        *offset += span;
-
-        entry.mappings.push((thread, address));
-        Ok((entry.frames.clone(), entry.info.size, address))
+        Ok((frames, size, address))
     })?;
 
     // Already mapped.
@@ -524,6 +531,13 @@ pub fn release_thread(thread: ThreadId) {
             allocator.deallocate(frame);
         }
     });
+}
+
+/// Claim `span` bytes of address space in a thread's shared-mapping area, for
+/// anything else that maps shared memory into processes. One allocator, so a
+/// buffer and a ring can never be handed the same address.
+pub fn reserve_address(thread: ThreadId, span: u64) -> Result<u64, Error> {
+    with(|registry| registry.reserve(thread, span))
 }
 
 pub fn info(thread: ThreadId, buffer: BufferId) -> Result<BufferInfo, Error> {

@@ -38,6 +38,10 @@ pub mod nr {
     pub const NET_SEND: u64 = 24;
     pub const NET_RECEIVE: u64 = 25;
     pub const NET_BIND: u64 = 26;
+    pub const RING_CREATE: u64 = 27;
+    pub const RING_MAP: u64 = 28;
+    pub const RING_WAIT: u64 = 29;
+    pub const RING_WAKE: u64 = 30;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -184,6 +188,191 @@ pub fn net_bind(endpoint: u64) -> i64 {
 
 /// Tag of the kernel's "frames have arrived" notification.
 pub const TAG_NET_RECEIVED: u64 = 0x2_0000;
+
+/// Message rings shared between two processes. See `kernel/src/ring.rs` for the
+/// layout and the reasoning behind it.
+pub mod ring {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use super::{nr, syscall};
+
+    pub const SLOT_BYTES: usize = 64;
+    pub type Slot = [u8; SLOT_BYTES];
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Side {
+        Sender = 0,
+        Receiver = 1,
+    }
+
+    const PAGE: u64 = 4096;
+
+    /// Attempts before a side goes to sleep.
+    ///
+    /// Sleeping costs a system call and a wake another, and when the other side
+    /// is running on its own core the next message is usually a few instructions
+    /// away. Without this, a receiver that keeps up empties the ring after every
+    /// message and sleeps each time -- which put 38,000 system calls into 50,000
+    /// messages, most of the cost of an endpoint for none of its simplicity.
+    const SPINS: u32 = 2_000;
+
+    fn spin_for(mut attempt: impl FnMut() -> bool) -> bool {
+        for _ in 0..SPINS {
+            if attempt() {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// Create a ring of `slots` messages. Returns its endpoint id, which is
+    /// granted like any other.
+    pub fn create(slots: u32) -> i64 {
+        syscall(nr::RING_CREATE, slots as u64, 0, 0)
+    }
+
+    /// One side of a mapped ring.
+    pub struct Ring {
+        endpoint: u64,
+        base: u64,
+        slots: u32,
+    }
+
+    impl Ring {
+        /// Map a side. Refused without the matching right, or if another
+        /// thread already holds that side.
+        pub fn map(endpoint: u64, side: Side) -> Result<Ring, i64> {
+            let base = syscall(nr::RING_MAP, endpoint, side as u64, 0);
+            if base < 0 {
+                return Err(base);
+            }
+            let base = base as u64;
+            // From the page neither side can write.
+            let slots = Self::counter_at(base).load(Ordering::Relaxed);
+            Ok(Ring { endpoint, base, slots })
+        }
+
+        fn counter_at(address: u64) -> &'static AtomicU32 {
+            // SAFETY: inside the ring's header pages, mapped for as long as this
+            // process lives. Read-only where this side may not write -- and
+            // nothing here writes those.
+            unsafe { &*(address as *const AtomicU32) }
+        }
+
+        fn tail(&self) -> &AtomicU32 {
+            Self::counter_at(self.base + PAGE)
+        }
+        fn sender_sleeping(&self) -> &AtomicU32 {
+            Self::counter_at(self.base + PAGE + 4)
+        }
+        fn head(&self) -> &AtomicU32 {
+            Self::counter_at(self.base + 2 * PAGE)
+        }
+        fn receiver_sleeping(&self) -> &AtomicU32 {
+            Self::counter_at(self.base + 2 * PAGE + 4)
+        }
+
+        fn slot(&self, index: u32) -> u64 {
+            self.base + 3 * PAGE + (index % self.slots) as u64 * SLOT_BYTES as u64
+        }
+
+        /// Messages waiting, or `None` if the other side has broken the ring.
+        fn queued(&self) -> Option<u32> {
+            let queued = self.tail().load(Ordering::SeqCst).wrapping_sub(self.head().load(Ordering::SeqCst));
+            (queued <= self.slots).then_some(queued)
+        }
+
+        fn wake_other(&self) {
+            syscall(nr::RING_WAKE, self.endpoint, 0, 0);
+        }
+
+        /// Park until `ready`, flagging it first so the other side knows to
+        /// wake this one. Returns false if the ring is broken.
+        fn sleep_until(&self, flag: &AtomicU32, ready: impl Fn(u32) -> bool) -> bool {
+            // An exchange, so the flag is committed before the look that follows.
+            flag.swap(1, Ordering::SeqCst);
+            let outcome = match self.queued() {
+                None => false,
+                Some(queued) if ready(queued) => true,
+                Some(_) => {
+                    syscall(nr::RING_WAIT, self.endpoint, 0, 0);
+                    true
+                }
+            };
+            flag.swap(0, Ordering::SeqCst);
+            outcome
+        }
+
+        /// Send without waiting. False if the ring is full or broken.
+        pub fn try_send(&self, message: &Slot) -> bool {
+            let tail = self.tail().load(Ordering::SeqCst);
+            match self.queued() {
+                Some(queued) if queued < self.slots => {}
+                _ => return false,
+            }
+            // SAFETY: a slot inside this side's writable slot pages.
+            unsafe {
+                core::ptr::copy_nonoverlapping(message.as_ptr(), self.slot(tail) as *mut u8, SLOT_BYTES)
+            };
+            // Published by exchange before the flag is read. See the kernel's
+            // notes on why the order and the instruction both matter.
+            self.tail().swap(tail.wrapping_add(1), Ordering::SeqCst);
+            if self.receiver_sleeping().load(Ordering::SeqCst) != 0 {
+                self.wake_other();
+            }
+            true
+        }
+
+        /// Send, waiting for room. False if the ring is broken.
+        pub fn send(&self, message: &Slot) -> bool {
+            loop {
+                if spin_for(|| self.try_send(message)) {
+                    return true;
+                }
+                if !self.sleep_until(self.sender_sleeping(), |queued| queued < self.slots) {
+                    return false;
+                }
+            }
+        }
+
+        /// Receive without waiting. False if the ring is empty or broken.
+        pub fn try_receive(&self, out: &mut Slot) -> bool {
+            let head = self.head().load(Ordering::SeqCst);
+            match self.queued() {
+                Some(queued) if queued > 0 => {}
+                _ => return false,
+            }
+            // SAFETY: a slot inside the slot pages, readable by both sides.
+            unsafe {
+                core::ptr::copy_nonoverlapping(self.slot(head) as *const u8, out.as_mut_ptr(), SLOT_BYTES)
+            };
+            self.head().swap(head.wrapping_add(1), Ordering::SeqCst);
+            if self.sender_sleeping().load(Ordering::SeqCst) != 0 {
+                self.wake_other();
+            }
+            true
+        }
+
+        /// Receive, waiting for a message. False if the ring is broken.
+        pub fn receive(&self, out: &mut Slot) -> bool {
+            loop {
+                if spin_for(|| self.try_receive(out)) {
+                    return true;
+                }
+                if !self.sleep_until(self.receiver_sleeping(), |queued| queued > 0) {
+                    return false;
+                }
+            }
+        }
+
+        /// Where the ring is mapped. Tests use it to try writing where they may
+        /// not.
+        pub fn base(&self) -> u64 {
+            self.base
+        }
+    }
+}
 
 /// What the network daemon and its clients say to each other.
 ///

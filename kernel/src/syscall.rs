@@ -39,6 +39,10 @@ pub mod numbers {
     pub const NET_SEND: u64 = 24;
     pub const NET_RECEIVE: u64 = 25;
     pub const NET_BIND: u64 = 26;
+    pub const RING_CREATE: u64 = 27;
+    pub const RING_MAP: u64 = 28;
+    pub const RING_WAIT: u64 = 29;
+    pub const RING_WAKE: u64 = 30;
 }
 
 /// Returned in RAX as a negative value.
@@ -175,6 +179,10 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::NET_SEND => crate::net::sys_send(frame.rdi, frame.rsi),
         numbers::NET_RECEIVE => crate::net::sys_receive(frame.rdi, frame.rsi),
         numbers::NET_BIND => crate::net::sys_bind(frame.rdi),
+        numbers::RING_CREATE => crate::ring::sys_create(frame.rdi),
+        numbers::RING_MAP => crate::ring::sys_map(frame.rdi, frame.rsi),
+        numbers::RING_WAIT => crate::ring::sys_wait(frame.rdi),
+        numbers::RING_WAKE => crate::ring::sys_wake(frame.rdi),
         _ => Err(Error::UnknownCall),
     };
 

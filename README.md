@@ -21,13 +21,13 @@ stack running as an unprivileged process.
 | Scheduling | Preemptive, three priorities, per-CPU run queues with work stealing, sleep and join |
 | Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
-| IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities |
+| IPC | Bounded endpoints, unforgeable sender identity, `SEND`/`RECEIVE`/`GRANT` capabilities, and shared message rings that cost no system call per message |
 | Devices | Local APIC and I/O APIC, PCIe with ECAM and MSI-X, AHCI, NVMe and virtio-blk storage, virtio-net, framebuffer, 16550 serial, PS/2 keyboard and mouse (driven from Ring 3) |
 | Networking | ARP, IPv4, ICMP echo and UDP in a Ring 3 daemon; the kernel only moves Ethernet frames |
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 196 cases across 24 boot-and-assert test kernels, run on four cores
+**Testing:** 201 cases across 25 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -152,6 +152,7 @@ kernel-panda/
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
     │   ├── syscall.rs    the entire Ring 3 surface
     │   ├── ipc.rs        endpoints, capabilities, blocking receive
+    │   ├── ring.rs       message rings two processes share
     │   ├── pci.rs        bus enumeration, BAR decoding, ECAM, MSI-X
     │   ├── net.rs        the virtio-net driver and the frame-moving syscalls
     │   ├── virtio.rs     virtio's legacy PCI interface and virtqueues, shared
@@ -812,6 +813,36 @@ filesystem and reading a file back after a remount. The first NVMe driver put a
 submission queue's completion-queue id where its flags go; QEMU's trace, reading
 "invalid cqid=0", found it faster than the specification did.
 
+**A ring is a queue two processes share, and a busy one never enters the
+kernel.** An endpoint moves each message through two system calls, and a
+context switch whenever the receiver was waiting. A ring is an endpoint with
+pages attached: the sender writes a 64-byte slot and advances its tail, the
+receiver reads it and advances its head, and both do it in memory they map.
+Fifty thousand messages through one cost six system calls in the test — two to
+map, two to report, two to exit.
+
+Capabilities carry over unchanged, because the ring *is* an endpoint: `SEND`
+lets a thread map the sending side, `RECEIVE` the receiving side, and `GRANT`
+hands either on. Each side is claimed by one thread, since two writers on one
+unlocked counter would corrupt it.
+
+The pages are split so each is writable by exactly one party. The sender's page
+holds the tail and the slots; the receiver's holds the head; the slot count is
+on a page neither can write, because both size their reads by it and either
+could otherwise point the other past the end. A receiver that writes a message,
+or a sender that moves the receiver's head, takes a page fault — both tested. A
+side can still lie in its own counter; the other then sees a broken channel,
+and nothing outside the ring's own memory.
+
+A side that finds nothing to do spins briefly, then sets a flag and sleeps; the
+other side, having published its counter, checks the flag and wakes it through
+the kernel. Both writes are exchanges, which on x86 are locked instructions and
+so committed before the read that follows — at least one side always sees the
+other, and a receiver cannot park beside a message. The spin matters: without
+it a receiver that kept up slept after every message, and the first run spent
+38,000 system calls on 50,000 of them. The wake path is tested by making each
+side in turn wait on a deliberately slow partner.
+
 ## Known limits
 
 * Only ever run under QEMU. Firmware variance in ACPI layout and AP start-up
@@ -827,6 +858,9 @@ submission queue's completion-queue id where its flags go; QEMU's trace, reading
   sequence is not decoded. An interrupt line stays routed after its driver
   exits; every ISA line is edge-triggered, so the cost is one ignored interrupt
   per event, not a storm.
+* A ring has exactly one sender and one receiver, fixed 64-byte slots, and at
+  most 4,096 of them. A side spins for 2,000 attempts before sleeping, which is
+  a guess tuned under emulation rather than a measurement on hardware.
 * Disks are polled, one request at a time, through a two-page bounce buffer.
   NVMe namespaces must use 512-byte blocks; one formatted with 4 KiB blocks is
   refused rather than misaddressed. virtio devices are driven through the legacy
