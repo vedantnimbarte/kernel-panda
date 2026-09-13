@@ -201,6 +201,7 @@ pub mod probe {
     pub const RING_MOVE_HEAD: u64 = 10;
     pub const WHOAMI: u64 = 11;
     pub const PERMISSIONS: u64 = 12;
+    pub const LOGIN: u64 = 13;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

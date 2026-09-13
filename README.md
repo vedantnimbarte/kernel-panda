@@ -17,7 +17,7 @@ stack running as an unprivileged process.
 | | |
 |---|---|
 | Memory | Bitmap frame allocator, four-level paging, per-process address spaces, kernel heap |
-| Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas, per-process users with no superuser |
+| Protection | NX, SMEP, SMAP, W^X, guard-paged kernel stacks, per-process quotas, per-process users with no superuser, password logins |
 | Scheduling | Preemptive, three priorities, per-CPU run queues with work stealing, sleep and join |
 | Multiprocessing | Every core started and scheduling, ticket locks, acknowledged TLB shootdown |
 | User space | Ring 3, a trap-gate syscall surface, ELF loading, preemptible system calls, granted I/O ports and interrupt lines |
@@ -27,7 +27,7 @@ stack running as an unprivileged process.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 207 cases across 26 boot-and-assert test kernels, run on four cores
+**Testing:** 210 cases across 27 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -150,7 +150,8 @@ kernel-panda/
     │   ├── acpi.rs    MADT and MCFG: processors, I/O APICs, the PCIe window
     │   ├── quota.rs   per-process resource limits
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
-    │   ├── users.rs      which user each thread runs as
+    │   ├── users.rs      which user each thread runs as, accounts, logging in
+    │   ├── sha256.rs     SHA-256, HMAC and PBKDF2, for password hashes
     │   ├── syscall.rs    the entire Ring 3 surface
     │   ├── ipc.rs        endpoints, capabilities, blocking receive
     │   ├── ring.rs       message rings two processes share
@@ -860,8 +861,19 @@ side in turn wait on a deliberately slow partner.
 thread runs as a user, a number. It starts as its spawner's, and only kernel
 code says otherwise — `sched::spawn_as` sets it before the thread can be picked
 up by any processor, so there is no moment in which a thread runs as someone it
-is not. No system call changes a thread's user: a process cannot promote itself
-or pass itself off as another.
+is not. The one system call that changes a thread's user is logging in, and it
+takes the account's password: a process cannot promote itself, or pass itself
+off as another without knowing what that user knows.
+
+Accounts live in `/users` on the root filesystem, a line each: name, user, a
+salt, and PBKDF2-HMAC-SHA-256 of the password at 10,000 rounds. The file is
+owned by a user no thread runs as and no account may be, with every permission
+bit clear, so no process can read the hashes or open the file up — the system's
+included; the kernel reads it on its own account. A login costs the same rounds
+whether or not the name exists, a wrong name and a wrong password are the same
+refusal, and a refusal waits half a second before returning. The shell's `login`
+reads the password without echoing it. The boot demo formats a blank disk if it
+found no filesystem, adds `panda` with password `panda`, and logs in.
 
 Every message carries its sender's user next to its thread, both stamped by the
 kernel on the way through, so a server can decide by user without trusting what
@@ -915,6 +927,9 @@ everything owned by the system and closed to all.
   daemon holds two frames while an address resolves and drops the rest, keeps
   one datagram per bound port, does not reassemble fragments, and neither sends
   nor checks UDP checksums.
+* Accounts are added only by kernel code; there is no system call to add one or
+  to change a password. Salts are unique but not unpredictable — there is no
+  entropy source — and adding two accounts at once can lose one.
 * A crash record holds the first 4 KiB of a report. Backtraces name functions,
   not lines: file and line need the DWARF data, which is far larger than the
   symbol table and slower to search.
@@ -925,8 +940,6 @@ The gaps that matter, so nobody has to discover them by trying:
 
 * **TCP, DHCP, DNS, IPv6.** The stack speaks ARP, IPv4, ICMP echo and UDP, with
   its address given at start-up.
-* **Logging in.** A process runs as whichever user its spawner chose; there are
-  no accounts, no passwords, and no way for a person to become a user.
 * **A libc or a toolchain for third-party software.** Programs are built in this
   repository's `userland` workspace against its own syscall wrappers.
 * **An IOMMU.** Without one, a Ring 3 driver handed a DMA-capable device is not

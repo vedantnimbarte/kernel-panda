@@ -46,6 +46,7 @@ pub mod numbers {
     pub const GET_USER: u64 = 31;
     pub const FILE_OWNER: u64 = 32;
     pub const FILE_CHMOD: u64 = 33;
+    pub const LOGIN: u64 = 34;
 }
 
 /// Returned in RAX as a negative value.
@@ -192,6 +193,7 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::GET_USER => crate::users::sys_current(),
         numbers::FILE_OWNER => sys_file_owner(frame.rdi, frame.rsi),
         numbers::FILE_CHMOD => sys_file_chmod(frame.rdi, frame.rsi, frame.rdx),
+        numbers::LOGIN => sys_login(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         _ => Err(Error::UnknownCall),
     };
 
@@ -268,6 +270,20 @@ fn sys_file_chmod(path: u64, path_len: u64, mode: u64) -> SyscallResult {
     let mode = u16::try_from(mode).map_err(|_| Error::InvalidArgument)?;
     filesystem()?.set_mode_as(&path, mode, caller())?;
     Ok(0)
+}
+
+/// Become an account's user, given its password. A wrong name and a wrong
+/// password are the same refusal.
+fn sys_login(name: u64, name_len: u64, password: u64, password_len: u64) -> SyscallResult {
+    // Not paths, but the same rules: bounded, validated, UTF-8.
+    let name = read_user_path(name, name_len)?;
+    let password = read_user_path(password, password_len)?;
+    let thread = sched::current_id().ok_or(Error::InvalidArgument)?;
+    match crate::users::login(thread, &name, &password) {
+        Ok(user) => Ok(user as i64),
+        Err(crate::users::AccountError::NoFileSystem) => Err(Error::NoFileSystem),
+        Err(_) => Err(Error::PermissionDenied),
+    }
 }
 
 /// Read a whole file into a user buffer. Returns the bytes written.

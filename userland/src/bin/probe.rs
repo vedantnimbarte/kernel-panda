@@ -25,6 +25,7 @@ pub const MODE_RING_FORGE_MESSAGE: u64 = 9;
 pub const MODE_RING_MOVE_HEAD: u64 = 10;
 pub const MODE_WHOAMI: u64 = 11;
 pub const MODE_PERMISSIONS: u64 = 12;
+pub const MODE_LOGIN: u64 = 13;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -285,6 +286,19 @@ extern "C" fn main(parameters: u64) {
             // fault before the report below.
             unsafe { core::ptr::write_volatile((ring.base() + offset) as *mut u32, 0xBAD) };
             user::ipc_send(parameters.report, &user::Message { tag: 0xBAD, words: [0; 4], sender: 0, sender_user: 0 });
+        }
+
+        // Log in as alice, whose password the test set: first wrongly, then
+        // rightly. Reports the refusal, the user after it, the login, and the
+        // user after that alongside an attempt to read the account database.
+        MODE_LOGIN => {
+            let wrong = user::login("alice", "not the password");
+            let after_wrong = user::user_id();
+            let right = user::login("alice", "correct horse battery staple");
+            let mut buffer = [0u8; 64];
+            let database = user::file_read("/users", &mut buffer);
+            let words = [wrong as u64, after_wrong as u64, right as u64, (user::user_id() as u64) << 32 | database as u32 as u64];
+            user::ipc_send(parameters.endpoint, &user::Message { tag: 0x0413, words, sender: 0, sender_user: 0 });
         }
 
         // Report the user this process runs as, to `endpoint`.

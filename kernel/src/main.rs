@@ -241,8 +241,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!();
 
     println!("shell: a ring 3 daemon reading the serial port");
+    let accounts = demo_accounts();
     let shell = sched::spawn("shell", shell_thread).expect("scheduler not running");
-    for line in ["help", "version", "hello", "exit"] {
+    let login: &[&str] = if accounts { &["login panda", "panda", "whoami"] } else { &[] };
+    for line in ["help", "version", "hello"].iter().chain(login).chain(&["exit"]) {
         type_at_shell(shell, line);
     }
     while sched::is_alive(shell) {
@@ -437,6 +439,43 @@ fn shell_thread() {
     // SAFETY: load_program mapped the entry user-executable and the stack
     // user-writable.
     unsafe { userspace::enter_ring3(image.entry, image.stack_top, 0) }
+}
+
+/// An account to log in to: `panda`, password `panda`.
+///
+/// Accounts live on the root filesystem. If the boot found none, the first disk
+/// that is blank -- no partition table, nothing in its first sectors -- is
+/// formatted to be one. Says whether the account is there.
+fn demo_accounts() -> bool {
+    use alloc::sync::Arc;
+    use panda_kernel::block::{self, partition, BlockDevice, SECTOR_SIZE};
+
+    if panda_kernel::fs::root().is_none() {
+        let blank = |disk: &Arc<dyn BlockDevice>| {
+            let mut start = [0u8; 8 * SECTOR_SIZE];
+            partition::read(&**disk).map_or(true, |p| p.is_empty())
+                && disk.read(0, &mut start).is_ok()
+                && start.iter().all(|byte| *byte == 0)
+        };
+        let Some(disk) = (0..block::count()).filter_map(block::device).find(blank) else {
+            println!("  no filesystem and no blank disk to make one on; no accounts");
+            return false;
+        };
+        match panda_kernel::fs::format::format(disk) {
+            Ok(fs) => panda_kernel::fs::set_root(Arc::new(fs)),
+            Err(error) => {
+                println!("  could not format a blank disk: {error:?}");
+                return false;
+            }
+        }
+    }
+    match panda_kernel::users::add_account("panda", 1000, "panda") {
+        Ok(()) | Err(panda_kernel::users::AccountError::Exists) => true,
+        Err(error) => {
+            println!("  could not add an account: {error:?}");
+            false
+        }
+    }
 }
 
 /// Type a line at the shell as though it had arrived on the serial port.

@@ -45,6 +45,7 @@ pub mod nr {
     pub const GET_USER: u64 = 31;
     pub const FILE_OWNER: u64 = 32;
     pub const FILE_CHMOD: u64 = 33;
+    pub const LOGIN: u64 = 34;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -514,7 +515,20 @@ pub fn file_chmod(path: &str, mode: u16) -> i64 {
     syscall(nr::FILE_CHMOD, path.as_ptr() as u64, path.len() as u64, mode as u64)
 }
 
-/// Returned when the caller's user may not do that to a file.
+/// Become the account `name`'s user, given its password. Returns the user, or
+/// `PERMISSION_DENIED` for a wrong name or password alike.
+pub fn login(name: &str, password: &str) -> i64 {
+    syscall4(
+        nr::LOGIN,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        password.as_ptr() as u64,
+        password.len() as u64,
+    )
+}
+
+/// Returned when the caller's user may not do that to a file, or a login is
+/// refused.
 pub const PERMISSION_DENIED: i64 = -15;
 
 /// Newline-separated names into `buffer`. Returns the bytes written.

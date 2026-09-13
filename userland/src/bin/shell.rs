@@ -20,13 +20,13 @@ extern "C" fn main(_argument: u64) {
 
     loop {
         user::write("panda> ");
-        let length = read_line(&mut line);
+        let length = read_line(&mut line, true);
         let command = core::str::from_utf8(&line[..length]).unwrap_or("");
 
         match command.trim() {
             "" => {}
             "help" => {
-                user::write("commands: help version tid echo exit\n");
+                user::write("commands: help version tid whoami login echo exit\n");
             }
             "version" => {
                 user::write("Kernel Panda, ring 3 shell (rust)\n");
@@ -36,6 +36,12 @@ extern "C" fn main(_argument: u64) {
                 user::write_number(user::thread_id() as u64);
                 user::write("\n");
             }
+            "whoami" => {
+                user::write("user ");
+                user::write_number(user::user_id() as u64);
+                user::write("\n");
+            }
+            other if other.starts_with("login ") => login(other[6..].trim()),
             "exit" => {
                 user::write("shell exiting\n");
                 user::exit(0);
@@ -51,8 +57,25 @@ extern "C" fn main(_argument: u64) {
     }
 }
 
-/// Read one line, echoing as it goes. Returns its length in bytes.
-fn read_line(line: &mut [u8]) -> usize {
+fn login(name: &str) {
+    user::write("password: ");
+    let mut password = [0u8; 128];
+    let length = read_line(&mut password, false);
+    let result = user::login(name, core::str::from_utf8(&password[..length]).unwrap_or(""));
+    password.fill(0);
+
+    if result < 0 {
+        user::write("login incorrect\n");
+    } else {
+        user::write("logged in as user ");
+        user::write_number(result as u64);
+        user::write("\n");
+    }
+}
+
+/// Read one line, echoing as it goes unless told not to. Returns its length in
+/// bytes.
+fn read_line(line: &mut [u8], echo: bool) -> usize {
     let mut length = 0;
 
     loop {
@@ -71,7 +94,9 @@ fn read_line(line: &mut [u8]) -> usize {
         if byte == 0x08 || byte == 0x7F {
             if length > 0 {
                 length -= 1;
-                user::write("\x08 \x08");
+                if echo {
+                    user::write("\x08 \x08");
+                }
             }
             continue;
         }
@@ -79,6 +104,9 @@ fn read_line(line: &mut [u8]) -> usize {
         if length < line.len() {
             line[length] = byte;
             length += 1;
+            if !echo {
+                continue;
+            }
             // SAFETY: a single byte that is not a control code, so valid UTF-8.
             user::write(unsafe { core::str::from_utf8_unchecked(&line[length - 1..length]) });
         }

@@ -752,6 +752,16 @@ impl FileSystem {
     /// As [`Self::create`], for `user`: it needs write permission on the
     /// directory the name goes in, and owns what it creates.
     pub fn create_as(&self, path: &str, kind: NodeKind, user: Option<UserId>) -> Result<(), FsError> {
+        self.create_for(path, kind, user, user.unwrap_or(SYSTEM))
+    }
+
+    /// As [`Self::create`], owned by `owner`. Kernel-facing: the one way a node
+    /// is made for a user other than the one making it.
+    pub fn create_owned_by(&self, path: &str, kind: NodeKind, owner: UserId) -> Result<(), FsError> {
+        self.create_for(path, kind, None, owner)
+    }
+
+    fn create_for(&self, path: &str, kind: NodeKind, user: Option<UserId>, owner: UserId) -> Result<(), FsError> {
         let (_, name) = split_path(path)?;
         check_name(name)?;
 
@@ -762,7 +772,7 @@ impl FileSystem {
 
             let mut inode = Inode {
                 kind: if kind == NodeKind::Directory { 1 } else { 0 },
-                owner: user.unwrap_or(SYSTEM),
+                owner,
                 mode: DEFAULT_MODE,
                 size: 0,
                 blocks_used: 0,
