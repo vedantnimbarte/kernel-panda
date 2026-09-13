@@ -370,3 +370,36 @@ fn stack_tcp_accepts_a_connection_in() {
     assert_eq!(reason, CLOSED_FINISHED, "the connection did not close cleanly");
 }
 
+#[test_case]
+fn stack_tcp_connects_out_over_ipv6() {
+    let [length, hash, reason, _] = tcp_probe(1 << 62 | HOST_TCP_PORT);
+    assert_ne!(length, u64::MAX, "the connection never opened: reason {hash}, step {reason}");
+    let expected = b"hello from the host, over TCP\nyou said: hello from panda\n";
+    assert_eq!(length, expected.len() as u64, "the probe received the wrong number of bytes");
+    assert_eq!(hash, fnv1a(expected), "the bytes received were not the host's");
+    assert_eq!(reason, CLOSED_FINISHED, "the connection did not close cleanly");
+}
+
+#[test_case]
+fn stack_ipv6_takes_an_advertised_prefix_pings_and_resolves() {
+    let (control, _) = stack();
+    let report = ipc::create(me(), 4).expect("create failed");
+    PROBE[0].store(userspace::probe::IPV6, Ordering::Release);
+    PROBE[1].store(control.0, Ordering::Release);
+    PROBE[2].store(report.0, Ordering::Release);
+    PROBE[3].store(0, Ordering::Release);
+    sync::without_interrupts(|| {
+        let id = sched::spawn("ipv6-probe", probe_thread).expect("spawn failed");
+        ipc::grant(me(), id, control, Rights::SEND).expect("grant failed");
+        ipc::grant(me(), id, report, Rights::SEND).expect("grant failed");
+    });
+    assert!(spin_until(|| ipc::queued(report) > 0), "the IPv6 probe reported nothing");
+    let [high, low, pong, resolved] = ipc::receive(me(), report).expect("receive failed").words;
+
+    assert_ne!(high, u64::MAX, "the probe failed at step {low} (tag {pong:#x})");
+    // QEMU advertises fec0::/64; the rest is the MAC, 52:54:00:12:34:56.
+    assert_eq!((high, low), (0xFEC0 << 48, 0x5054_00FF_FE12_3456), "the wrong address was formed");
+    assert_eq!(pong, u64::MAX, "the pong did not say it came over IPv6");
+    // What xtask's DNS server answers: fec0::1234.
+    assert_eq!(resolved, 0x1234 << 8, "panda.test did not resolve to its IPv6 address");
+}

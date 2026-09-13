@@ -533,6 +533,52 @@ pub fn release_thread(thread: ThreadId) {
     });
 }
 
+/// Give a buffer up: out of `thread`'s address space and, unless it owns it,
+/// out of what it may reach. A buffer whose owner has gone is freed once the
+/// last thread holding it lets go -- which, for a server that maps whatever its
+/// clients share, would otherwise be never.
+pub fn unmap(thread: ThreadId, buffer: BufferId) -> Result<(), Error> {
+    let (address, pages) = with(|registry| {
+        let entry = registry.buffers.get(&buffer.0).ok_or(Error::NoSuchEndpoint)?;
+        let (_, address) = entry.mappings.iter().find(|(id, _)| *id == thread).ok_or(Error::InvalidArgument)?;
+        Ok::<_, Error>((*address, entry.info.size.div_ceil(PAGE_SIZE)))
+    })?;
+
+    // The pages go before the record of them, so no moment exists in which the
+    // buffer could be freed with its frames still mapped here.
+    let target = crate::sched::address_space_of(thread).unwrap_or_else(paging::kernel_space);
+    for index in 0..pages {
+        let page = x86_64::structures::paging::Page::<Size4KiB>::containing_address(VirtAddr::new(
+            address + index * PAGE_SIZE,
+        ));
+        // `unmap`, not `unmap_and_free`: the frames are the buffer's.
+        let _ = paging::unmap_in(&target, page);
+    }
+
+    let frames = with(|registry| {
+        let scanout = registry.scanout;
+        let Some(entry) = registry.buffers.get_mut(&buffer.0) else {
+            return Vec::new();
+        };
+        entry.mappings.retain(|(id, _)| *id != thread);
+        entry.shared_with.retain(|other| *other != thread);
+        let unreferenced = entry.orphaned && entry.mappings.is_empty() && entry.shared_with.is_empty();
+        if !unreferenced || scanout == Some(buffer) {
+            return Vec::new();
+        }
+        match registry.buffers.remove(&buffer.0) {
+            Some(entry) if entry.owns_frames => entry.frames,
+            _ => Vec::new(),
+        }
+    });
+    crate::memory::frame::with(|allocator| {
+        for frame in frames {
+            allocator.deallocate(frame);
+        }
+    });
+    Ok(())
+}
+
 /// Claim `span` bytes of address space in a thread's shared-mapping area, for
 /// anything else that maps shared memory into processes. One allocator, so a
 /// buffer and a ring can never be handed the same address.
@@ -601,6 +647,11 @@ pub fn sys_scanout() -> Result<i64, Error> {
 
 pub fn sys_map(buffer: u64) -> Result<i64, Error> {
     Ok(map(current()?, BufferId(buffer))? as i64)
+}
+
+pub fn sys_unmap(buffer: u64) -> Result<i64, Error> {
+    unmap(current()?, BufferId(buffer))?;
+    Ok(0)
 }
 
 pub fn sys_share(buffer: u64, target: u64) -> Result<i64, Error> {

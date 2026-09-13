@@ -244,6 +244,36 @@ fn sharing_a_buffer_grants_access() {
     sched::join(id);
 }
 
+static GIVER_BUFFER: AtomicU64 = AtomicU64::new(u64::MAX);
+static TAKER: AtomicU64 = AtomicU64::new(0);
+
+fn giver() {
+    let buffer = gbm::create(me(), 16, 16).expect("create failed");
+    gbm::share(me(), ThreadId(TAKER.load(Ordering::Acquire) as usize), buffer).expect("share failed");
+    GIVER_BUFFER.store(buffer.0, Ordering::Release);
+}
+
+#[test_case]
+fn giving_up_the_last_hold_on_an_orphan_frees_it() {
+    // A buffer shared with this thread by one that then exits, the way a
+    // client's buffers reach the network daemon.
+    TAKER.store(me().0 as u64, Ordering::Release);
+    let giver = sched::spawn("giver", giver).expect("spawn failed");
+    sched::join(giver);
+    assert!(spin_until(|| GIVER_BUFFER.load(Ordering::Acquire) != u64::MAX), "the giver never shared");
+    let buffer = BufferId(GIVER_BUFFER.load(Ordering::Acquire));
+
+    gbm::map(me(), buffer).expect("a shared buffer could not be mapped");
+    assert!(gbm::info(me(), buffer).is_ok(), "a buffer still held was freed");
+
+    gbm::unmap(me(), buffer).expect("unmap failed");
+    assert!(
+        spin_until(|| gbm::info(me(), buffer) == Err(Error::NoSuchEndpoint)),
+        "an orphan nobody holds was never freed"
+    );
+    assert!(gbm::unmap(me(), buffer).is_err(), "a freed buffer was unmapped again");
+}
+
 #[test_case]
 fn sharing_requires_ownership() {
     let buffer = gbm::create(me(), 16, 16).expect("create failed");

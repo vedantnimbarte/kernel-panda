@@ -49,6 +49,7 @@ pub mod numbers {
     pub const LOGIN: u64 = 34;
     pub const TIMER_SET: u64 = 35;
     pub const RANDOM: u64 = 36;
+    pub const BUF_UNMAP: u64 = 37;
 }
 
 /// Returned in RAX as a negative value.
@@ -198,6 +199,7 @@ pub fn dispatch(frame: &mut SyscallFrame) {
         numbers::LOGIN => sys_login(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         numbers::TIMER_SET => crate::timer::sys_set(frame.rdi, frame.rsi, frame.rdx),
         numbers::RANDOM => crate::random::sys_fill(frame.rdi, frame.rsi),
+        numbers::BUF_UNMAP => crate::gbm::sys_unmap(frame.rdi),
         _ => Err(Error::UnknownCall),
     };
 

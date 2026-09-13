@@ -18,7 +18,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     thread,
@@ -331,13 +331,13 @@ const CRASH_PARTITION_TYPE: &[u8; 16] = b"KernelPandaCrash";
 /// against this, so it is fixed here rather than generated.
 const TFTP_FILE_CONTENTS: &str = "hello from the host, over TFTP\n";
 
-/// A TCP service on the host, which the guest reaches at 10.0.2.2. Must match
+/// A TCP service on the host, which the guest reaches at 10.0.2.2 and fec0::2. Must match
 /// `kernel/tests/net.rs`.
 const HOST_TCP_PORT: u16 = 47110;
 /// A host port QEMU forwards to the guest's port 80.
 const FORWARDED_PORT: u16 = 47111;
 /// A DNS server on the host, which the guest reaches at 10.0.2.2. Knows one
-/// name. Must match `kernel/tests/net.rs`.
+/// name, in both families. Must match `kernel/tests/net.rs`.
 const HOST_DNS_PORT: u16 = 47153;
 
 /// What network tests talk to on the host, for as long as this process lives:
@@ -346,39 +346,44 @@ const HOST_DNS_PORT: u16 = 47153;
 ///   line, and closes;
 /// * a client that keeps connecting to the guest's port 80 until something
 ///   there answers "hello from the host" with "hello from panda";
-/// * a DNS server that says `panda.test` is 10.1.2.3 and that nothing else
-///   exists.
+/// * a DNS server that says `panda.test` is 10.1.2.3 and fec0::1234, and that
+///   nothing else exists.
+///
+/// The servers listen on both loopbacks: QEMU carries the guest's IPv4 to the
+/// host's 127.0.0.1 and its IPv6 to ::1.
 ///
 /// Neither matters to a kernel that does not use the network. A port already
 /// taken is left alone, and the test that needs it fails saying so.
 fn start_host_services() {
-    thread::spawn(|| {
-        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, HOST_TCP_PORT)) else {
-            return;
-        };
-        for mut stream in listener.incoming().flatten() {
-            thread::spawn(move || {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                let _ = stream.write_all(b"hello from the host, over TCP\n");
-                let mut line = String::new();
-                if BufReader::new(&stream).read_line(&mut line).is_ok() {
-                    let _ = stream.write_all(format!("you said: {line}").as_bytes());
-                }
-            });
-        }
-    });
-
-    thread::spawn(|| {
-        let Ok(socket) = UdpSocket::bind((Ipv4Addr::LOCALHOST, HOST_DNS_PORT)) else {
-            return;
-        };
-        let mut query = [0u8; 512];
-        while let Ok((length, client)) = socket.recv_from(&mut query) {
-            if let Some(answer) = dns_answer(&query[..length]) {
-                let _ = socket.send_to(&answer, client);
+    for loopback in [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)] {
+        thread::spawn(move || {
+            let Ok(listener) = TcpListener::bind((loopback, HOST_TCP_PORT)) else {
+                return;
+            };
+            for mut stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                    let _ = stream.write_all(b"hello from the host, over TCP\n");
+                    let mut line = String::new();
+                    if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                        let _ = stream.write_all(format!("you said: {line}").as_bytes());
+                    }
+                });
             }
-        }
-    });
+        });
+
+        thread::spawn(move || {
+            let Ok(socket) = UdpSocket::bind((loopback, HOST_DNS_PORT)) else {
+                return;
+            };
+            let mut query = [0u8; 512];
+            while let Ok((length, client)) = socket.recv_from(&mut query) {
+                if let Some(answer) = dns_answer(&query[..length]) {
+                    let _ = socket.send_to(&answer, client);
+                }
+            }
+        });
+    }
 
     thread::spawn(|| {
         let guest = SocketAddr::from((Ipv4Addr::LOCALHOST, FORWARDED_PORT));
@@ -492,8 +497,8 @@ fn crash_disk(name: &str, fresh: bool) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// The answer to one DNS question: `panda.test` A is 10.1.2.3; everything else
-/// is no such name.
+/// The answer to one DNS question: `panda.test` A is 10.1.2.3 and AAAA is
+/// fec0::1234; everything else is no such name.
 fn dns_answer(query: &[u8]) -> Option<Vec<u8>> {
     if query.len() < 12 || u16::from_be_bytes([query[4], query[5]]) != 1 {
         return None;
@@ -507,15 +512,22 @@ fn dns_answer(query: &[u8]) -> Option<Vec<u8>> {
     }
     let question = query.get(12..at + 5)?;
     let kind = u16::from_be_bytes([query[at + 1], query[at + 2]]);
-    let known = labels.join(".") == "panda.test" && kind == 1;
+    let known = labels.join(".") == "panda.test" && (kind == 1 || kind == 28);
 
     let mut answer = Vec::from(&query[0..2]);
     answer.extend_from_slice(if known { &[0x81, 0x80] } else { &[0x81, 0x83] });
     answer.extend_from_slice(&[0, 1, 0, known as u8, 0, 0, 0, 0]);
     answer.extend_from_slice(question);
     if known {
-        // A pointer to the question's name, then A, IN, a minute, four bytes.
-        answer.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 1, 2, 3]);
+        // A pointer to the question's name, the type, IN, a minute, the address.
+        answer.extend_from_slice(&[0xC0, 12]);
+        answer.extend_from_slice(&kind.to_be_bytes());
+        answer.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+        if kind == 1 {
+            answer.extend_from_slice(&[0, 4, 10, 1, 2, 3]);
+        } else {
+            answer.extend_from_slice(&[0, 16, 0xFE, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34]);
+        }
     }
     Some(answer)
 }
@@ -597,6 +609,12 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool, crash: &Path) -> Resul
     cmd.arg("-netdev")
         .arg(format!("user,id=panda-net,tftp={},hostfwd=tcp:127.0.0.1:{FORWARDED_PORT}-:80", qpath(&tftp)));
     cmd.args(["-device", "virtio-net-pci,netdev=panda-net"]);
+    // `PANDA_PCAP=<file>` records every frame the guest sends and receives, for
+    // reading in Wireshark when a network test goes quiet.
+    if let Some(pcap) = env::var_os("PANDA_PCAP") {
+        cmd.arg("-object")
+            .arg(format!("filter-dump,id=panda-pcap,netdev=panda-net,file={}", qpath(Path::new(&pcap))));
+    }
 
     cmd.args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     // Turn a triple fault into a dead VM instead of an invisible reboot loop.

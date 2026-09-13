@@ -1,4 +1,5 @@
-//! The network daemon: ARP, IPv4, ICMP, UDP, TCP, DHCP and DNS, in Ring 3.
+//! The network daemon: ARP, IPv4, ICMP, IPv6, NDP, UDP, TCP, DHCP and DNS, in
+//! Ring 3.
 //!
 //! The kernel hands this process Ethernet frames and nothing else, so every
 //! byte that arrives from the network is parsed here, by a process with no
@@ -13,10 +14,17 @@
 //!   a few slots while the request goes out.
 //! * **IPv4**: one address, a gateway for everything off the local network, no
 //!   fragments, no options.
-//! * **ICMP**: echo requests are answered; echo replies are matched to pings a
-//!   client asked for.
+//! * **IPv6**: a link-local address made from the MAC, and a global one made
+//!   from the prefix a router advertises; neighbours found by NDP into the same
+//!   cache as ARP's. No extension headers, no fragments, no duplicate address
+//!   detection.
+//! * **ICMP and ICMPv6**: echo requests are answered; echo replies are matched to
+//!   pings a client asked for.
 //! * **UDP**: a client binds a port to a buffer it shares, and sends by naming a
-//!   buffer. Checksums are not sent -- IPv4 allows that -- and not checked.
+//!   buffer. Checksums are sent, and checked on IPv6, where they are mandatory.
+//!
+//! Above the network layer an address is 16 bytes, IPv4 ones held IPv4-mapped
+//! (`::ffff:a.b.c.d`), so UDP, TCP and DNS have one code path for both.
 //! * **TCP**: connections opened and accepted, one segment in flight each way.
 //!   A client's send waits for its acknowledgement before the next, and the
 //!   receive side takes one segment into the client's buffer and closes its
@@ -50,6 +58,8 @@ struct Parameters {
 const MAX_FRAME: usize = 1514;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_IPV6: u16 = 0x86DD;
+const PROTOCOL_ICMPV6: u8 = 58;
 const PROTOCOL_ICMP: u8 = 1;
 const PROTOCOL_UDP: u8 = 17;
 const PROTOCOL_TCP: u8 = 6;
@@ -82,6 +92,42 @@ const DNS_PORT_RANGE: core::ops::Range<u16> = 49152..65535 - RESOLVERS as u16;
 /// Timer ticks before a DHCP or DNS request is sent again, and DNS tries.
 const REQUEST_TICKS: u32 = 10;
 const DNS_TRIES: u32 = 3;
+/// Router solicitations sent before giving up on being told a prefix.
+const SOLICITATIONS: u32 = 3;
+/// Largest TCP payload in one frame over IPv6, whose header is 20 bytes longer.
+const TCP_MSS_V6: usize = net::TCP_MSS - 20;
+
+/// An address of either family: see the module notes.
+type Ip = [u8; 16];
+const UNSPECIFIED: Ip = [0; 16];
+const ALL_NODES: Ip = [0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+const ALL_ROUTERS: Ip = [0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+
+fn mapped(v4: u32) -> Ip {
+    let mut ip = UNSPECIFIED;
+    ip[10..12].copy_from_slice(&[0xFF, 0xFF]);
+    ip[12..].copy_from_slice(&v4.to_be_bytes());
+    ip
+}
+
+fn as_v4(ip: &Ip) -> Option<u32> {
+    (ip[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF]).then(|| read_u32(ip, 12))
+}
+
+fn read_ip(bytes: &[u8], at: usize) -> Ip {
+    bytes[at..at + 16].try_into().unwrap()
+}
+
+fn is_link_local(ip: &Ip) -> bool {
+    ip[0] == 0xFE && ip[1] & 0xC0 == 0x80
+}
+
+/// The multicast group a neighbour solicitation for `ip` goes to.
+fn solicited_node(ip: &Ip) -> Ip {
+    let mut group = [0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0, 0, 0];
+    group[13..].copy_from_slice(&ip[13..]);
+    group
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Dhcp {
@@ -96,6 +142,8 @@ enum Dhcp {
 struct Resolve {
     /// Zero for a free slot.
     id: u16,
+    /// 1 for A, 28 for AAAA.
+    kind: u16,
     reply: u64,
     token: u64,
     base: u64,
@@ -141,7 +189,7 @@ struct Connection {
     /// The thread that opened or accepted it, and the only one that may use it.
     owner: u64,
     reply: u64,
-    remote: u32,
+    remote: Ip,
     remote_port: u16,
     local_port: u16,
     /// The client's receive buffer, and how much of it holds data.
@@ -179,15 +227,16 @@ struct Listener {
 struct Waiting {
     frame: [u8; MAX_FRAME],
     length: usize,
-    /// The address whose MAC the frame is waiting for. Zero for a free slot.
-    next_hop: u32,
+    /// The address whose MAC the frame is waiting for. Unspecified for a free
+    /// slot.
+    next_hop: Ip,
 }
 
 #[derive(Clone, Copy, Default)]
 struct Ping {
     token: u64,
     reply: u64,
-    address: u32,
+    address: Ip,
     /// Echo sequence number, or zero for a free slot.
     sequence: u16,
 }
@@ -205,7 +254,8 @@ struct Stack {
     address: u32,
     gateway: u32,
     netmask: u32,
-    arp: [(u32, [u8; 6]); ARP_ENTRIES],
+    /// Neighbours of both families: ARP's and NDP's.
+    arp: [(Ip, [u8; 6]); ARP_ENTRIES],
     arp_next: usize,
     waiting: [Waiting; WAITING_FRAMES],
     pings: [Ping; PINGS],
@@ -226,10 +276,18 @@ struct Stack {
     dhcp_server: u32,
     offered_dns: u32,
     config_waiters: [u64; CONFIG_WAITERS],
-    dns_server: u32,
+    dns_server: Ip,
     dns_port: u16,
     resolves: [Resolve; RESOLVERS],
     dns_local_port: u16,
+    link_local: Ip,
+    /// Unspecified until a router advertises a prefix.
+    global6: Ip,
+    router6: Ip,
+    dns6: Ip,
+    solicited: u32,
+    solicit_waited: u32,
+    config6_waiters: [u64; CONFIG_WAITERS],
 }
 
 extern "C" fn main(parameters: u64) {
@@ -249,12 +307,12 @@ extern "C" fn main(parameters: u64) {
         address: parameters.address as u32,
         gateway: parameters.gateway as u32,
         netmask: parameters.netmask as u32,
-        arp: [(0, [0; 6]); ARP_ENTRIES],
+        arp: [(UNSPECIFIED, [0; 6]); ARP_ENTRIES],
         arp_next: 0,
         waiting: [Waiting {
             frame: [0; MAX_FRAME],
             length: 0,
-            next_hop: 0,
+            next_hop: UNSPECIFIED,
         }; WAITING_FRAMES],
         pings: [Ping::default(); PINGS],
         next_sequence: 1,
@@ -273,11 +331,23 @@ extern "C" fn main(parameters: u64) {
         dhcp_server: 0,
         offered_dns: 0,
         config_waiters: [0; CONFIG_WAITERS],
-        dns_server: (parameters.dns >> 16) as u32,
+        dns_server: mapped((parameters.dns >> 16) as u32),
         dns_port: parameters.dns as u16,
         resolves: [Resolve::default(); RESOLVERS],
         dns_local_port: DNS_PORT_RANGE.start + (user::random_u64() % DNS_PORT_RANGE.len() as u64) as u16,
+        // fe80::, then the MAC stretched to 64 bits with its universal bit flipped.
+        link_local: [
+            0xFE, 0x80, 0, 0, 0, 0, 0, 0, mac[0] ^ 2, mac[1], mac[2], 0xFF, 0xFE, mac[3], mac[4], mac[5],
+        ],
+        global6: UNSPECIFIED,
+        router6: UNSPECIFIED,
+        dns6: UNSPECIFIED,
+        solicited: 1,
+        solicit_waited: 0,
+        config6_waiters: [0; CONFIG_WAITERS],
     };
+    stack.solicit_router();
+    stack.arm_timer();
     if stack.address == 0 {
         stack.dhcp = Dhcp::Discovering;
         stack.dhcp_send(DHCP_DISCOVER);
@@ -344,15 +414,29 @@ fn fold(mut sum: u64) -> u16 {
     !(sum as u16)
 }
 
-/// A TCP checksum: over a pseudo-header of the addresses, protocol and length,
-/// then the segment. Zero when checking a segment that carries a good one.
-fn tcp_checksum(source: u32, destination: u32, segment: &[u8]) -> u16 {
-    let mut pseudo = [0u8; 12];
-    pseudo[0..4].copy_from_slice(&source.to_be_bytes());
-    pseudo[4..8].copy_from_slice(&destination.to_be_bytes());
-    pseudo[9] = PROTOCOL_TCP;
-    pseudo[10..12].copy_from_slice(&(segment.len() as u16).to_be_bytes());
-    fold(add_words(add_words(0, &pseudo), segment))
+/// The checksum UDP, TCP and ICMPv6 carry: over a pseudo-header of the
+/// addresses, protocol and length -- laid out per family -- then the bytes.
+/// Zero when checking bytes that carry a good one.
+fn transport_checksum(protocol: u8, source: &Ip, destination: &Ip, bytes: &[u8]) -> u16 {
+    let pseudo = match (as_v4(source), as_v4(destination)) {
+        (Some(from), Some(to)) => {
+            let mut pseudo = [0u8; 12];
+            pseudo[0..4].copy_from_slice(&from.to_be_bytes());
+            pseudo[4..8].copy_from_slice(&to.to_be_bytes());
+            pseudo[9] = protocol;
+            pseudo[10..12].copy_from_slice(&(bytes.len() as u16).to_be_bytes());
+            add_words(0, &pseudo)
+        }
+        _ => {
+            let mut pseudo = [0u8; 40];
+            pseudo[0..16].copy_from_slice(source);
+            pseudo[16..32].copy_from_slice(destination);
+            pseudo[32..36].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+            pseudo[39] = protocol;
+            add_words(0, &pseudo)
+        }
+    };
+    fold(add_words(pseudo, bytes))
 }
 
 impl Stack {
@@ -378,6 +462,7 @@ impl Stack {
         match read_u16(frame, 12) {
             ETHERTYPE_ARP => self.arp(&frame[14..]),
             ETHERTYPE_IPV4 => self.ipv4(&frame[14..]),
+            ETHERTYPE_IPV6 => self.ipv6(&frame[14..]),
             _ => {}
         }
     }
@@ -402,7 +487,7 @@ impl Stack {
         if target != self.address {
             return;
         }
-        self.learn(sender, sender_mac);
+        self.learn(mapped(sender), sender_mac);
 
         if operation == 1 {
             let mut reply = [0u8; 42];
@@ -418,7 +503,7 @@ impl Stack {
         }
     }
 
-    fn learn(&mut self, address: u32, mac: [u8; 6]) {
+    fn learn(&mut self, address: Ip, mac: [u8; 6]) {
         match self.arp.iter_mut().find(|(known, _)| *known == address) {
             Some(entry) => entry.1 = mac,
             None => {
@@ -433,7 +518,7 @@ impl Stack {
                 let waiting = &mut self.waiting[slot];
                 waiting.frame[0..6].copy_from_slice(&mac);
                 user::net_send(&waiting.frame[..waiting.length]);
-                waiting.next_hop = 0;
+                waiting.next_hop = UNSPECIFIED;
             }
         }
     }
@@ -463,8 +548,8 @@ impl Stack {
         let payload = &packet[header..total];
         match packet[9] {
             PROTOCOL_ICMP => self.icmp(source, payload),
-            PROTOCOL_UDP => self.udp(source, payload),
-            PROTOCOL_TCP => self.tcp(source, payload),
+            PROTOCOL_UDP => self.udp(mapped(source), mapped(destination), payload),
+            PROTOCOL_TCP => self.tcp(mapped(source), mapped(destination), payload),
             _ => {}
         }
     }
@@ -491,7 +576,7 @@ impl Stack {
                 if let Some(ping) = self
                     .pings
                     .iter_mut()
-                    .find(|ping| ping.sequence == sequence && ping.address == source)
+                    .find(|ping| ping.sequence == sequence && ping.address == mapped(source))
                 {
                     let pong = user::Message {
                         tag: net::TAG_PONG,
@@ -507,8 +592,12 @@ impl Stack {
         }
     }
 
-    fn udp(&mut self, source: u32, datagram: &[u8]) {
+    fn udp(&mut self, source: Ip, destination: Ip, datagram: &[u8]) {
         if datagram.len() < 8 {
+            return;
+        }
+        let v4 = as_v4(&source).is_some();
+        if !v4 && transport_checksum(PROTOCOL_UDP, &source, &destination, datagram) != 0 {
             return;
         }
         let source_port = read_u16(datagram, 0);
@@ -516,7 +605,7 @@ impl Stack {
         let length = (read_u16(datagram, 4) as usize).clamp(8, datagram.len());
         let payload = &datagram[8..length];
 
-        if port == DHCP_CLIENT_PORT && self.dhcp != Dhcp::Done {
+        if v4 && port == DHCP_CLIENT_PORT && self.dhcp != Dhcp::Done {
             self.dhcp_reply(payload);
             return;
         }
@@ -530,14 +619,23 @@ impl Stack {
         let Some(binding) = self.bindings.iter().find(|binding| binding.port == port && binding.base != 0) else {
             return;
         };
-        let take = payload.len().min(binding.size as usize);
+        // An IPv6 source goes ahead of the payload, since it will not fit a word.
+        let skip = if v4 { 0 } else { 16 };
+        if (binding.size as usize) < skip {
+            return;
+        }
+        let take = payload.len().min(binding.size as usize - skip);
         // SAFETY: the client's buffer, mapped into this process with at least
-        // `size` bytes, and `take` never exceeds that.
-        unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), binding.base as *mut u8, take) };
+        // `size` bytes, and `skip + take` never exceeds that.
+        unsafe {
+            core::ptr::copy_nonoverlapping(source.as_ptr(), binding.base as *mut u8, skip);
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), (binding.base as usize + skip) as *mut u8, take);
+        }
 
+        let from = as_v4(&source).map_or(net::IPV6, u64::from);
         let announcement = user::Message {
             tag: net::TAG_DATAGRAM,
-            words: [take as u64, source as u64, source_port as u64, port as u64],
+            words: [take as u64, from, source_port as u64, port as u64],
             sender: 0,
             sender_user: 0,
         };
@@ -579,11 +677,11 @@ impl Stack {
             user::net_send(&frame[..length]);
             return;
         }
-        let next_hop = if destination & self.netmask == self.address & self.netmask {
+        let next_hop = mapped(if destination & self.netmask == self.address & self.netmask {
             destination
         } else {
             self.gateway
-        };
+        });
 
         if let Some(&(_, mac)) = self.arp.iter().find(|(known, _)| *known == next_hop) {
             frame[0..6].copy_from_slice(&mac);
@@ -591,14 +689,39 @@ impl Stack {
             return;
         }
 
-        // Park it until the address resolves. With every slot taken the frame
-        // is dropped; whoever sent it retries or gives up.
-        if let Some(slot) = self.waiting.iter_mut().find(|slot| slot.next_hop == 0) {
-            slot.frame[..length].copy_from_slice(&frame[..length]);
-            slot.length = length;
+        self.park(&frame[..length], next_hop);
+        if let Some(address) = as_v4(&next_hop) {
+            self.request_mac(address);
+        }
+    }
+
+    /// Hold a frame until its next hop's MAC is known. With every slot taken
+    /// the frame is dropped; whoever sent it retries or gives up.
+    fn park(&mut self, frame: &[u8], next_hop: Ip) {
+        if let Some(slot) = self.waiting.iter_mut().find(|slot| slot.next_hop == UNSPECIFIED) {
+            slot.frame[..frame.len()].copy_from_slice(frame);
+            slot.length = frame.len();
             slot.next_hop = next_hop;
         }
-        self.request_mac(next_hop);
+    }
+
+    /// Send `payload` to either family.
+    fn send_ip(&mut self, destination: &Ip, protocol: u8, payload: &[u8]) {
+        match as_v4(destination) {
+            Some(address) => self.send_ipv4(address, protocol, payload),
+            None => self.send_ipv6(destination, protocol, payload),
+        }
+    }
+
+    /// The address this machine sends to `destination` from.
+    fn source_for(&self, destination: &Ip) -> Ip {
+        if as_v4(destination).is_some() {
+            mapped(self.address)
+        } else if is_link_local(destination) || destination[0] == 0xFF || self.global6 == UNSPECIFIED {
+            self.link_local
+        } else {
+            self.global6
+        }
     }
 
     fn request_mac(&self, address: u32) {
@@ -618,13 +741,15 @@ impl Stack {
     fn command(&mut self, message: &user::Message) {
         let [a, b, c, d] = message.words;
         match message.tag {
-            net::TAG_PING => self.ping(a as u32, b, c),
+            net::TAG_PING => self.ping(a, b, c, d),
             net::TAG_UDP_BIND => self.bind(a as u16, b, c),
-            net::TAG_UDP_SEND => self.send_udp(a, b as usize, c as u32, (d >> 16) as u16, d as u16),
-            net::TAG_TCP_CONNECT => self.connect(message.sender, a as u32, (b >> 16) as u16, b as u16, c, d),
+            net::TAG_UDP_SEND => self.send_udp(a, b as usize, c, (d >> 16) as u16, d as u16),
+            net::TAG_TCP_CONNECT => self.connect(message.sender, a, (b >> 16) as u16, b as u16, c, d),
             net::TAG_TCP_LISTEN => self.listen(message.sender, a as u16, b, c),
             net::TAG_NET_CONFIG => self.config(a),
-            net::TAG_RESOLVE => self.resolve(a, b as usize, c, d),
+            net::TAG_RESOLVE => self.resolve(a, b as usize, c, d, 1),
+            net::TAG_RESOLVE6 => self.resolve(a, b as usize, c, d, 28),
+            net::TAG_NET_CONFIG6 => self.config6(a),
             _ => {}
         }
 
@@ -650,7 +775,21 @@ impl Stack {
         }
     }
 
-    fn ping(&mut self, address: u32, reply: u64, token: u64) {
+    /// The address a client named: a word for IPv4, or `IPV6` and the 16 bytes
+    /// at the start of `buffer`.
+    fn named_address(&mut self, word: u64, buffer: u64) -> Option<Ip> {
+        if word != net::IPV6 {
+            return Some(mapped(word as u32));
+        }
+        let (base, size) = self.mapping(buffer)?;
+        // SAFETY: a mapped buffer of `size` bytes, checked to hold 16.
+        (size >= 16).then(|| unsafe { core::ptr::read_unaligned(base as *const Ip) })
+    }
+
+    fn ping(&mut self, word: u64, reply: u64, token: u64, buffer: u64) {
+        let Some(address) = self.named_address(word, buffer) else {
+            return;
+        };
         let Some(slot) = self.pings.iter().position(|ping| ping.sequence == 0) else {
             return;
         };
@@ -665,33 +804,60 @@ impl Stack {
         };
 
         let mut echo = [0u8; 8 + 32];
-        echo[0] = 8;
         echo[4..6].copy_from_slice(&PING_IDENTIFIER.to_be_bytes());
         echo[6..8].copy_from_slice(&sequence.to_be_bytes());
         for (index, byte) in echo[8..].iter_mut().enumerate() {
             *byte = b'a' + (index % 26) as u8;
         }
-        let sum = checksum(&echo);
-        echo[2..4].copy_from_slice(&sum.to_be_bytes());
-        self.send_ipv4(address, PROTOCOL_ICMP, &echo);
+        match as_v4(&address) {
+            Some(v4) => {
+                echo[0] = 8;
+                let sum = checksum(&echo);
+                echo[2..4].copy_from_slice(&sum.to_be_bytes());
+                self.send_ipv4(v4, PROTOCOL_ICMP, &echo);
+            }
+            None => {
+                echo[0] = 128;
+                self.send_icmpv6(&address, &mut echo);
+            }
+        }
     }
 
-    /// A buffer the client shared, mapped into this process once.
+    /// A buffer the client shared, mapped into this process once. With the
+    /// table full, one that nothing refers to any more is given up for it:
+    /// clients come and go, and each brings buffers of its own.
     fn mapping(&mut self, buffer: u64) -> Option<(u64, u64)> {
         if let Some(&(_, base, size)) = self.mappings.iter().find(|(handle, _, _)| *handle == buffer) {
             return Some((base, size));
         }
+        let slot = match self.mappings.iter().position(|(handle, _, _)| *handle == 0) {
+            Some(slot) => slot,
+            None => {
+                let slot = self.mappings.iter().position(|&(_, base, _)| !self.refers_to(base))?;
+                user::buffer_unmap(self.mappings[slot].0);
+                self.mappings[slot] = (0, 0, 0);
+                slot
+            }
+        };
         let base = user::buffer_map(buffer);
         if base < 0 {
             return None;
         }
         let mut info = user::BufferInfo::default();
         if user::buffer_info(buffer, &mut info) < 0 {
+            user::buffer_unmap(buffer);
             return None;
         }
-        let slot = self.mappings.iter().position(|(handle, _, _)| *handle == 0)?;
         self.mappings[slot] = (buffer, base as u64, info.size);
         Some((base as u64, info.size))
+    }
+
+    /// Whether anything still in use reads or writes the buffer mapped at `base`.
+    fn refers_to(&self, base: u64) -> bool {
+        self.bindings.iter().any(|b| b.base == base)
+            || self.listeners.iter().any(|l| l.base == base)
+            || self.connections.iter().any(|c| c.state != State::Free && (c.base == base || c.flight_base == base))
+            || self.resolves.iter().any(|r| r.id != 0 && r.base == base)
     }
 
     fn bind(&mut self, port: u16, reply: u64, buffer: u64) {
@@ -712,29 +878,45 @@ impl Stack {
         }
     }
 
-    fn send_udp(&mut self, buffer: u64, length: usize, destination: u32, local: u16, remote: u16) {
-        let Some((base, size)) = self.mapping(buffer) else {
+    fn send_udp(&mut self, buffer: u64, length: usize, word: u64, local: u16, remote: u16) {
+        let (Some((base, size)), Some(destination)) = (self.mapping(buffer), self.named_address(word, buffer)) else {
             return;
         };
+        // For IPv6 the payload follows the address.
+        let skip = if word == net::IPV6 { 16 } else { 0 };
+        let room = if skip == 0 { MAX_FRAME - 34 } else { MAX_FRAME - 54 };
         let mut datagram = [0u8; MAX_FRAME - 34];
-        if length > size as usize || 8 + length > datagram.len() {
+        if skip + length > size as usize || 8 + length > room {
             return;
         }
         datagram[0..2].copy_from_slice(&local.to_be_bytes());
         datagram[2..4].copy_from_slice(&remote.to_be_bytes());
         datagram[4..6].copy_from_slice(&((8 + length) as u16).to_be_bytes());
-        // SAFETY: the client's buffer, mapped with `size` bytes, and `length`
-        // was checked against it.
-        unsafe { core::ptr::copy_nonoverlapping(base as *const u8, datagram[8..].as_mut_ptr(), length) };
-        self.send_ipv4(destination, PROTOCOL_UDP, &datagram[..8 + length]);
+        // SAFETY: the client's buffer, mapped with `size` bytes, and
+        // `skip + length` was checked against it.
+        unsafe { core::ptr::copy_nonoverlapping((base as usize + skip) as *const u8, datagram[8..].as_mut_ptr(), length) };
+        self.send_udp_datagram(&destination, &mut datagram[..8 + length]);
+    }
+
+    /// Checksum a UDP datagram and send it. Zero means "no checksum", so a
+    /// checksum that works out to zero is sent as all ones.
+    fn send_udp_datagram(&mut self, destination: &Ip, datagram: &mut [u8]) {
+        datagram[6..8].fill(0);
+        let source = self.source_for(destination);
+        let sum = match transport_checksum(PROTOCOL_UDP, &source, destination, datagram) {
+            0 => 0xFFFF,
+            sum => sum,
+        };
+        datagram[6..8].copy_from_slice(&sum.to_be_bytes());
+        self.send_ip(destination, PROTOCOL_UDP, datagram);
     }
 }
 
 // --- TCP ---------------------------------------------------------------------
 
 impl Stack {
-    fn tcp(&mut self, source: u32, segment: &[u8]) {
-        if segment.len() < 20 || tcp_checksum(source, self.address, segment) != 0 {
+    fn tcp(&mut self, source: Ip, destination: Ip, segment: &[u8]) {
+        if segment.len() < 20 || transport_checksum(PROTOCOL_TCP, &source, &destination, segment) != 0 {
             return;
         }
         let remote_port = read_u16(segment, 0);
@@ -761,10 +943,10 @@ impl Stack {
             // Nothing here: refuse, in the form RFC 793 asks for.
             let length = payload.len() as u32 + (flags & (SYN | FIN) != 0) as u32;
             if flags & ACK != 0 {
-                self.segment(source, local_port, remote_port, acknowledgement, 0, RST, 0, &[]);
+                self.segment(&source, local_port, remote_port, acknowledgement, 0, RST, 0, &[]);
             } else {
                 let ack = sequence.wrapping_add(length);
-                self.segment(source, local_port, remote_port, 0, ack, RST | ACK, 0, &[]);
+                self.segment(&source, local_port, remote_port, 0, ack, RST | ACK, 0, &[]);
             }
             return;
         };
@@ -861,7 +1043,7 @@ impl Stack {
     }
 
     /// A SYN for a port someone is listening on becomes a connection.
-    fn accept(&mut self, source: u32, remote_port: u16, local_port: u16, sequence: u32) -> bool {
+    fn accept(&mut self, source: Ip, remote_port: u16, local_port: u16, sequence: u32) -> bool {
         let Some(listener) = self.listeners.iter().position(|l| l.port == local_port && l.base != 0) else {
             return false;
         };
@@ -894,8 +1076,8 @@ impl Stack {
         user::random_u64() as u32
     }
 
-    fn connect(&mut self, owner: u64, address: u32, local_port: u16, remote_port: u16, reply: u64, buffer: u64) {
-        let Some((base, size)) = self.mapping(buffer) else {
+    fn connect(&mut self, owner: u64, word: u64, local_port: u16, remote_port: u16, reply: u64, buffer: u64) {
+        let (Some((base, size)), Some(address)) = (self.mapping(buffer), self.named_address(word, buffer)) else {
             return;
         };
         let Some(index) = self.connections.iter().position(|c| c.state == State::Free) else {
@@ -942,11 +1124,15 @@ impl Stack {
         let idle = connection.unacknowledged == connection.next_send && !connection.close_requested;
         let mapped = self.mapping(buffer);
         match mapped {
-            Some((base, size)) if open && idle && length > 0 && length <= net::TCP_MSS && length <= size as usize => {
+            Some((base, size)) if open && idle && length > 0 && length <= Self::mss(&connection.remote) && length <= size as usize => {
                 self.start_flight(index, PSH, base, length);
             }
             _ => self.tell(index, net::TAG_TCP_SENT, [index as u64, 0, 0, 0]),
         }
+    }
+
+    fn mss(remote: &Ip) -> usize {
+        if as_v4(remote).is_some() { net::TCP_MSS } else { TCP_MSS_V6 }
     }
 
     fn close(&mut self, index: usize) {
@@ -1046,13 +1232,13 @@ impl Stack {
         // Shut while the client has data to read, so nothing arrives that
         // there is no room for.
         let window = if c.delivered { 0 } else { (c.size as usize - c.filled).min(0xFFFF) as u16 };
-        self.segment(c.remote, c.local_port, c.remote_port, sequence, c.next_receive, flags, window, payload);
+        self.segment(&c.remote, c.local_port, c.remote_port, sequence, c.next_receive, flags, window, payload);
     }
 
     #[allow(clippy::too_many_arguments)]
     fn segment(
         &mut self,
-        destination: u32,
+        destination: &Ip,
         local_port: u16,
         remote_port: u16,
         sequence: u32,
@@ -1074,18 +1260,26 @@ impl Stack {
         segment[13] = flags;
         segment[14..16].copy_from_slice(&window.to_be_bytes());
         if header == 24 {
-            segment[20..24].copy_from_slice(&[2, 4, 0x05, 0xB4]);
+            segment[20..22].copy_from_slice(&[2, 4]);
+            segment[22..24].copy_from_slice(&(Self::mss(destination) as u16).to_be_bytes());
         }
         segment[header..header + payload.len()].copy_from_slice(payload);
         let length = header + payload.len();
-        let sum = tcp_checksum(self.address, destination, &segment[..length]);
+        let source = self.source_for(destination);
+        let sum = transport_checksum(PROTOCOL_TCP, &source, destination, &segment[..length]);
         segment[16..18].copy_from_slice(&sum.to_be_bytes());
-        self.send_ipv4(destination, PROTOCOL_TCP, &segment[..length]);
+        self.send_ip(destination, PROTOCOL_TCP, &segment[..length]);
     }
 
     fn announce_open(&mut self, index: usize) {
         let c = self.connections[index];
-        let words = [index as u64, c.remote as u64, c.remote_port as u64, c.local_port as u64];
+        if as_v4(&c.remote).is_none() && c.size >= 16 {
+            // SAFETY: the client's mapped buffer, checked to hold 16 bytes. No
+            // data has arrived to be overwritten: this is the first news of it.
+            unsafe { core::ptr::write_unaligned(c.base as *mut Ip, c.remote) };
+        }
+        let remote = as_v4(&c.remote).map_or(net::IPV6, u64::from);
+        let words = [index as u64, remote, c.remote_port as u64, c.local_port as u64];
         self.tell(index, net::TAG_TCP_OPEN, words);
     }
 
@@ -1103,7 +1297,8 @@ impl Stack {
     fn arm_timer(&mut self) {
         let waiting = self.connections.iter().any(|c| c.state != State::Free && c.unacknowledged != c.next_send)
             || self.dhcp != Dhcp::Done
-            || self.resolves.iter().any(|r| r.id != 0);
+            || self.resolves.iter().any(|r| r.id != 0)
+            || (self.global6 == UNSPECIFIED && self.solicited < SOLICITATIONS);
         if waiting && !self.timer_armed && user::timer_set(self.control, TICK_MS, 0) >= 0 {
             self.timer_armed = true;
         }
@@ -1115,6 +1310,7 @@ impl Stack {
         self.timer_armed = false;
         self.dhcp_tick();
         self.dns_tick();
+        self.solicit_tick();
         for index in 0..CONNECTIONS {
             let connection = &mut self.connections[index];
             if connection.state == State::Free || connection.unacknowledged == connection.next_send {
@@ -1142,14 +1338,14 @@ impl Stack {
 
 impl Stack {
     /// A UDP datagram of this daemon's own, rather than a client's.
-    fn send_datagram(&mut self, destination: u32, local: u16, remote: u16, payload: &[u8]) {
+    fn send_datagram(&mut self, destination: &Ip, local: u16, remote: u16, payload: &[u8]) {
         let mut datagram = [0u8; 8 + 512];
         let length = 8 + payload.len();
         datagram[0..2].copy_from_slice(&local.to_be_bytes());
         datagram[2..4].copy_from_slice(&remote.to_be_bytes());
         datagram[4..6].copy_from_slice(&(length as u16).to_be_bytes());
         datagram[8..length].copy_from_slice(payload);
-        self.send_ipv4(destination, PROTOCOL_UDP, &datagram[..length]);
+        self.send_udp_datagram(destination, &mut datagram[..length]);
     }
 
     fn dhcp_send(&mut self, kind: u8) {
@@ -1179,7 +1375,7 @@ impl Stack {
         option(&[55, 3, 1, 3, 6, 255]);
         message[240..240 + length].copy_from_slice(&options[..length]);
 
-        self.send_datagram(u32::MAX, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &message);
+        self.send_datagram(&mapped(u32::MAX), DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &message);
     }
 
     fn dhcp_reply(&mut self, message: &[u8]) {
@@ -1228,7 +1424,7 @@ impl Stack {
                 self.gateway = router;
                 self.offered_dns = dns;
                 if self.dns_port == 0 && dns != 0 {
-                    self.dns_server = dns;
+                    self.dns_server = mapped(dns);
                     self.dns_port = 53;
                 }
                 self.dhcp = Dhcp::Done;
@@ -1273,7 +1469,7 @@ impl Stack {
         user::ipc_send(reply, &user::Message { tag: net::TAG_NET_CONFIGURED, words, sender: 0, sender_user: 0 });
     }
 
-    fn resolve(&mut self, buffer: u64, length: usize, reply: u64, token: u64) {
+    fn resolve(&mut self, buffer: u64, length: usize, reply: u64, token: u64, kind: u16) {
         let answer = |status: u64| {
             let words = [token, 0, status, 0];
             user::ipc_send(reply, &user::Message { tag: net::TAG_RESOLVED, words, sender: 0, sender_user: 0 });
@@ -1281,7 +1477,8 @@ impl Stack {
         let Some((base, size)) = self.mapping(buffer) else {
             return;
         };
-        if length == 0 || length > 253 || length > size as usize {
+        // An IPv6 answer is written over the start of the buffer.
+        if length == 0 || length > 253 || length > size as usize || (kind == 28 && size < 16) {
             return answer(net::RESOLVE_BAD_NAME);
         }
         if self.dns_port == 0 {
@@ -1293,7 +1490,7 @@ impl Stack {
 
         // Random, and never zero, which marks a free slot.
         let id = (user::random_u64() as u16).max(1);
-        self.resolves[slot] = Resolve { id, reply, token, base, length, waited: 0, tries: 1 };
+        self.resolves[slot] = Resolve { id, kind, reply, token, base, length, waited: 0, tries: 1 };
         if !self.dns_query(slot) {
             self.resolves[slot] = Resolve::default();
             return answer(net::RESOLVE_BAD_NAME);
@@ -1322,12 +1519,14 @@ impl Stack {
             query[at + 1..at + 1 + label.len()].copy_from_slice(label);
             at += 1 + label.len();
         }
-        // The root, then type A, class IN.
-        query[at..at + 5].copy_from_slice(&[0, 0, 1, 0, 1]);
+        // The root, the type, class IN.
+        query[at] = 0;
+        query[at + 1..at + 3].copy_from_slice(&lookup.kind.to_be_bytes());
+        query[at + 3..at + 5].copy_from_slice(&[0, 1]);
         at += 5;
 
         let (server, port) = (self.dns_server, self.dns_port);
-        self.send_datagram(server, self.dns_local_port + slot as u16, port, &query[..at]);
+        self.send_datagram(&server, self.dns_local_port + slot as u16, port, &query[..at]);
         true
     }
 
@@ -1341,7 +1540,8 @@ impl Stack {
         let (questions, answers) = (read_u16(message, 4), read_u16(message, 6));
 
         let mut at = 12;
-        let mut address = None;
+        let mut found = false;
+        let mut address = 0;
         for _ in 0..questions {
             at = skip_name(message, at) + 4;
         }
@@ -1352,20 +1552,29 @@ impl Stack {
             }
             let length = read_u16(message, at + 8) as usize;
             let (kind, class) = (read_u16(message, at), read_u16(message, at + 2));
-            if kind == 1 && class == 1 && length == 4 && at + 14 <= message.len() {
-                address = Some(read_u32(message, at + 10));
+            let size = if lookup.kind == 1 { 4 } else { 16 };
+            if kind == lookup.kind && class == 1 && length == size && at + 10 + size <= message.len() {
+                found = true;
+                if size == 4 {
+                    address = read_u32(message, at + 10) as u64;
+                } else {
+                    address = net::IPV6;
+                    // SAFETY: the lookup's mapped buffer, which `resolve` checked
+                    // holds 16 bytes.
+                    unsafe { core::ptr::copy_nonoverlapping(message[at + 10..].as_ptr(), lookup.base as *mut u8, 16) };
+                }
                 break;
             }
             at += 10 + length;
         }
 
-        let (address, status) = match (address, code) {
-            (Some(address), 0) => (address, net::RESOLVE_FOUND),
+        let (address, status) = match (found, code) {
+            (true, 0) => (address, net::RESOLVE_FOUND),
             (_, 0) => (0, net::RESOLVE_NO_ADDRESS),
             (_, code) => (0, code),
         };
         self.resolves[slot] = Resolve::default();
-        let words = [lookup.token, address as u64, status, 0];
+        let words = [lookup.token, address, status, 0];
         user::ipc_send(lookup.reply, &user::Message { tag: net::TAG_RESOLVED, words, sender: 0, sender_user: 0 });
     }
 
@@ -1405,4 +1614,236 @@ fn skip_name(message: &[u8], mut at: usize) -> usize {
         }
     }
     usize::MAX / 2
+}
+
+// --- IPv6 --------------------------------------------------------------------
+
+impl Stack {
+    fn ipv6(&mut self, packet: &[u8]) {
+        if packet.len() < 40 || packet[0] >> 4 != 6 {
+            return;
+        }
+        let length = read_u16(packet, 4) as usize;
+        if 40 + length > packet.len() {
+            return;
+        }
+        let (next_header, hop_limit) = (packet[6], packet[7]);
+        let (source, destination) = (read_ip(packet, 8), read_ip(packet, 24));
+        // The global address shares its last 24 bits with the link-local one, so
+        // one solicited-node group covers both.
+        let ours = destination == self.link_local
+            || (destination == self.global6 && self.global6 != UNSPECIFIED)
+            || destination == ALL_NODES
+            || destination == solicited_node(&self.link_local);
+        if !ours {
+            return;
+        }
+
+        let payload = &packet[40..40 + length];
+        match next_header {
+            PROTOCOL_ICMPV6 => self.icmpv6(source, destination, hop_limit, payload),
+            PROTOCOL_UDP => self.udp(source, destination, payload),
+            PROTOCOL_TCP => self.tcp(source, destination, payload),
+            // Extension headers are not followed.
+            _ => {}
+        }
+    }
+
+    fn icmpv6(&mut self, source: Ip, destination: Ip, hop_limit: u8, message: &[u8]) {
+        if message.len() < 8 || transport_checksum(PROTOCOL_ICMPV6, &source, &destination, message) != 0 {
+            return;
+        }
+        // Neighbour discovery must come from the link itself: a router would
+        // have spent a hop, so anything less than 255 was forwarded.
+        let from_link = hop_limit == 255;
+        match message[0] {
+            // Echo request.
+            128 => {
+                let mut reply = [0u8; MAX_FRAME - 54];
+                let length = message.len().min(reply.len());
+                reply[..length].copy_from_slice(&message[..length]);
+                reply[0] = 129;
+                self.send_icmpv6(&source, &mut reply[..length]);
+            }
+            // Echo reply to one of ours.
+            129 if read_u16(message, 4) == PING_IDENTIFIER => {
+                let sequence = read_u16(message, 6);
+                if let Some(ping) = self.pings.iter_mut().find(|p| p.sequence == sequence && p.address == source) {
+                    let pong = user::Message { tag: net::TAG_PONG, words: [ping.token, net::IPV6, 0, 0], sender: 0, sender_user: 0 };
+                    user::ipc_send(ping.reply, &pong);
+                    ping.sequence = 0;
+                }
+            }
+            // Router advertisement.
+            134 if from_link && is_link_local(&source) && message.len() >= 16 => {
+                let (mut prefix, mut dns) = (None, UNSPECIFIED);
+                for (kind, option) in options(&message[16..]) {
+                    match kind {
+                        1 if option.len() >= 8 => self.learn(source, option[2..8].try_into().unwrap()),
+                        3 if option.len() >= 32 && option[2] == 64 => prefix = Some(read_ip(option, 16)),
+                        25 if option.len() >= 24 => dns = read_ip(option, 8),
+                        _ => {}
+                    }
+                }
+                let Some(prefix) = prefix else {
+                    return;
+                };
+                self.router6 = source;
+                if self.global6 == UNSPECIFIED {
+                    self.global6[..8].copy_from_slice(&prefix[..8]);
+                    self.global6[8..].copy_from_slice(&self.link_local[8..]);
+                }
+                if dns != UNSPECIFIED {
+                    self.dns6 = dns;
+                    if self.dns_port == 0 {
+                        self.dns_server = dns;
+                        self.dns_port = 53;
+                    }
+                }
+                for waiter in core::mem::take(&mut self.config6_waiters) {
+                    if waiter != 0 {
+                        self.configured6(waiter);
+                    }
+                }
+            }
+            // Neighbour solicitation.
+            135 if from_link && message.len() >= 24 => {
+                let target = read_ip(message, 8);
+                if target != self.link_local && (target != self.global6 || self.global6 == UNSPECIFIED) {
+                    return;
+                }
+                if source != UNSPECIFIED {
+                    if let Some((_, option)) = options(&message[24..]).find(|(kind, o)| *kind == 1 && o.len() >= 8) {
+                        self.learn(source, option[2..8].try_into().unwrap());
+                    }
+                }
+                // Solicited and override, unless it came from nobody in
+                // particular, in which case the answer goes to everyone.
+                let mut advert = [0u8; 32];
+                advert[0] = 136;
+                advert[4] = if source == UNSPECIFIED { 0x20 } else { 0x60 };
+                advert[8..24].copy_from_slice(&target);
+                advert[24..26].copy_from_slice(&[2, 1]);
+                advert[26..32].copy_from_slice(&self.mac);
+                let to = if source == UNSPECIFIED { ALL_NODES } else { source };
+                self.send_icmpv6(&to, &mut advert);
+            }
+            // Neighbour advertisement.
+            136 if from_link && message.len() >= 24 => {
+                let target = read_ip(message, 8);
+                if let Some((_, option)) = options(&message[24..]).find(|(kind, o)| *kind == 2 && o.len() >= 8) {
+                    self.learn(target, option[2..8].try_into().unwrap());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Wrap `payload` in IPv6 and Ethernet and send it, finding the next hop's
+    /// MAC first if need be.
+    fn send_ipv6(&mut self, destination: &Ip, next_header: u8, payload: &[u8]) {
+        let mut frame = [0u8; MAX_FRAME];
+        let length = 54 + payload.len();
+        if length > MAX_FRAME {
+            return;
+        }
+        frame[6..12].copy_from_slice(&self.mac);
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+        frame[14] = 0x60;
+        frame[18..20].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame[20] = next_header;
+        // Neighbour discovery insists on 255; nothing else minds it.
+        frame[21] = 255;
+        frame[22..38].copy_from_slice(&self.source_for(destination));
+        frame[38..54].copy_from_slice(destination);
+        frame[54..length].copy_from_slice(payload);
+
+        if destination[0] == 0xFF {
+            frame[0..2].copy_from_slice(&[0x33, 0x33]);
+            frame[2..6].copy_from_slice(&destination[12..]);
+            user::net_send(&frame[..length]);
+            return;
+        }
+        let on_link = is_link_local(destination)
+            || (self.global6 != UNSPECIFIED && destination[..8] == self.global6[..8]);
+        let next_hop = if on_link { *destination } else { self.router6 };
+        if next_hop == UNSPECIFIED {
+            return;
+        }
+        if let Some(&(_, mac)) = self.arp.iter().find(|(known, _)| *known == next_hop) {
+            frame[0..6].copy_from_slice(&mac);
+            user::net_send(&frame[..length]);
+            return;
+        }
+        self.park(&frame[..length], next_hop);
+        self.solicit_neighbour(next_hop);
+    }
+
+    /// Checksum an ICMPv6 message and send it.
+    fn send_icmpv6(&mut self, destination: &Ip, message: &mut [u8]) {
+        message[2..4].fill(0);
+        let source = self.source_for(destination);
+        let sum = transport_checksum(PROTOCOL_ICMPV6, &source, destination, message);
+        message[2..4].copy_from_slice(&sum.to_be_bytes());
+        self.send_ipv6(destination, PROTOCOL_ICMPV6, message);
+    }
+
+    fn solicit_neighbour(&mut self, target: Ip) {
+        let mut solicitation = [0u8; 32];
+        solicitation[0] = 135;
+        solicitation[8..24].copy_from_slice(&target);
+        solicitation[24..26].copy_from_slice(&[1, 1]);
+        solicitation[26..32].copy_from_slice(&self.mac);
+        self.send_icmpv6(&solicited_node(&target), &mut solicitation);
+    }
+
+    fn solicit_router(&mut self) {
+        let mut solicitation = [0u8; 16];
+        solicitation[0] = 133;
+        solicitation[8..10].copy_from_slice(&[1, 1]);
+        solicitation[10..16].copy_from_slice(&self.mac);
+        self.send_icmpv6(&ALL_ROUTERS, &mut solicitation);
+    }
+
+    fn solicit_tick(&mut self) {
+        if self.global6 != UNSPECIFIED || self.solicited >= SOLICITATIONS {
+            return;
+        }
+        self.solicit_waited += 1;
+        if self.solicit_waited >= REQUEST_TICKS {
+            self.solicit_waited = 0;
+            self.solicited += 1;
+            self.solicit_router();
+        }
+    }
+
+    fn config6(&mut self, reply: u64) {
+        if self.global6 != UNSPECIFIED {
+            self.configured6(reply);
+        } else if let Some(slot) = self.config6_waiters.iter_mut().find(|waiter| **waiter == 0) {
+            *slot = reply;
+        }
+    }
+
+    fn configured6(&self, reply: u64) {
+        let half = |ip: &Ip, at: usize| u64::from_be_bytes(ip[at..at + 8].try_into().unwrap());
+        let words = [half(&self.global6, 0), half(&self.global6, 8), half(&self.dns6, 0), half(&self.dns6, 8)];
+        user::ipc_send(reply, &user::Message { tag: net::TAG_NET_CONFIGURED6, words, sender: 0, sender_user: 0 });
+    }
+}
+
+/// The type-length-value options neighbour discovery carries: each option's
+/// kind, and the whole option. Stops at one that claims no length or runs off
+/// the end.
+fn options(bytes: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut at = 0;
+    core::iter::from_fn(move || {
+        let length = *bytes.get(at + 1)? as usize * 8;
+        if length == 0 || at + length > bytes.len() {
+            return None;
+        }
+        let option = &bytes[at..at + length];
+        at += length;
+        Some((option[0], option))
+    })
 }

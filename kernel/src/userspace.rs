@@ -207,6 +207,7 @@ pub mod probe {
     pub const TCP: u64 = 14;
     pub const RESOLVE: u64 = 15;
     pub const RANDOM: u64 = 16;
+    pub const IPV6: u64 = 17;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

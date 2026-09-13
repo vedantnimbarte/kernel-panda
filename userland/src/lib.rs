@@ -48,6 +48,7 @@ pub mod nr {
     pub const LOGIN: u64 = 34;
     pub const TIMER_SET: u64 = 35;
     pub const RANDOM: u64 = 36;
+    pub const BUF_UNMAP: u64 = 37;
 }
 
 /// Message layout shared with the kernel. Changing either side alone breaks IPC
@@ -387,19 +388,31 @@ pub mod ring {
 /// Addresses are IPv4 in network order packed into the low 32 bits. A client
 /// names a reply endpoint it has already granted the daemon `SEND` on, and
 /// shares any buffer it names with the daemon first.
+///
+/// An IPv6 address does not fit a word. Where one is named, the word says
+/// [`IPV6`](net::IPV6) and the 16 bytes are at the start of the buffer the
+/// request names; where one is reported, the same, in the buffer the client
+/// gave for replies.
 pub mod net {
-    /// `[address, reply endpoint, token, 0]`: send an echo request. The answer
-    /// arrives on the reply endpoint as [`TAG_PONG`].
+    /// In an address word: the address is IPv6, and in the buffer.
+    pub const IPV6: u64 = u64::MAX;
+
+    /// `[address, reply endpoint, token, buffer]`: send an echo request. The
+    /// answer arrives on the reply endpoint as [`TAG_PONG`]. `buffer` is read
+    /// only for an IPv6 address.
     pub const TAG_PING: u64 = 1;
-    /// `[token, address, 0, 0]`.
+    /// `[token, address or IPV6, 0, 0]`.
     pub const TAG_PONG: u64 = 2;
     /// `[port, reply endpoint, buffer, 0]`: datagrams to `port` are copied into
     /// `buffer` and announced as [`TAG_DATAGRAM`]. One datagram at a time: the
     /// next overwrites the last.
     pub const TAG_UDP_BIND: u64 = 3;
-    /// `[length, source address, source port, local port]`.
+    /// `[length, source address, source port, local port]`. From IPv6, the
+    /// source address is the buffer's first 16 bytes and the `length` bytes of
+    /// payload follow it.
     pub const TAG_DATAGRAM: u64 = 4;
     /// `[buffer, length, destination address, local port << 16 | remote port]`.
+    /// To IPv6, the payload follows the address in the buffer.
     pub const TAG_UDP_SEND: u64 = 5;
 
     /// `[address, local port << 16 | remote port, reply endpoint, buffer]`:
@@ -410,7 +423,8 @@ pub mod net {
     /// `[port, reply endpoint, buffer, 0]`: accept the next connection to
     /// `port`, announced with [`TAG_TCP_OPEN`]. One connection per listen.
     pub const TAG_TCP_LISTEN: u64 = 7;
-    /// `[connection, address, remote port, local port]`.
+    /// `[connection, address, remote port, local port]`. For IPv6 the peer's
+    /// address is written to the start of the connection's buffer.
     pub const TAG_TCP_OPEN: u64 = 8;
     /// `[connection, buffer, length, 0]`: send up to [`TCP_MSS`] bytes from the
     /// start of `buffer`, which must hold them unchanged until
@@ -441,7 +455,7 @@ pub mod net {
     /// Every connection slot was taken.
     pub const CLOSED_NO_ROOM: u64 = 4;
 
-    /// Most one segment carries, and so one send.
+    /// Most one segment carries, and so one send: 20 fewer over IPv6.
     pub const TCP_MSS: usize = 1460;
 
     /// `[reply endpoint, 0, 0, 0]`: answered with [`TAG_NET_CONFIGURED`] once
@@ -465,6 +479,16 @@ pub mod net {
     pub const RESOLVE_TIMED_OUT: u64 = 0x101;
     /// Not a name: empty, too long, or with an empty or overlong label.
     pub const RESOLVE_BAD_NAME: u64 = 0x102;
+
+    /// `[reply endpoint, 0, 0, 0]`: answered with [`TAG_NET_CONFIGURED6`] once a
+    /// router has advertised a prefix.
+    pub const TAG_NET_CONFIG6: u64 = 19;
+    /// `[address high, address low, DNS server high, DNS server low]`, the DNS
+    /// server zero if none was advertised.
+    pub const TAG_NET_CONFIGURED6: u64 = 20;
+    /// As [`TAG_RESOLVE`], for an IPv6 address, which is written over the start
+    /// of the buffer; the answer's address word is [`IPV6`].
+    pub const TAG_RESOLVE6: u64 = 21;
 
     pub const fn address(a: u8, b: u8, c: u8, d: u8) -> u64 {
         (a as u64) << 24 | (b as u64) << 16 | (c as u64) << 8 | d as u64
@@ -528,6 +552,11 @@ pub fn buffer_create(width: u64, height: u64) -> i64 {
 
 pub fn buffer_map(buffer: u64) -> i64 {
     syscall(nr::BUF_MAP, buffer, 0, 0)
+}
+
+/// Give a buffer up: unmap it and, if it is someone else's, lose access to it.
+pub fn buffer_unmap(buffer: u64) -> i64 {
+    syscall(nr::BUF_UNMAP, buffer, 0, 0)
 }
 
 pub fn buffer_share(buffer: u64, target: u64) -> i64 {

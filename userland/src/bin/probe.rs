@@ -29,6 +29,10 @@ pub const MODE_LOGIN: u64 = 13;
 pub const MODE_TCP: u64 = 14;
 pub const MODE_RESOLVE: u64 = 15;
 pub const MODE_RANDOM: u64 = 16;
+pub const MODE_IPV6: u64 = 17;
+
+/// QEMU's host, as its IPv6 user network names it.
+const HOST_V6: [u8; 16] = [0xFE, 0xC0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -222,8 +226,8 @@ extern "C" fn main(parameters: u64) {
         }
 
         // One TCP conversation through the network daemon. `address` is a port:
-        // with bit 63 set, listen on it; otherwise connect to it on the host,
-        // 10.0.2.2. Either way, answer the first line that arrives with
+        // with bit 63 set, listen on it; otherwise connect to it on the host --
+        // at fec0::2 with bit 62 set, 10.0.2.2 without. Either way, answer the first line that arrives with
         // "hello from panda", then close once the other side has. Reports the
         // bytes received, their FNV-1a hash, and why the connection ended --
         // or u64::MAX, the reason, and the step, if it never opened.
@@ -258,6 +262,10 @@ extern "C" fn main(parameters: u64) {
             let port = parameters.address as u16;
             if parameters.address >> 63 != 0 {
                 send(net::TAG_TCP_LISTEN, [port as u64, reply, receive, 0]);
+            } else if parameters.address >> 62 & 1 != 0 {
+                // SAFETY: this process's mapped buffer, far larger than 16 bytes.
+                unsafe { core::ptr::write_unaligned(receive_base as *mut [u8; 16], HOST_V6) };
+                send(net::TAG_TCP_CONNECT, [net::IPV6, port as u64, reply, receive]);
             } else {
                 send(net::TAG_TCP_CONNECT, [net::address(10, 0, 2, 2), port as u64, reply, receive]);
             }
@@ -353,6 +361,58 @@ extern "C" fn main(parameters: u64) {
                 words[2 * index + 1] = answer.words[2];
             }
             report(words);
+        }
+
+        // IPv6 through the network daemon: the address a router advertisement
+        // produced, a ping to the host, and a name's IPv6 address. Reports the
+        // address, the pong's address word, and the name's low 64 bits and
+        // status -- or u64::MAX and the step that failed.
+        MODE_IPV6 => {
+            use user::net;
+            let report = |words: [u64; 4]| {
+                user::ipc_send(parameters.report, &user::Message { tag: 0x6666, words, sender: 0, sender_user: 0 });
+                user::exit(0)
+            };
+            let reply = user::ipc_create(4);
+            if reply < 0 || user::ipc_grant(reply as u64, parameters.daemon, 1) < 0 {
+                report([u64::MAX, 1, 0, 0]);
+            }
+            let reply = reply as u64;
+            let buffer = user::buffer_create(256, 1);
+            if buffer < 0 || user::buffer_share(buffer as u64, parameters.daemon) < 0 {
+                report([u64::MAX, 2, 0, 0]);
+            }
+            let (buffer, base) = (buffer as u64, user::buffer_map(buffer as u64));
+            if base < 0 {
+                report([u64::MAX, 3, 0, 0]);
+            }
+            let ask = |tag: u64, words: [u64; 4]| -> user::Message {
+                user::ipc_send(parameters.endpoint, &user::Message { tag, words, sender: 0, sender_user: 0 });
+                let mut answer = user::Message::default();
+                if user::ipc_receive(reply, &mut answer) < 0 {
+                    report([u64::MAX, 4, tag, 0]);
+                }
+                answer
+            };
+
+            let configured = ask(net::TAG_NET_CONFIG6, [reply, 0, 0, 0]);
+
+            // SAFETY: this process's mapped buffer, far larger than 16 bytes.
+            unsafe { core::ptr::write_unaligned(base as *mut [u8; 16], HOST_V6) };
+            let pong = ask(net::TAG_PING, [net::IPV6, reply, 7, buffer]);
+            if pong.tag != net::TAG_PONG || pong.words[0] != 7 {
+                report([u64::MAX, 5, pong.tag, 0]);
+            }
+
+            let name = b"panda.test";
+            // SAFETY: as above.
+            unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), base as *mut u8, name.len()) };
+            let resolved = ask(net::TAG_RESOLVE6, [buffer, name.len() as u64, reply, 9]);
+            // SAFETY: the daemon wrote the address over the buffer's first 16 bytes.
+            let address = unsafe { core::ptr::read_unaligned(base as *const [u8; 16]) };
+            let low = u64::from_be_bytes(address[8..].try_into().unwrap());
+
+            report([configured.words[0], configured.words[1], pong.words[1], low << 8 | resolved.words[2]]);
         }
 
         // The two ends of a ring. `endpoint` is the ring, `daemon` the message
