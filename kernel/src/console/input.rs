@@ -1,14 +1,10 @@
 //! Serial input, and the `read` syscall on top of it.
 //!
-//! Bytes are drained from the UART by the timer handler rather than by a
-//! receive interrupt. Routing IRQ 4 to the CPU would mean programming the
-//! IOAPIC, and finding the IOAPIC properly means parsing ACPI -- a lot of
-//! machinery for a console. Polling at the 100 Hz tick adds up to 10 ms of
-//! latency, which is imperceptible against a human typing and well inside the
-//! UART's 16-byte FIFO at 38400 baud.
-//!
-//! It is the wrong answer for a serial line carrying data at speed, and the
-//! right one for the only thing using it today.
+//! Bytes are drained from the UART by its receive interrupt, routed through the
+//! I/O APIC. If that routing fails -- no ACPI, no chip, a firmware layout the
+//! parser does not understand -- the timer handler drains it instead, so the
+//! console degrades to up to 10 ms of latency at the 100 Hz tick rather than
+//! going deaf. That is still well inside the UART's 16-byte FIFO at 38400 baud.
 
 use alloc::collections::VecDeque;
 

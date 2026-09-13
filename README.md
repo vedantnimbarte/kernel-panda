@@ -25,7 +25,7 @@ filesystem that survives a power cut.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order and damage tracking |
 
-**Testing:** 160+ cases across 21 boot-and-assert test kernels, run on four cores
+**Testing:** 170+ cases across 20 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
