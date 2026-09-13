@@ -388,6 +388,14 @@ when full; a bitmap cannot fill, so there is no degraded mode to reason about,
 at the cost of rounding each update out to whole tiles. Each row's adjacent
 damaged tiles are composed as one run.
 
+Each pixel reaches the display as one four-byte store, so the display can never
+latch half of one — a row `memcpy` copies in eight-byte strides, which split
+three-byte pixels. The fourth byte belongs to the next pixel and carries the
+value already on the display, not the back buffer's, since outside the damage
+the two need not agree; the last pixel of the display ends its store at itself
+instead. Under QEMU no watcher caught a torn pixel even from a byte-at-a-time
+flush, so this is argued rather than observed; only the corner case is tested.
+
 Tearing *is* observed, not argued: a thread on another core samples one pixel
 while that area is recomposed repeatedly, and checks it never catches the
 cleared-to-black intermediate state. Around 25,000 samples per run see it zero
@@ -751,11 +759,6 @@ naming it is a message only the kernel can send.
 * One user program is still hand-written assembly: the W^X test, which plants
   two bytes of machine code on its own stack and jumps to them. That is not
   something Rust will express, and it is the right tool for that one job.
-* A 24-bit pixel reaches the screen as three separate byte writes, so the display
-  can latch a half-written pixel during the flush. Invisible in practice at these
-  sizes, and not something double buffering addresses; fixing it means writing
-  whole aligned words, which means the scanout and the back buffer agreeing on a
-  32-bit format.
 * The keyboard layout is US, caps lock is not tracked, and the Pause key's E1
   sequence is not decoded. An interrupt line stays routed after its driver
   exits; every ISA line is edge-triggered, so the cost is one ignored interrupt

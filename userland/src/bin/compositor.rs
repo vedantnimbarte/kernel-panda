@@ -471,22 +471,49 @@ impl Compositor {
         }
     }
 
-    /// Copy the composed region to the display, one row at a time.
+    /// Copy the composed region to the display, one whole pixel per write.
+    ///
+    /// The display reads its memory whenever it likes, so a pixel written a
+    /// byte at a time can be latched half old and half new -- and a row `memcpy`
+    /// copies in eight-byte strides, which split three-byte pixels. So every
+    /// pixel goes out as a single four-byte store.
+    ///
+    /// At three bytes a pixel, the fourth byte of that store belongs to the next
+    /// pixel, and it carries the value *already on the display* rather than the
+    /// back buffer's. Inside the damaged area the next store overwrites it
+    /// anyway; outside it the two buffers need not agree, and writing the back
+    /// buffer's byte would change a pixel nobody asked to change. The very last
+    /// pixel of the display has no byte after it, so its store ends at the pixel
+    /// and carries the byte before instead.
     fn flush(&self, area: Rect) {
         let depth = self.depth();
         let stride = self.screen.stride as u64;
-        let width = (area.right - area.left) * depth;
+        let end = self.screen.size;
 
         for row in area.top..area.bottom {
-            let offset = row * stride + area.left * depth;
-            // SAFETY: both buffers are the screen's dimensions and `area` is
-            // clipped to them, so this row is inside each.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (self.back_base + offset) as *const u8,
-                    (self.scanout_base + offset) as *mut u8,
-                    width as usize,
-                );
+            for x in area.left..area.right {
+                let offset = row * stride + x * depth;
+                let back = (self.back_base + offset) as *const u8;
+                let screen = self.scanout_base + offset;
+
+                // SAFETY: `area` is clipped to the screen, both buffers are the
+                // screen's dimensions, and every read and write below stays
+                // inside `0..end` of the display -- the last-pixel case is what
+                // keeps the four-byte store from running off it.
+                unsafe {
+                    if depth != 3 {
+                        core::ptr::copy_nonoverlapping(back, screen as *mut u8, depth as usize);
+                        continue;
+                    }
+                    let pixel = u32::from_le_bytes([*back, *back.add(1), *back.add(2), 0]);
+                    if offset + 4 <= end {
+                        let after = core::ptr::read_unaligned(screen as *const u32) & 0xFF00_0000;
+                        core::ptr::write_unaligned(screen as *mut u32, pixel | after);
+                    } else {
+                        let before = core::ptr::read_unaligned((screen - 1) as *const u32) & 0xFF;
+                        core::ptr::write_unaligned((screen - 1) as *mut u32, pixel << 8 | before);
+                    }
+                }
             }
         }
     }

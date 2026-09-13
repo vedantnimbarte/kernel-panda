@@ -362,13 +362,12 @@ fn the_display_never_shows_a_half_composed_frame() {
     // black: 0x0000FF is (FF,00,00) and 0x00FFFF is (FF,FF,00), so only the
     // middle byte changes and every intermediate is one of the two.
     //
-    // That matters, because the final copy to the scanout is a memcpy and a
-    // three-byte pixel is not written atomically. Alternating blue and green
-    // -- (FF,00,00) and (00,FF,00) -- lets a reader catch the first byte updated
-    // and the second not, which reads as black and looks exactly like the
-    // cleared state this is hunting for. Double buffering does not make the
-    // flush atomic and was never going to; conflating the two would have this
-    // case failing for a reason it does not name.
+    // That mattered when the flush was a memcpy, which wrote a three-byte pixel
+    // in pieces: alternating blue and green -- (FF,00,00) and (00,FF,00) --
+    // let a reader catch the first byte updated and the second not, which reads
+    // as black and looks exactly like the cleared state this is hunting for.
+    // Pixels now go out whole, but this watcher reads its three bytes
+    // separately, so the colours still must not be able to mix to black.
     // Driven by how much the watcher has actually seen, not by a fixed number
     // of rounds. A busy host gives the watcher less CPU, and a round count tuned
     // on an idle one then fails for want of samples rather than for anything
@@ -678,4 +677,35 @@ fn keys_reach_only_the_focused_client() {
         compositor.0 as u64,
         "the key did not come from the compositor"
     );
+}
+
+#[test_case]
+fn the_last_pixel_on_the_display_is_flushed_whole() {
+    let (endpoint, compositor) = start_compositor();
+    let info = framebuffer::info().expect("no framebuffer");
+    let (right, bottom) = (info.width - 1, info.height - 1);
+    let last = (bottom * info.stride + right) * info.bytes_per_pixel;
+    panda_kernel::serial_println!(
+        "  (end-aligned store {})",
+        if framebuffer::buffer_len() - last < 4 { "exercised" } else { "not needed on this display" }
+    );
+
+    // A pixel is flushed as one four-byte store, and at the very end of the
+    // display that store has to end at the pixel and borrow the byte before
+    // it. A surface over the corner in a colour whose bytes all differ shows
+    // any byte landing one place off.
+    let colour = (0x21, 0x43, 0x65);
+    present(endpoint, compositor, 0x654321, right as u64 - 39, bottom as u64 - 29);
+
+    assert!(
+        spin_until(|| pixel_at(right, bottom) == colour),
+        "the last pixel on the display came out as {:?}",
+        pixel_at(right, bottom)
+    );
+    assert_eq!(
+        pixel_at(right - 1, bottom),
+        colour,
+        "the pixel before the last one was disturbed by its store"
+    );
+    assert!(sched::is_alive(compositor), "the compositor died flushing the corner");
 }
