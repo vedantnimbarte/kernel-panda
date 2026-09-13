@@ -3,6 +3,11 @@
 //! The harness attaches a virtio-net card to QEMU's user-mode network, whose
 //! gateway at 10.0.2.2 answers ARP. These cases put frames on the wire from
 //! Ring 0 and check what comes back -- and that it comes back by interrupt.
+//! Then the Ring 3 stack is started on top.
+//!
+//! Cases run in name order, and that order matters here: the card cases bind
+//! arrivals to themselves, so they are named to run before the stack starts
+//! and binds them to it.
 
 #![no_std]
 #![no_main]
@@ -59,7 +64,7 @@ fn arp_request(mac: [u8; 6]) -> [u8; 42] {
 }
 
 #[test_case]
-fn the_card_was_found_with_qemus_mac() {
+fn card_was_found_with_qemus_mac() {
     // QEMU's default for the first card. A different value means the
     // configuration was read from the wrong offset -- with MSI-X on, it moves.
     assert_eq!(
@@ -70,7 +75,7 @@ fn the_card_was_found_with_qemus_mac() {
 }
 
 #[test_case]
-fn the_gateway_answers_arp_and_the_answer_arrives_by_interrupt() {
+fn card_gets_the_gateways_arp_answer_by_interrupt() {
     let mac = net::mac().expect("no card");
     let me = sched::current_id().expect("no thread");
     let endpoint = ipc::create(me, 8).expect("create failed");
@@ -107,4 +112,157 @@ fn the_gateway_answers_arp_and_the_answer_arrives_by_interrupt() {
         }
     }
     assert!(replied, "frames arrived but none was the gateway's ARP reply");
+}
+
+// ---------------------------------------------------------------------------
+// The Ring 3 stack on top
+// ---------------------------------------------------------------------------
+
+use core::sync::atomic::{AtomicU64, Ordering};
+use panda_kernel::ipc::{EndpointId, Message, Rights};
+use panda_kernel::sched::ThreadId;
+use panda_kernel::{sync, syscall, userspace};
+
+const TAG_PING: u64 = 1;
+const TAG_PONG: u64 = 2;
+
+const fn packed(address: [u8; 4]) -> u64 {
+    u32::from_be_bytes(address) as u64
+}
+
+fn me() -> ThreadId {
+    sched::current_id().expect("no thread")
+}
+
+static CONTROL: AtomicU64 = AtomicU64::new(0);
+static STACK: AtomicU64 = AtomicU64::new(u64::MAX);
+static PROBE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn stack_thread() {
+    let owner = me();
+    let image = userspace::load_elf(owner, userspace::NET_ELF).expect("failed to load the stack");
+    let parameters = [
+        CONTROL.load(Ordering::Acquire),
+        packed(GUEST_IP),
+        packed(GATEWAY_IP),
+        packed([255, 255, 255, 0]),
+    ];
+    // SAFETY: the parameter page just mapped for a program not yet running.
+    unsafe { userspace::write_parameters(image.data, &parameters) };
+    // SAFETY: load_elf mapped the entry executable and the stack writable.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
+}
+
+/// The network daemon, running once for the whole test kernel: it is the only
+/// thread allowed the card, and later cases reuse it.
+fn stack() -> (EndpointId, ThreadId) {
+    if let Some(id) = Some(STACK.load(Ordering::Acquire)).filter(|id| *id != u64::MAX) {
+        return (EndpointId(CONTROL.load(Ordering::Acquire)), ThreadId(id as usize));
+    }
+
+    let control = ipc::create(me(), 32).expect("create failed");
+    CONTROL.store(control.0, Ordering::Release);
+    let daemon = sync::without_interrupts(|| {
+        let id = sched::spawn("net", stack_thread).expect("spawn failed");
+        ipc::grant(me(), id, control, Rights::SEND.union(Rights::RECEIVE)).expect("grant failed");
+        net::allow_stack(id);
+        id
+    });
+    assert!(
+        spin_until(|| sched::is_blocked(daemon) || !sched::is_alive(daemon)),
+        "the network daemon never settled"
+    );
+    assert!(sched::is_alive(daemon), "the network daemon died starting up");
+    STACK.store(daemon.0 as u64, Ordering::Release);
+    (control, daemon)
+}
+
+fn probe_thread() {
+    let owner = me();
+    let image = userspace::load_elf(owner, userspace::PROBE_ELF).expect("failed to load the probe");
+    let [mode, first, second] = [0, 1, 2].map(|index| PROBE[index].load(Ordering::Acquire));
+    let (daemon, report) = (STACK.load(Ordering::Acquire), second);
+    // Probe parameters: mode, address, endpoint, daemon, report.
+    // SAFETY: the parameter page just mapped for a program not yet running.
+    unsafe { userspace::write_parameters(image.data, &[mode, 0, first, daemon, report]) };
+    // SAFETY: as in `stack_thread`.
+    unsafe { userspace::enter_ring3(image.entry, image.stack_top, image.data.as_u64()) }
+}
+
+#[test_case]
+fn stack_pings_the_gateway() {
+    let (control, daemon) = stack();
+    let reply = ipc::create(me(), 4).expect("create failed");
+    ipc::grant(me(), daemon, reply, Rights::SEND).expect("grant failed");
+
+    let request = Message {
+        tag: TAG_PING,
+        words: [packed(GATEWAY_IP), reply.0, 0xC0FFEE, 0],
+        sender: 0,
+    };
+    ipc::send(me(), control, request).expect("send failed");
+
+    assert!(
+        spin_until(|| ipc::queued(reply) > 0),
+        "no echo reply came back from the gateway"
+    );
+    let pong = ipc::receive(me(), reply).expect("receive failed");
+    assert_eq!(pong.tag, TAG_PONG, "not a pong");
+    assert_eq!(pong.words[0], 0xC0FFEE, "the pong carries the wrong token");
+    assert_eq!(pong.words[1], packed(GATEWAY_IP), "the pong is from the wrong address");
+    assert_eq!(pong.sender, daemon.0 as u64, "the pong did not come from the daemon");
+}
+
+#[test_case]
+fn stack_serves_a_process_fetching_a_file_over_udp() {
+    let (control, _) = stack();
+    let report = ipc::create(me(), 4).expect("create failed");
+
+    PROBE[0].store(userspace::probe::TFTP, Ordering::Release);
+    PROBE[1].store(control.0, Ordering::Release);
+    PROBE[2].store(report.0, Ordering::Release);
+    sync::without_interrupts(|| {
+        let id = sched::spawn("tftp-probe", probe_thread).expect("spawn failed");
+        ipc::grant(me(), id, control, Rights::SEND).expect("grant failed");
+        ipc::grant(me(), id, report, Rights::SEND).expect("grant failed");
+    });
+
+    assert!(spin_until(|| ipc::queued(report) > 0), "the probe reported nothing");
+    let result = ipc::receive(me(), report).expect("receive failed");
+
+    // Must match what xtask writes into the TFTP directory.
+    const EXPECTED: &[u8] = b"hello from the host, over TFTP\n";
+    assert_eq!(
+        result.words[0],
+        EXPECTED.len() as u64,
+        "the probe got {} bytes (failed at step {} if zero)",
+        result.words[0],
+        result.words[1]
+    );
+    let mut first = [0u8; 24];
+    for (index, byte) in first.iter_mut().enumerate() {
+        *byte = (result.words[1 + index / 8] >> (8 * (index % 8))) as u8;
+    }
+    assert_eq!(&first, &EXPECTED[..24], "the file's contents came back wrong");
+}
+
+#[test_case]
+fn stack_is_the_only_process_that_can_send_frames() {
+    stack();
+    let report = ipc::create(me(), 4).expect("create failed");
+    PROBE[0].store(userspace::probe::DEVICE, Ordering::Release);
+    PROBE[1].store(report.0, Ordering::Release);
+    PROBE[2].store(0, Ordering::Release);
+    sync::without_interrupts(|| {
+        let id = sched::spawn("device-probe", probe_thread).expect("spawn failed");
+        ipc::grant(me(), id, report, Rights::SEND).expect("grant failed");
+    });
+
+    assert!(spin_until(|| ipc::queued(report) > 0), "the probe reported nothing");
+    let result = ipc::receive(me(), report).expect("receive failed");
+    assert_eq!(
+        result.words[3],
+        syscall::Error::NoCapability as i64 as u64,
+        "a process other than the stack put a frame on the wire"
+    );
 }

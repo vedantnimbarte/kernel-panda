@@ -178,6 +178,8 @@ pub const COMPOSITOR_ELF: &[u8] =
     include_bytes!("../../userland/target/x86_64-unknown-none/release/compositor");
 pub const INPUT_ELF: &[u8] =
     include_bytes!("../../userland/target/x86_64-unknown-none/release/input");
+pub const NET_ELF: &[u8] =
+    include_bytes!("../../userland/target/x86_64-unknown-none/release/net");
 pub const CLIENT_ELF: &[u8] =
     include_bytes!("../../userland/target/x86_64-unknown-none/release/client");
 /// Test programs, selected by the `mode` word of their parameter page.
@@ -192,6 +194,7 @@ pub mod probe {
     pub const PEEK: u64 = 3;
     pub const FILES: u64 = 4;
     pub const DEVICE: u64 = 5;
+    pub const TFTP: u64 = 6;
 }
 
 /// Load the probe program in `mode`, with an optional address or endpoint.

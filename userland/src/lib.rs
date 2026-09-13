@@ -185,6 +185,31 @@ pub fn net_bind(endpoint: u64) -> i64 {
 /// Tag of the kernel's "frames have arrived" notification.
 pub const TAG_NET_RECEIVED: u64 = 0x2_0000;
 
+/// What the network daemon and its clients say to each other.
+///
+/// Addresses are IPv4 in network order packed into the low 32 bits. A client
+/// names a reply endpoint it has already granted the daemon `SEND` on, and
+/// shares any buffer it names with the daemon first.
+pub mod net {
+    /// `[address, reply endpoint, token, 0]`: send an echo request. The answer
+    /// arrives on the reply endpoint as [`TAG_PONG`].
+    pub const TAG_PING: u64 = 1;
+    /// `[token, address, 0, 0]`.
+    pub const TAG_PONG: u64 = 2;
+    /// `[port, reply endpoint, buffer, 0]`: datagrams to `port` are copied into
+    /// `buffer` and announced as [`TAG_DATAGRAM`]. One datagram at a time: the
+    /// next overwrites the last.
+    pub const TAG_UDP_BIND: u64 = 3;
+    /// `[length, source address, source port, local port]`.
+    pub const TAG_DATAGRAM: u64 = 4;
+    /// `[buffer, length, destination address, local port << 16 | remote port]`.
+    pub const TAG_UDP_SEND: u64 = 5;
+
+    pub const fn address(a: u8, b: u8, c: u8, d: u8) -> u64 {
+        (a as u64) << 24 | (b as u64) << 16 | (c as u64) << 8 | d as u64
+    }
+}
+
 /// The `sender` of a message the kernel wrote itself. No thread has this id.
 pub const KERNEL_SENDER: u64 = u64::MAX;
 

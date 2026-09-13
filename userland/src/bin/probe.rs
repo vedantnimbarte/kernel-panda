@@ -18,6 +18,7 @@ pub const MODE_IPC: u64 = 2;
 pub const MODE_PEEK: u64 = 3;
 pub const MODE_FILES: u64 = 4;
 pub const MODE_DEVICE: u64 = 5;
+pub const MODE_TFTP: u64 = 6;
 
 /// Parameters for the modes that need more than a mode number.
 #[repr(C)]
@@ -25,8 +26,11 @@ struct Parameters {
     mode: u64,
     /// Address to read, for TRESPASS and PEEK.
     address: u64,
-    /// Endpoint to send on, for IPC.
+    /// Endpoint to send on, for IPC. The network daemon's, for TFTP.
     endpoint: u64,
+    /// For TFTP: the daemon's thread id, and where to send the result.
+    daemon: u64,
+    report: u64,
 }
 
 extern "C" fn main(parameters: u64) {
@@ -115,12 +119,95 @@ extern "C" fn main(parameters: u64) {
             let read = user::port_read(0x60);
             let written = user::port_write(0x60, 0xF4);
             let bound = user::irq_bind(1, parameters.endpoint);
+            let sent = user::net_send(&[0u8; 60]);
             let report = user::Message {
                 tag: 0xDE,
-                words: [read as u64, written as u64, bound as u64, 0],
+                words: [read as u64, written as u64, bound as u64, sent as u64],
                 sender: 0,
             };
             user::ipc_send(parameters.endpoint, &report);
+        }
+
+        // Fetch a file from QEMU's TFTP server through the network daemon, and
+        // report its length and first 24 bytes. Everything is fallible, and a
+        // failure is reported as a length of zero with the step that failed.
+        MODE_TFTP => {
+            let failed = |step: u64| -> ! {
+                let report = user::Message { tag: 0x7F7F, words: [0, step, 0, 0], sender: 0 };
+                user::ipc_send(parameters.report, &report);
+                user::exit(1)
+            };
+
+            let reply = user::ipc_create(8);
+            if reply < 0 || user::ipc_grant(reply as u64, parameters.daemon, 1) < 0 {
+                failed(1);
+            }
+            let reply = reply as u64;
+
+            let receive = user::buffer_create(1024, 1);
+            let transmit = user::buffer_create(256, 1);
+            if receive < 0 || transmit < 0 {
+                failed(2);
+            }
+            let (receive, transmit) = (receive as u64, transmit as u64);
+            if user::buffer_share(receive, parameters.daemon) < 0
+                || user::buffer_share(transmit, parameters.daemon) < 0
+            {
+                failed(3);
+            }
+            let (receive_base, transmit_base) = (user::buffer_map(receive), user::buffer_map(transmit));
+            if receive_base < 0 || transmit_base < 0 {
+                failed(4);
+            }
+
+            const LOCAL_PORT: u64 = 1069;
+            let server = user::net::address(10, 0, 2, 2);
+            let send = |tag: u64, words: [u64; 4]| {
+                user::ipc_send(parameters.endpoint, &user::Message { tag, words, sender: 0 });
+            };
+            send(user::net::TAG_UDP_BIND, [LOCAL_PORT, reply, receive, 0]);
+
+            // A read request: opcode 1, file name, transfer mode.
+            let request = b"\x00\x01hello.txt\x00octet\x00";
+            // SAFETY: the transmit buffer is this process's, mapped, and far
+            // larger than the request.
+            unsafe {
+                core::ptr::copy_nonoverlapping(request.as_ptr(), transmit_base as *mut u8, request.len())
+            };
+            send(
+                user::net::TAG_UDP_SEND,
+                [transmit, request.len() as u64, server, LOCAL_PORT << 16 | 69],
+            );
+
+            let mut message = user::Message::default();
+            if user::ipc_receive(reply, &mut message) < 0 || message.tag != user::net::TAG_DATAGRAM {
+                failed(5);
+            }
+            let length = message.words[0] as usize;
+            // SAFETY: the receive buffer is mapped, and the daemon wrote
+            // `length` bytes of it, never more than its size.
+            let datagram = unsafe { core::slice::from_raw_parts(receive_base as *const u8, length) };
+            // DATA, block 1.
+            if length < 4 || datagram[..4] != [0, 3, 0, 1] {
+                failed(6);
+            }
+
+            // Acknowledged, so the server does not send it again. The server
+            // answers from a port of its own, which is where the ack goes.
+            let ack = [0u8, 4, 0, 1];
+            // SAFETY: as for the request.
+            unsafe { core::ptr::copy_nonoverlapping(ack.as_ptr(), transmit_base as *mut u8, 4) };
+            send(
+                user::net::TAG_UDP_SEND,
+                [transmit, 4, message.words[1], LOCAL_PORT << 16 | message.words[2]],
+            );
+
+            let data = &datagram[4..];
+            let mut words = [data.len() as u64, 0, 0, 0];
+            for (index, byte) in data.iter().take(24).enumerate() {
+                words[1 + index / 8] |= (*byte as u64) << (8 * (index % 8));
+            }
+            user::ipc_send(parameters.report, &user::Message { tag: 0x7F7F, words, sender: 0 });
         }
 
         MODE_IPC => {
