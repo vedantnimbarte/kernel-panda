@@ -14,10 +14,11 @@ extern crate alloc;
 
 use alloc::vec;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::block::{self, BlockDevice, BlockError, SECTOR_SIZE};
-use panda_kernel::{arch::x86_64::halt_loop, serial_println, testing, BOOTLOADER_CONFIG};
+use panda_kernel::{arch::x86_64::halt_loop, sched, serial_println, testing, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -401,4 +402,52 @@ fn the_disk_accepts_a_flush() {
     let payload = vec![0x77u8; SECTOR_SIZE];
     disk.write(SCRATCH_LBA + 300, &payload).expect("write failed");
     disk.flush().expect("the disk refused to flush its cache");
+}
+
+const WORKERS: usize = 4;
+const ROUNDS: u64 = 24;
+const WORKER_SECTORS: usize = 12;
+
+static FINISHED: AtomicUsize = AtomicUsize::new(0);
+static FAILURES: AtomicU64 = AtomicU64::new(0);
+static NEXT_WORKER: AtomicU64 = AtomicU64::new(0);
+
+/// Write a pattern of its own to a range of its own, read it back, over and
+/// over, alongside the others.
+fn worker() {
+    let disk = scratch();
+    let me = NEXT_WORKER.fetch_add(1, Ordering::AcqRel);
+    let lba = SCRATCH_LBA + 4000 + me * 100;
+    let mut written = vec![0u8; WORKER_SECTORS * SECTOR_SIZE];
+    let mut read = vec![0u8; WORKER_SECTORS * SECTOR_SIZE];
+    for round in 0..ROUNDS {
+        for (index, byte) in written.iter_mut().enumerate() {
+            *byte = (index as u8) ^ (me as u8).wrapping_mul(31) ^ (round as u8).wrapping_mul(17);
+        }
+        let ok = disk.write(lba, &written).is_ok() && disk.read(lba, &mut read).is_ok() && read == written;
+        if !ok {
+            FAILURES.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    FINISHED.fetch_add(1, Ordering::AcqRel);
+}
+
+#[test_case]
+fn queued_requests_overlap_and_are_answered_by_interrupt() {
+    let disk = scratch();
+    let before = disk.stats();
+    for _ in 0..WORKERS {
+        sched::spawn("sata-worker", worker).expect("spawn failed");
+    }
+    // A flush in the middle, which runs alone and must wait its turn.
+    disk.flush().expect("a flush among queued commands failed");
+    while FINISHED.load(Ordering::Acquire) < WORKERS {
+        sched::yield_now();
+    }
+
+    let stats = disk.stats();
+    serial_println!("  ({stats:?})");
+    assert_eq!(FAILURES.load(Ordering::Acquire), 0, "a request came back wrong alongside others");
+    assert!(stats.peak_in_flight >= 2, "requests never overlapped; is NCQ in use?");
+    assert!(stats.interrupt_completions > before.interrupt_completions, "no request was answered by interrupt");
 }

@@ -49,7 +49,7 @@ use alloc::vec::Vec;
 
 use crate::block::{BlockDevice, BlockError, SECTOR_SIZE};
 use crate::users::{UserId, SYSTEM};
-use crate::sync::Mutex;
+use crate::sync::SleepMutex;
 
 /// Bytes per filesystem block. One sector, so a block write is a sector write
 /// and the atomicity argument does not need a second layer of reasoning.
@@ -366,7 +366,9 @@ impl DirEntry {
 /// A mounted filesystem.
 pub struct FileSystem {
     device: Arc<dyn BlockDevice>,
-    state: Mutex<State>,
+    /// Held across disk I/O, so it sleeps rather than spins: a request that
+    /// waits on its disk's interrupt must not do so with interrupts masked.
+    state: SleepMutex<State>,
 }
 
 struct State {
@@ -492,7 +494,7 @@ impl FileSystem {
 
         Ok(Self {
             device,
-            state: Mutex::new(State {
+            state: SleepMutex::new(State {
                 superblock,
                 live_slot,
                 bitmap,
@@ -714,34 +716,32 @@ impl FileSystem {
             return Err(FsError::BadName);
         }
 
-        crate::sync::without_interrupts(|| {
-            let mut state = self.state.lock();
-            let mut garbage = Vec::new();
+        let mut state = self.state.lock();
+        let mut garbage = Vec::new();
 
-            let root = state.superblock.root_inode;
-            let new_root = self.rewrite(
-                &mut state,
-                root,
-                &components,
-                access,
-                &mut action,
-                &mut garbage,
-            )?;
+        let root = state.superblock.root_inode;
+        let new_root = self.rewrite(
+            &mut state,
+            root,
+            &components,
+            access,
+            &mut action,
+            &mut garbage,
+        )?;
 
-            state.superblock.root_inode = new_root;
-            self.commit(&mut state)?;
+        state.superblock.root_inode = new_root;
+        self.commit(&mut state)?;
 
-            // Only now: the superblock naming the new tree has landed, so
-            // nothing reachable refers to these any more. Until this point they
-            // were still marked in use, both in memory and on the disk the
-            // commit just wrote, so a crash anywhere above left the old tree
-            // complete.
-            let retired = core::mem::take(&mut state.retired);
-            for block in garbage.into_iter().chain(retired) {
-                state.mark(block, false);
-            }
-            Ok(())
-        })
+        // Only now: the superblock naming the new tree has landed, so
+        // nothing reachable refers to these any more. Until this point they
+        // were still marked in use, both in memory and on the disk the
+        // commit just wrote, so a crash anywhere above left the old tree
+        // complete.
+        let retired = core::mem::take(&mut state.retired);
+        for block in garbage.into_iter().chain(retired) {
+            state.mark(block, false);
+        }
+        Ok(())
     }
 
     /// Create a file or directory at `path`.
@@ -857,27 +857,25 @@ impl FileSystem {
 
     /// As [`Self::read_file`], for `user`, who needs read permission on it.
     pub fn read_file_as(&self, path: &str, user: Option<UserId>) -> Result<Vec<u8>, FsError> {
-        crate::sync::without_interrupts(|| {
-            let state = self.state.lock();
-            let inode_block = self.resolve(&state, path, user)?;
-            let inode = self.read_inode(inode_block)?;
-            if inode.node_kind() != NodeKind::File {
-                return Err(FsError::WrongType);
-            }
-            if !inode.permits(user, false) {
-                return Err(FsError::Denied);
-            }
+        let state = self.state.lock();
+        let inode_block = self.resolve(&state, path, user)?;
+        let inode = self.read_inode(inode_block)?;
+        if inode.node_kind() != NodeKind::File {
+            return Err(FsError::WrongType);
+        }
+        if !inode.permits(user, false) {
+            return Err(FsError::Denied);
+        }
 
-            let mut out = Vec::with_capacity(inode.size as usize);
-            let mut left = inode.size as usize;
-            for slot in 0..inode.blocks_used as usize {
-                let block = self.read_block(inode.direct[slot])?;
-                let take = left.min(BLOCK_SIZE);
-                out.extend_from_slice(&block[..take]);
-                left -= take;
-            }
-            Ok(out)
-        })
+        let mut out = Vec::with_capacity(inode.size as usize);
+        let mut left = inode.size as usize;
+        for slot in 0..inode.blocks_used as usize {
+            let block = self.read_block(inode.direct[slot])?;
+            let take = left.min(BLOCK_SIZE);
+            out.extend_from_slice(&block[..take]);
+            left -= take;
+        }
+        Ok(out)
     }
 
     /// Names in a directory.
@@ -887,33 +885,31 @@ impl FileSystem {
 
     /// As [`Self::list`], for `user`, who needs read permission on it.
     pub fn list_as(&self, path: &str, user: Option<UserId>) -> Result<Vec<String>, FsError> {
-        crate::sync::without_interrupts(|| {
-            let state = self.state.lock();
-            let inode_block = self.resolve(&state, path, user)?;
-            let inode = self.read_inode(inode_block)?;
-            if inode.node_kind() != NodeKind::Directory {
-                return Err(FsError::WrongType);
-            }
-            if !inode.permits(user, false) {
-                return Err(FsError::Denied);
-            }
+        let state = self.state.lock();
+        let inode_block = self.resolve(&state, path, user)?;
+        let inode = self.read_inode(inode_block)?;
+        if inode.node_kind() != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        if !inode.permits(user, false) {
+            return Err(FsError::Denied);
+        }
 
-            let mut names = Vec::new();
-            for slot in 0..inode.blocks_used as usize {
-                let data = self.read_block(inode.direct[slot])?;
-                for index in 0..ENTRIES_PER_BLOCK {
-                    let at = index * core::mem::size_of::<DirEntry>();
-                    let entry = DirEntry::decode(&data[at..]);
-                    if entry.inode == 0 {
-                        continue;
-                    }
-                    if let Some(name) = entry.name_str() {
-                        names.push(String::from(name));
-                    }
+        let mut names = Vec::new();
+        for slot in 0..inode.blocks_used as usize {
+            let data = self.read_block(inode.direct[slot])?;
+            for index in 0..ENTRIES_PER_BLOCK {
+                let at = index * core::mem::size_of::<DirEntry>();
+                let entry = DirEntry::decode(&data[at..]);
+                if entry.inode == 0 {
+                    continue;
+                }
+                if let Some(name) = entry.name_str() {
+                    names.push(String::from(name));
                 }
             }
-            Ok(names)
-        })
+        }
+        Ok(names)
     }
 
     /// Remove a file, or an empty directory.
@@ -957,22 +953,18 @@ impl FileSystem {
 
     /// As [`Self::stat`], for `user`, who needs only to be able to reach it.
     pub fn stat_as(&self, path: &str, user: Option<UserId>) -> Result<(NodeKind, u64), FsError> {
-        crate::sync::without_interrupts(|| {
-            let state = self.state.lock();
-            let inode_block = self.resolve(&state, path, user)?;
-            let inode = self.read_inode(inode_block)?;
-            Ok((inode.node_kind(), inode.size))
-        })
+        let state = self.state.lock();
+        let inode_block = self.resolve(&state, path, user)?;
+        let inode = self.read_inode(inode_block)?;
+        Ok((inode.node_kind(), inode.size))
     }
 
     /// Who owns a node, and its permission bits.
     pub fn owner_as(&self, path: &str, user: Option<UserId>) -> Result<(UserId, u16), FsError> {
-        crate::sync::without_interrupts(|| {
-            let state = self.state.lock();
-            let inode_block = self.resolve(&state, path, user)?;
-            let inode = self.read_inode(inode_block)?;
-            Ok((inode.owner, inode.mode))
-        })
+        let state = self.state.lock();
+        let inode_block = self.resolve(&state, path, user)?;
+        let inode = self.read_inode(inode_block)?;
+        Ok((inode.owner, inode.mode))
     }
 
     /// Change a node's permission bits. Only its owner may; there is no way to
@@ -1000,13 +992,13 @@ impl FileSystem {
 
     /// Blocks not currently in use.
     pub fn free_blocks(&self) -> u64 {
-        crate::sync::without_interrupts(|| self.state.lock().free_blocks())
+        self.state.lock().free_blocks()
     }
 
     /// Commits since the filesystem was created. Diagnostic, and how a test
     /// tells one commit from none.
     pub fn generation(&self) -> u64 {
-        crate::sync::without_interrupts(|| self.state.lock().superblock.generation)
+        self.state.lock().superblock.generation
     }
 }
 

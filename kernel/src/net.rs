@@ -157,7 +157,7 @@ fn bring_up(address: pci::Address) -> Option<VirtioNet> {
 
     // MSI-X before the queues: enabling it moves the device configuration and
     // adds the vector registers the queues are configured through.
-    pci::route_msix(address, 0, on_receive).ok()?;
+    pci::route_msix(address, 0, on_receive, 0).ok()?;
 
     let receive = Queue::new(port, RECEIVE_QUEUE, NET_VIRT_BASE)?;
     // SAFETY: as above; the receive queue is still selected.
@@ -206,7 +206,7 @@ fn bring_up(address: pci::Address) -> Option<VirtioNet> {
 
 /// The receive queue's MSI-X vector. Interrupt context: it only tells whoever
 /// is bound, who takes the frames at their own pace.
-fn on_receive() {
+fn on_receive(_: usize) {
     let endpoint = BOUND.load(Ordering::Acquire);
     if endpoint != 0 {
         let notification = Message {

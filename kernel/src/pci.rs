@@ -627,6 +627,9 @@ pub fn capabilities(address: Address) -> Vec<(u8, u8)> {
 
 /// Capability id of MSI-X.
 const CAPABILITY_MSIX: u8 = 0x11;
+/// Capability id of MSI, MSI-X's predecessor: one address and one value in
+/// configuration space rather than a table in a BAR.
+const CAPABILITY_MSI: u8 = 0x05;
 
 /// Interrupt vectors handed out to MSI-X entries.
 pub const MSI_VECTOR_BASE: u8 = 0x50;
@@ -635,6 +638,29 @@ pub const MSI_VECTORS: usize = 16;
 /// The function each MSI vector calls, as a raw pointer, or zero for a free one.
 /// Atomic so the interrupt handler can read it without a lock.
 static MSI_HANDLERS: [AtomicU64; MSI_VECTORS] = [const { AtomicU64::new(0) }; MSI_VECTORS];
+/// What each handler is passed: which device, when one driver serves several.
+static MSI_CONTEXTS: [AtomicU64; MSI_VECTORS] = [const { AtomicU64::new(0) }; MSI_VECTORS];
+
+/// Claim a free vector for `handler`.
+///
+/// The CAS decides ownership; the context is written only after it is won, so
+/// two callers racing the same free slot cannot have the loser's context land
+/// after the winner's. Safe to write second rather than first because nothing
+/// can interrupt on a vector before the device that will use it is told about
+/// it, which happens later in the caller, after this returns.
+fn claim_vector(handler: fn(usize), context: usize) -> Result<usize, MsiError> {
+    (0..MSI_VECTORS)
+        .find(|&slot| {
+            let won = MSI_HANDLERS[slot]
+                .compare_exchange(0, handler as usize as u64, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            if won {
+                MSI_CONTEXTS[slot].store(context as u64, Ordering::Release);
+            }
+            won
+        })
+        .ok_or(MsiError::NoVector)
+}
 
 /// Where MSI-X tables are mapped, one page per routed entry.
 const MSIX_VIRT_BASE: u64 = 0x0000_7300_0000_0000;
@@ -651,7 +677,7 @@ pub enum MsiError {
 }
 
 /// Point MSI-X table entry `entry` of a device at a vector of its own, which
-/// calls `handler` on this processor, and turn MSI-X on.
+/// calls `handler` with `context` on this processor, and turn MSI-X on.
 ///
 /// Message-signalled interrupts are why no ACPI interpreter is needed. A
 /// device's legacy interrupt pin reaches the I/O APIC through wiring only the
@@ -660,7 +686,7 @@ pub enum MsiError {
 ///
 /// `handler` runs in interrupt context with interrupts masked. It must not
 /// block.
-pub fn route_msix(address: Address, entry: u16, handler: fn()) -> Result<u8, MsiError> {
+pub fn route_msix(address: Address, entry: u16, handler: fn(usize), context: usize) -> Result<u8, MsiError> {
     let capability = capabilities(address)
         .into_iter()
         .find(|(id, _)| *id == CAPABILITY_MSIX)
@@ -690,13 +716,7 @@ pub fn route_msix(address: Address, entry: u16, handler: fn()) -> Result<u8, Msi
 
     // A vector first, so a device that fires the moment it is unmasked has
     // somewhere to go.
-    let slot = (0..MSI_VECTORS)
-        .find(|&slot| {
-            MSI_HANDLERS[slot]
-                .compare_exchange(0, handler as usize as u64, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        })
-        .ok_or(MsiError::NoVector)?;
+    let slot = claim_vector(handler, context)?;
     let vector = MSI_VECTOR_BASE + slot as u8;
 
     let virtual_page = MSIX_VIRT_BASE + MSIX_NEXT_PAGE.fetch_add(1, Ordering::AcqRel) * 4096;
@@ -745,13 +765,51 @@ pub fn route_msix(address: Address, entry: u16, handler: fn()) -> Result<u8, Msi
     Ok(vector)
 }
 
+/// Point a device's MSI capability at a vector of its own, which calls `handler`
+/// with `context` on this processor, and turn MSI on. One message only.
+pub fn route_msi(address: Address, handler: fn(usize), context: usize) -> Result<u8, MsiError> {
+    let capability = capabilities(address)
+        .into_iter()
+        .find(|(id, _)| *id == CAPABILITY_MSI)
+        .map(|(_, offset)| offset)
+        .ok_or(MsiError::NotSupported)?;
+    let header = read_config(address, capability);
+    let control = (header >> 16) as u16;
+    // A 64-bit capable function has an upper address word, which moves the data
+    // register along by four bytes.
+    let data_offset = if control & (1 << 7) != 0 { 12 } else { 8 };
+
+    let slot = claim_vector(handler, context)?;
+    let vector = MSI_VECTOR_BASE + slot as u8;
+    let apic_id = crate::arch::x86_64::apic::id();
+
+    // SAFETY: the MSI capability of a device its driver owns. Address and data
+    // are written before the enable bit that lets the device use them, and the
+    // legacy pin is switched off so the interrupt does not also arrive there.
+    unsafe {
+        write_config(address, capability + 4, 0xFEE0_0000 | (apic_id as u32) << 12);
+        if data_offset == 12 {
+            write_config(address, capability + 8, 0);
+        }
+        write_config(address, capability + data_offset, vector as u32);
+
+        let command = read_config(address, 0x04);
+        write_config(address, 0x04, command | 0b110 | 1 << 10);
+
+        // Enabled, asking for one message.
+        let control = (control & !(0b111 << 4)) | 1;
+        write_config(address, capability, (header & 0xFFFF) | (control as u32) << 16);
+    }
+    Ok(vector)
+}
+
 /// Called by the interrupt handler for MSI vector `slot`.
 pub fn msi_dispatch(slot: usize) {
     let raw = MSI_HANDLERS[slot].load(Ordering::Acquire);
     if raw != 0 {
-        // SAFETY: only ever stored from a `fn()` in `route_msix`.
-        let handler: fn() = unsafe { core::mem::transmute::<usize, fn()>(raw as usize) };
-        handler();
+        // SAFETY: only ever stored from a `fn(usize)` in `claim_vector`.
+        let handler: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(raw as usize) };
+        handler(MSI_CONTEXTS[slot].load(Ordering::Acquire) as usize);
     }
 }
 

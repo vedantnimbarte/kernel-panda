@@ -2,13 +2,16 @@
 //!
 //! The rest of the kernel locks through this module rather than naming a crate
 //! directly, so the primitive underneath can change without touching call sites.
-//! Everything here is in-house: [`Mutex`], a ticket lock, and [`Once`] and
-//! [`Lazy`] for values made on first use.
+//! Everything here is in-house: [`Mutex`], a ticket lock; [`SleepMutex`], for
+//! holding across work that waits; and [`Once`] and [`Lazy`] for values made
+//! on first use.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+use alloc::collections::VecDeque;
 
 pub use x86_64::instructions::interrupts::without_interrupts;
 
@@ -272,5 +275,106 @@ impl<T, F: Fn() -> T> Deref for Lazy<T, F> {
 
     fn deref(&self) -> &T {
         self.once.call_once(&self.make)
+    }
+}
+
+/// A lock whose waiters sleep.
+///
+/// [`Mutex`] spins with interrupts masked, which is right for a few
+/// instructions and wrong for a disk read: a request that waits on its disk's
+/// interrupt cannot be made while holding one, and neither can anything else
+/// that parks. This one is held with interrupts as the caller had them, and a
+/// caller that finds it taken parks until it is let go.
+///
+/// A caller that cannot park -- interrupts masked, no scheduler yet, or a panic
+/// under way -- spins instead, so it is usable everywhere a [`Mutex`] is, only
+/// slower there. Never from an interrupt handler: the holder may be the very
+/// thread that was interrupted.
+pub struct SleepMutex<T> {
+    held: AtomicBool,
+    waiters: Mutex<VecDeque<crate::sched::ThreadId>>,
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: `held` admits one holder at a time, as `Mutex` does.
+unsafe impl<T: Send> Sync for SleepMutex<T> {}
+// SAFETY: as above.
+unsafe impl<T: Send> Send for SleepMutex<T> {}
+
+pub struct SleepMutexGuard<'a, T> {
+    lock: &'a SleepMutex<T>,
+}
+
+/// Whether the current caller may park.
+pub fn can_sleep() -> bool {
+    x86_64::instructions::interrupts::are_enabled()
+        && crate::sched::is_initialised()
+        && crate::sched::current_id().is_some()
+        && !crate::crash::is_panicking()
+}
+
+impl<T> SleepMutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self { held: AtomicBool::new(false), waiters: Mutex::new(VecDeque::new()), value: UnsafeCell::new(value) }
+    }
+
+    fn take(&self) -> bool {
+        self.held.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    pub fn lock(&self) -> SleepMutexGuard<'_, T> {
+        loop {
+            if self.take() {
+                return SleepMutexGuard { lock: self };
+            }
+            if !can_sleep() {
+                core::hint::spin_loop();
+                continue;
+            }
+            let Some(me) = crate::sched::current_id() else {
+                continue;
+            };
+            {
+                // Tried again under the waiters' lock, which the holder takes
+                // after letting go: either this sees it free, or the holder
+                // sees this waiter queued. There is no gap for a release to
+                // fall into.
+                let mut waiters = self.waiters.lock();
+                if self.take() {
+                    return SleepMutexGuard { lock: self };
+                }
+                waiters.push_back(me);
+            }
+            crate::sched::block_current();
+        }
+    }
+}
+
+impl<T> Deref for SleepMutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: holding the guard means `held` is this caller's.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for SleepMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as above, and `&mut self` rules out a second reference.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for SleepMutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.held.store(false, Ordering::Release);
+        // A woken waiter tries again rather than being handed the lock, so a
+        // caller arriving now may take it first. That costs the waiter a turn,
+        // never correctness: it queues again.
+        let next = self.lock.waiters.lock().pop_front();
+        if let Some(next) = next {
+            crate::sched::unblock(next);
+        }
     }
 }

@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::{BlockDevice, BlockError, SECTOR_SIZE};
+use super::{BlockDevice, BlockError, BlockStats, SECTOR_SIZE};
 
 /// The signature at the end of a valid MBR.
 const MBR_SIGNATURE: u16 = 0xAA55;
@@ -299,6 +299,10 @@ impl BlockDevice for PartitionDevice {
     fn write_now(&self, lba: u64, buffer: &[u8]) -> Result<(), BlockError> {
         let absolute = self.map(lba, buffer.len())?;
         self.disk.write_now(absolute, buffer)
+    }
+
+    fn stats(&self) -> BlockStats {
+        self.disk.stats()
     }
 }
 

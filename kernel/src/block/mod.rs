@@ -31,6 +31,7 @@
 pub mod ahci;
 pub mod nvme;
 pub mod partition;
+pub mod request;
 pub mod virtio_blk;
 
 use alloc::vec::Vec;
@@ -90,6 +91,32 @@ pub trait BlockDevice: Send + Sync {
     /// Bytes it holds, for reporting.
     fn capacity(&self) -> u64 {
         self.sector_count() * SECTOR_SIZE as u64
+    }
+
+    /// How it has been used. Diagnostic, and how a test sees that requests
+    /// really overlapped and really were answered by interrupt.
+    fn stats(&self) -> BlockStats {
+        BlockStats::default()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockStats {
+    /// Requests the device can have in flight at once.
+    pub slots: usize,
+    /// The most it has had.
+    pub peak_in_flight: usize,
+    /// Answers its interrupt delivered.
+    pub interrupt_completions: u64,
+}
+
+impl request::Slots {
+    pub fn stats(&self) -> BlockStats {
+        BlockStats {
+            slots: self.count(),
+            peak_in_flight: self.peak(),
+            interrupt_completions: self.interrupt_completions.load(core::sync::atomic::Ordering::Acquire),
+        }
     }
 }
 
