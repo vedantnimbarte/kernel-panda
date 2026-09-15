@@ -27,7 +27,7 @@ stack running as an unprivileged process.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 225 cases across 28 boot-and-assert test kernels, run on four cores
+**Testing:** 230 cases across 29 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -147,7 +147,8 @@ kernel-panda/
     │   ├── crash.rs   the panic handler: stop, report, save, find next boot
     │   ├── device.rs  I/O port and interrupt-line grants for Ring 3 drivers
     │   ├── smp.rs     starting the other processors, per-CPU identity
-    │   ├── acpi.rs    MADT and MCFG: processors, I/O APICs, the PCIe window
+    │   ├── acpi.rs    MADT, MCFG and DMAR: processors, I/O APICs, the PCIe window, VT-d
+    │   ├── iommu/     VT-d remapping-unit inventory; no domain yet confines a device to it
     │   ├── quota.rs   per-process resource limits
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
     │   ├── users.rs      which user each thread runs as, accounts, logging in
@@ -457,6 +458,33 @@ memory, which is far worse than having no ECAM at all.
 The test harness runs QEMU as `-machine q35`. The default i440FX is a 1996
 chipset with no PCI Express, so it publishes no MCFG and every extended-config
 path would go untested.
+
+**The IOMMU inventory is read before anything trusts it.** VT-d's DMAR table
+names remapping hardware the way MCFG names the ECAM window, so it is parsed
+the same way: `acpi::dmar` walks the structures, `iommu::init` maps each
+unit's register page and reads `VER`/`CAP`/`ECAP` back, and a unit that
+answers `0` or all-ones — what a misaddressed MMIO page reads back as — is
+treated as absent rather than believed, the same rule
+`both_views_of_configuration_space_agree` already applies to ECAM. No domain
+exists yet, and no device is any more confined than before; this stage is
+only the inventory the rest is built on. A machine with no DMAR table, or no
+unit that answers, boots on without it — every driver reaches all of physical
+memory exactly as it always has.
+
+The test harness runs QEMU with `-device intel-iommu,intremap=off,aw-bits=48`.
+`caching-mode=on` was tried and reverted: the specification frames it as
+costing an extra invalidation on a not-present-to-present mapping change, but
+on this QEMU (11.1.0) it made every AHCI DMA transaction dramatically slower —
+`fs::the_allocator_never_hands_out_metadata`, which writes on the order of a
+hundred files to a small disk in well under a second, timed out at 90 seconds
+with `caching-mode=on` and nothing else different, three runs running, and
+passed immediately with it off. The kernel does not yet touch a single IOMMU
+register beyond the three read here, so the cost was QEMU's own emulation, not
+anything this driver does — measured, not argued, in keeping with how
+everything else in this file is written. Handling `CAP.CM` moves to whichever
+stage tests it deliberately, in isolation, rather than being paid on every one
+of 29 test-kernel boots. `PANDA_IOMMU=off` bisects a future regression to this
+device in one command.
 
 **Serial input arrives by interrupt, not by polling.** It was drained from the
 timer handler before, which capped throughput at the tick rate and made a

@@ -31,6 +31,7 @@ pub mod device;
 pub mod elf;
 pub mod fs;
 pub mod gbm;
+pub mod iommu;
 pub mod ipc;
 pub mod memory;
 pub mod net;
@@ -130,6 +131,17 @@ pub fn init(boot_info: &'static mut BootInfo) -> &'static mut BootInfo {
     // below offset 0x100, which is all the kernel reads today.
     if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
         map_pci_config(rsdp);
+    }
+
+    // VT-d, if the firmware describes remapping hardware. This stage only
+    // maps each unit and reads its capabilities -- nothing yet confines a
+    // device to a domain, so every driver below still reaches all of physical
+    // memory exactly as before. Survivable like everything else here: a
+    // machine with no DMAR table, or no usable unit, just does not get it.
+    if let Some(rsdp) = boot_info.rsdp_addr.into_option() {
+        // SAFETY: the address comes from the bootloader, and physical memory
+        // and PCI configuration space are both mapped by this point.
+        unsafe { iommu::init(rsdp) };
     }
 
     // Storage last: it needs PCI to find the controller and the heap for the
