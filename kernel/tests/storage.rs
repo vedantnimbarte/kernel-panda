@@ -16,12 +16,13 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec;
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bootloader_api::{entry_point, BootInfo};
 use panda_kernel::block::partition::{self, PartitionDevice};
 use panda_kernel::block::{self, BlockDevice, BlockError, SECTOR_SIZE};
 use panda_kernel::fs::{format, FileSystem, NodeKind};
-use panda_kernel::{arch::x86_64::halt_loop, serial_println, testing, BOOTLOADER_CONFIG};
+use panda_kernel::{arch::x86_64::halt_loop, sched, serial_println, testing, BOOTLOADER_CONFIG};
 
 entry_point!(test_kernel_main, config = &BOOTLOADER_CONFIG);
 
@@ -139,6 +140,65 @@ fn a_filesystem_lives_on_both() {
             fs.read_file("/note").expect("read failed"),
             CONTENTS,
             "{name}: the file did not survive a remount"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Many requests at once
+// ---------------------------------------------------------------------------
+
+const WORKERS: usize = 4;
+const ROUNDS: u64 = 24;
+const WORKER_SECTORS: usize = 12;
+
+static TARGET: AtomicUsize = AtomicUsize::new(0);
+static FINISHED: AtomicUsize = AtomicUsize::new(0);
+static FAILURES: AtomicU64 = AtomicU64::new(0);
+static NEXT_WORKER: AtomicU64 = AtomicU64::new(0);
+
+/// Write a pattern of its own to a range of its own, read it back, over and
+/// over, alongside the others.
+fn worker() {
+    let disk = disks()[TARGET.load(Ordering::Acquire)].1.clone();
+    let me = NEXT_WORKER.fetch_add(1, Ordering::AcqRel);
+    let lba = 4000 + me * 100;
+    let mut written = vec![0u8; WORKER_SECTORS * SECTOR_SIZE];
+    let mut read = vec![0u8; WORKER_SECTORS * SECTOR_SIZE];
+    for round in 0..ROUNDS {
+        for (index, byte) in written.iter_mut().enumerate() {
+            *byte = (index as u8) ^ (me as u8).wrapping_mul(31) ^ (round as u8).wrapping_mul(17);
+        }
+        let ok = disk.write(lba, &written).is_ok() && disk.read(lba, &mut read).is_ok() && read == written;
+        if !ok {
+            FAILURES.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    FINISHED.fetch_add(1, Ordering::AcqRel);
+}
+
+#[test_case]
+fn requests_overlap_and_are_answered_by_interrupt() {
+    for (index, (name, disk)) in disks().into_iter().enumerate() {
+        TARGET.store(index, Ordering::Release);
+        FINISHED.store(0, Ordering::Release);
+        FAILURES.store(0, Ordering::Release);
+        let before = disk.stats();
+
+        for _ in 0..WORKERS {
+            sched::spawn("disk-worker", worker).expect("spawn failed");
+        }
+        while FINISHED.load(Ordering::Acquire) < WORKERS {
+            sched::yield_now();
+        }
+
+        let stats = disk.stats();
+        serial_println!("  ({name}: {stats:?})");
+        assert_eq!(FAILURES.load(Ordering::Acquire), 0, "{name}: a request came back wrong alongside others");
+        assert!(stats.peak_in_flight >= 2, "{name}: requests never overlapped");
+        assert!(
+            stats.interrupt_completions > before.interrupt_completions,
+            "{name}: no request was answered by interrupt"
         );
     }
 }

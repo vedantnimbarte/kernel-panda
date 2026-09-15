@@ -332,6 +332,113 @@ impl EcamRegion {
     }
 }
 
+/// Entry type 0: a chunk of DMA remapping hardware.
+const DMAR_DRHD: u16 = 0;
+/// Entry type 1: a physical range firmware DMAs into on a device's behalf.
+const DMAR_RMRR: u16 = 1;
+
+/// Bit 0 of a DRHD's flags: this unit covers every PCI device in its segment
+/// other than those explicitly scoped to another unit.
+const DRHD_INCLUDE_PCI_ALL: u8 = 1;
+
+/// One DMA remapping hardware unit definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Drhd {
+    pub segment: u16,
+    /// Physical address of this unit's register block.
+    pub register_base: u64,
+    pub include_all: bool,
+}
+
+/// One reserved memory region a device DMAs into on firmware's behalf --
+/// legacy USB keyboard emulation, integrated graphics, and the like. A domain
+/// that does not keep this range reachable breaks the device on its first
+/// transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rmrr {
+    pub segment: u16,
+    pub base: u64,
+    /// Inclusive, as the table reports it.
+    pub limit: u64,
+}
+
+/// What the DMAR table says about VT-d on this machine.
+#[derive(Debug, Clone, Default)]
+pub struct Dmar {
+    /// Host address width the platform supports, minus one -- add one before
+    /// comparing it against anything.
+    pub address_width: u8,
+    pub drhds: Vec<Drhd>,
+    pub rmrrs: Vec<Rmrr>,
+}
+
+/// Find the DMA remapping table, if the firmware describes one.
+///
+/// Absent on anything without VT-d -- most virtualised machines and a good
+/// deal of real hardware -- so this is not an error the way a missing MADT
+/// would be.
+///
+/// # Safety
+///
+/// As [`topology`].
+pub unsafe fn dmar(rsdp: Physical) -> Result<Dmar, AcpiError> {
+    // SAFETY: forwarded from this function's contract.
+    let table = unsafe { find_table(rsdp, b"DMAR")? };
+    Ok(parse_dmar(&table))
+}
+
+/// Parse the body of a DMAR table, already checksum-validated by
+/// [`find_table`].
+///
+/// Split out from [`dmar`] so a synthetic table can be handed to it directly.
+/// QEMU emits no RMRRs, so a table built by hand in a test is the only
+/// coverage that path will ever have.
+pub fn parse_dmar(table: &[u8]) -> Dmar {
+    let mut dmar = Dmar::default();
+
+    // Header, then width (1 byte), flags (1 byte) and 10 reserved bytes.
+    if table.len() < SDT_HEADER_LEN + 12 {
+        return dmar;
+    }
+    dmar.address_width = table[SDT_HEADER_LEN];
+
+    let mut offset = SDT_HEADER_LEN + 12;
+    while offset + 4 <= table.len() {
+        let kind = u16::from_le_bytes([table[offset], table[offset + 1]]);
+        let length = u16::from_le_bytes([table[offset + 2], table[offset + 3]]) as usize;
+
+        // Unlike the MADT's single-byte type and length, a DMAR structure's
+        // header alone is 4 bytes -- so the minimum here is 4, not 2. Either
+        // a structure shorter than its own header or one that runs past the
+        // table would loop forever or read out of bounds on a malformed one.
+        if length < 4 || offset + length > table.len() {
+            break;
+        }
+
+        match kind {
+            DMAR_DRHD if length >= 16 => {
+                dmar.drhds.push(Drhd {
+                    segment: u16::from_le_bytes([table[offset + 6], table[offset + 7]]),
+                    register_base: read_u64(table, offset + 8),
+                    include_all: table[offset + 4] & DRHD_INCLUDE_PCI_ALL != 0,
+                });
+            }
+            DMAR_RMRR if length >= 24 => {
+                dmar.rmrrs.push(Rmrr {
+                    segment: u16::from_le_bytes([table[offset + 6], table[offset + 7]]),
+                    base: read_u64(table, offset + 8),
+                    limit: read_u64(table, offset + 16),
+                });
+            }
+            _ => {}
+        }
+
+        offset += length;
+    }
+
+    dmar
+}
+
 /// Find the memory-mapped configuration windows, if the firmware describes any.
 ///
 /// Separate from [`topology`] because the two tables answer unrelated questions

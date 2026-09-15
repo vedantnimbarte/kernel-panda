@@ -27,7 +27,7 @@ stack running as an unprivileged process.
 | Storage | Block layer, GPT and MBR, a copy-on-write filesystem with atomic commits, owners and permission bits |
 | Graphics | Shared buffers with capability-checked handles, a Ring 3 compositor with z-order, damage tracking, a pointer and click-to-focus |
 
-**Testing:** 223 cases across 28 boot-and-assert test kernels, run on four cores
+**Testing:** 230 cases across 29 boot-and-assert test kernels, run on four cores
 under QEMU with SMEP and SMAP enabled.
 
 ```
@@ -147,7 +147,8 @@ kernel-panda/
     │   ├── crash.rs   the panic handler: stop, report, save, find next boot
     │   ├── device.rs  I/O port and interrupt-line grants for Ring 3 drivers
     │   ├── smp.rs     starting the other processors, per-CPU identity
-    │   ├── acpi.rs    MADT and MCFG: processors, I/O APICs, the PCIe window
+    │   ├── acpi.rs    MADT, MCFG and DMAR: processors, I/O APICs, the PCIe window, VT-d
+    │   ├── iommu/     VT-d remapping-unit inventory; no domain yet confines a device to it
     │   ├── quota.rs   per-process resource limits
     │   ├── userspace.rs  user regions, program loading, the drop to Ring 3
     │   ├── users.rs      which user each thread runs as, accounts, logging in
@@ -457,6 +458,33 @@ memory, which is far worse than having no ECAM at all.
 The test harness runs QEMU as `-machine q35`. The default i440FX is a 1996
 chipset with no PCI Express, so it publishes no MCFG and every extended-config
 path would go untested.
+
+**The IOMMU inventory is read before anything trusts it.** VT-d's DMAR table
+names remapping hardware the way MCFG names the ECAM window, so it is parsed
+the same way: `acpi::dmar` walks the structures, `iommu::init` maps each
+unit's register page and reads `VER`/`CAP`/`ECAP` back, and a unit that
+answers `0` or all-ones — what a misaddressed MMIO page reads back as — is
+treated as absent rather than believed, the same rule
+`both_views_of_configuration_space_agree` already applies to ECAM. No domain
+exists yet, and no device is any more confined than before; this stage is
+only the inventory the rest is built on. A machine with no DMAR table, or no
+unit that answers, boots on without it — every driver reaches all of physical
+memory exactly as it always has.
+
+The test harness runs QEMU with `-device intel-iommu,intremap=off,aw-bits=48`.
+`caching-mode=on` was tried and reverted: the specification frames it as
+costing an extra invalidation on a not-present-to-present mapping change, but
+on this QEMU (11.1.0) it made every AHCI DMA transaction dramatically slower —
+`fs::the_allocator_never_hands_out_metadata`, which writes on the order of a
+hundred files to a small disk in well under a second, timed out at 90 seconds
+with `caching-mode=on` and nothing else different, three runs running, and
+passed immediately with it off. The kernel does not yet touch a single IOMMU
+register beyond the three read here, so the cost was QEMU's own emulation, not
+anything this driver does — measured, not argued, in keeping with how
+everything else in this file is written. Handling `CAP.CM` moves to whichever
+stage tests it deliberately, in isolation, rather than being paid on every one
+of 29 test-kernel boots. `PANDA_IOMMU=off` bisects a future regression to this
+device in one command.
 
 **Serial input arrives by interrupt, not by polling.** It was drained from the
 timer handler before, which capped throughput at the tick rate and made a
@@ -870,12 +898,29 @@ to ::1. `PANDA_PCAP=<file>` makes xtask record every frame, for Wireshark.
 
 **A disk behind SATA, NVMe or virtio looks the same from above.** The block layer
 asks for sectors by number, and each driver answers through the same interface,
-including the lock-free write the panic path needs. The three share a shape on
-purpose: completion is polled and one request is in flight at a time, because
-every call into a disk here is synchronous and an interrupt announcing an answer
-the caller is already waiting for buys nothing. Each copies through a bounce
-buffer of two pages, which is also as far as NVMe's second PRP reaches without a
-list.
+including the write the panic path needs. The three share a shape on purpose.
+A disk has request slots — eight, or as many as the controller has — each with a
+bounce buffer of two pages, which is also as far as NVMe's second PRP reaches
+without a list. A request takes a slot, hands the device its command, and waits
+for the answer, so requests on different slots are with the device together.
+
+How it waits depends on where it is. Where the caller may sleep, it sleeps, and
+the device's interrupt — MSI-X for NVMe and virtio-blk, MSI for AHCI — wakes it.
+Where it may not, it polls the device itself: during boot, on the panic path, and
+with a spinning lock held. Every spinning lock masks interrupts, so "interrupts
+are on" is the same test as "no spinning lock is held", and it is the one the
+driver makes. A caller waiting for a slot sleeps or polls on the same rule.
+
+That rule put the filesystem in the way: it held a spinning lock across every
+disk I/O, so every file read polled. Its lock now sleeps. `SleepMutex` parks a
+caller that finds it taken, and falls back to spinning where parking is not
+allowed, so it is usable anywhere a `Mutex` is, only slower there.
+
+AHCI queues through NCQ, where both the controller and the drive offer it: a
+slot is a tag, and the drive answers tags in whatever order it likes. Flush and
+identify are not queued commands, so they take every slot and run alone, and a
+caller waiting to do that holds back new single-slot requests so a steady stream
+cannot keep it waiting forever. A drive without NCQ gets one command at a time.
 
 NVMe is two pairs of rings: the admin queue, through which the driver learns the
 namespace's size and creates the other, and one I/O queue. virtio-blk is one
@@ -884,7 +929,10 @@ outcome — on the same virtqueue code the network driver uses.
 
 The test harness attaches a disk of each kind at a distinct size, and
 `tests/storage.rs` runs the same cases on both new ones, down to formatting a
-filesystem and reading a file back after a remount. The first NVMe driver put a
+filesystem and reading a file back after a remount. On each disk four threads
+write and read back patterns of their own at once, and the case checks that the
+data survived, that requests really were in flight together, and that answers
+really came by interrupt. The first NVMe driver put a
 submission queue's completion-queue id where its flags go; QEMU's trace, reading
 "invalid cqid=0", found it faster than the specification did.
 
@@ -980,8 +1028,11 @@ everything owned by the system and closed to all.
 * A ring has exactly one sender and one receiver, fixed 64-byte slots, and at
   most 4,096 of them. A side spins for 2,000 attempts before sleeping, which is
   a guess tuned under emulation rather than a measurement on hardware.
-* Disks are polled, one request at a time, through a two-page bounce buffer.
-  NVMe namespaces must use 512-byte blocks; one formatted with 4 KiB blocks is
+* Every transfer is copied through a slot's bounce buffer rather than built
+  as a scatter-gather list over the caller's memory. A request waiting on an
+  interrupt that never comes waits forever: only polled waits time out. An AHCI
+  error fails every queued command on the port and restarts the port, without
+  resetting the drive. NVMe namespaces must use 512-byte blocks; one formatted with 4 KiB blocks is
   refused rather than misaddressed. virtio devices are driven through the legacy
   interface only.
 * The network card has one transmit buffer, so frames go out one at a time. The

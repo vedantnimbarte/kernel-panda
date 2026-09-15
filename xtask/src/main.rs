@@ -568,6 +568,33 @@ fn qemu_command(image: &Path, uefi: bool, headless: bool, crash: &Path) -> Resul
     // RDRAND and RDSEED likewise: without them the kernel seeds its random
     // numbers from timing, and the hardware path goes untested.
     cmd.args(["-cpu", "qemu64,+smep,+smap,+rdrand,+rdseed"]);
+    // An IOMMU, so a device can be confined to the memory its driver actually
+    // owns. Before every other -device: the PCI devices behind it take their
+    // DMA address space from it when they are created.
+    //
+    // intremap=off deliberately -- interrupt remapping would reject the
+    // compatibility-format MSI writes `pci::route_msi`/`route_msix` already
+    // produce, for a feature the kernel does not use.
+    //
+    // caching-mode=on was tried and reverted: it does not merely cost "one
+    // extra invalidation poll" the way the specification's wording suggests.
+    // On this QEMU (11.1.0) it made every AHCI DMA transaction dramatically
+    // slower -- `fs::the_allocator_never_hands_out_metadata`, which writes
+    // roughly a hundred files to a small disk in well under a second
+    // normally, timed out at 90s with caching-mode=on and nothing else
+    // different, three runs in a row, and passed immediately with it off.
+    // The kernel does not yet touch a single IOMMU register beyond VER/CAP/
+    // ECAP at this stage, so the cost is QEMU's own emulation, not anything
+    // this driver does. Measured, not argued: this is exactly the kind of
+    // claim this codebase does not take on faith. CAP.CM handling moves to
+    // Milestone 5, tested deliberately and in isolation rather than paid on
+    // every one of 29 test-kernel boots.
+    //
+    // PANDA_IOMMU=off is the escape hatch, for bisecting a regression to this
+    // in one command.
+    if env::var_os("PANDA_IOMMU").as_deref() != Some(std::ffi::OsStr::new("off")) {
+        cmd.args(["-device", "intel-iommu,intremap=off,aw-bits=48,caching-mode=off"]);
+    }
     // A scratch SATA disk for the block driver to talk to.
     //
     // Attached through q35's own ICH9 AHCI controller, which is the same
